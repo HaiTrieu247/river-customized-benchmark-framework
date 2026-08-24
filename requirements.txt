@@ -1,0 +1,12 @@
+# Core scientific stack
+numpy>=1.24
+pandas>=2.0
+scikit-learn>=1.3
+scipy>=1.10
+matplotlib>=3.7
+
+# Required by the sibling river source tree (imported from ../river)
+narwhals>=1.0
+
+# Tests
+pytest>=7.0
