@@ -1,102 +1,111 @@
-# `benchmark/` — Streaming Clustering Concept-Drift Benchmark
+# `benchmark/` — Streaming Clustering Resource Benchmark
 
-Implementation of the design in
-[`../streaming_clustering_concept_drift_benchmark_direction.md`](../streaming_clustering_concept_drift_benchmark_direction.md).
+Run many River clustering algorithms — in several **settings** (params +
+scaler) — on the **same dataset**, and compare them on:
 
-The framework answers not just *"which algorithm has the highest final clustering
-quality?"* but *"which adapts best when the cluster structure changes over time,
-at a reasonable compute/memory cost?"*
+- **Resource cost:** execution time, throughput (samples/s), model RAM,
+  micro-cluster count, macro-cluster count, scalability as the stream grows.
+- **Clustering quality** (labeled datasets only): ARI, NMI, purity.
 
 ```
-Synthetic Stream → Ground-Truth Cluster Evolution → Drift Events / States
-    → Streaming Model → Observed Clusters → Evaluator
-    → (Cluster Quality, Drift Adaptation, Efficiency)
+Dataset ──▶ [ algorithm + params + scaler ] × N ──▶ Runner ──▶ Report
+                                                       │
+                     (runtime, RAM, cluster counts, quality)
 ```
 
 ## Layout
 
-| Package | Role | Doc section |
-|---|---|---|
-| `ground_truth/` | `ClusterState`, `DriftEvent`, `GroundTruthTracker` — describe *how* structure evolves | §3–§7 |
-| `datasets/synthetic/` | `SyntheticStream` generator + the `S1..S10` scenario matrix | §6, §16 |
-| `algorithms/` | Uniform `ClustererAdapter` over River clusterers + preset registry | §9, §22 |
-| `evaluation/` | Quality metrics, adaptation metrics, efficiency, the online runner, aggregation | §10–§15, §20 |
-| `reports/` | Comparison tables (§18) and plots (§23) | §18, §23 |
-| `experiments/` | Harness + per-phase entry points (stationary / drift / efficiency / hyperparameter) | §14–§20 |
+| Package | Role |
+|---|---|
+| `datasets/` | `Dataset` interface, synthetic static-blob generator, KDD99/KDD98 loaders |
+| `algorithms/` | `ClustererAdapter` over River clusterers (+ optional online scaler), preset registry |
+| `evaluation/` | quality metrics, efficiency metrics, the online runner, seed aggregation |
+| `reports/` | comparison tables (efficiency / quality) and plots |
+| `experiments/` | `Setting` + `BenchmarkConfig` harness that runs many settings on one dataset |
 
 ## Requirements
 
 River is imported from the **sibling source tree** `../river` (auto-added to
-`sys.path` by `algorithms/adapter.py:build_river_path`). Install the rest with:
+`sys.path` by `algorithms/adapter.py:build_river_path`). Install the rest:
 
 ```bash
 pip install -r requirements.txt
 ```
 
-## Running
+## Running (CLI)
 
 ```bash
-# Phase 2 — stationary baseline (§17)
-python -m benchmark stationary
+# Synthetic labeled Gaussian blobs — compare all default algorithms
+python -m benchmark synthetic --n-samples 20000 --n-clusters 5
 
-# Phase 3-4 — drift adaptation on any scenario (§12, §18)
-python -m benchmark drift S2_abrupt_movement
-python -m benchmark drift S6_split --n-samples 20000
+# Compare the effect of scalers on one algorithm (README: scaler matters a lot)
+python -m benchmark synthetic --algorithms DBSTREAM --scalers none,standard,minmax
 
-# Phase 5 — hyperparameter calibration on disjoint streams (§19)
-python -m benchmark calibrate
+# KDDCup99 (34 continuous features, auto-fetched via sklearn)
+python -m benchmark kdd99 --n-samples 50000 --scalers standard
 
-# Phase 6 — efficiency & scalability (§13)
-python -m benchmark efficiency
+# KDDCup98 (local file, 56 RFM fields)
+python -m benchmark kdd98 --path /path/to/cup98LRN.txt --n-samples 20000
 
-# Full S1..S10 matrix, repeated over seeds → JSON digest (§16, §20)
-python -m benchmark matrix --seeds 1,2,3 --out results.json
+# Repeat over seeds → mean ± std, and write JSON + plots
+python -m benchmark synthetic --seeds 1,2,3 --out results/
 ```
 
-## Scenario matrix (§16)
+### CLI options (common to all datasets)
 
-| Id | Scenario | Purpose |
-|---|---|---|
-| `S1_stationary` | no drift | baseline |
-| `S2_abrupt_movement` | abrupt move | tracking |
-| `S3_gradual_movement` | gradual move (interval) | slow adaptation |
-| `S4_birth` | new cluster | detect new structure |
-| `S5_death` | cluster disappears | drop obsolete structure |
-| `S6_split` | one → many | structural adaptation |
-| `S7_merge` | many → one | structural adaptation |
-| `S8_recurring` | concept returns | recurrence |
-| `S9_multiple_drift` | several events | robustness over time |
-| `S10_noise_drift` | drift + background noise | robustness |
+| Flag | Meaning |
+|---|---|
+| `--algorithms` | comma-separated; default: CluStream, DenStream, DBSTREAM, STREAMKMeans, KMeans |
+| `--scalers` | comma-separated online scalers: `none, standard, minmax, maxabs, robust, adaptive_standard` |
+| `--seeds` | comma-separated; more than one → aggregate to mean ± std |
+| `--n-samples` | cap number of streamed samples |
+| `--checkpoints` | number of time/RAM/cluster measurements across the stream |
+| `--out` | directory to write `results.json` + plots |
 
 ## Metrics
 
-- **Quality (§11):** ARI, NMI, macro-average purity — computed *per time window*,
-  not just at the end.
-- **Adaptation (§12):** performance drop, recovery time, adaptation delay,
-  post-drift quality, area under recovery curve — all derived from the
-  quality-over-time curve, so algorithms **without** a drift detector are still
-  evaluated on how well they adapt (§9).
-- **Efficiency (§13):** runtime, throughput, ms/sample, model memory
-  (`_raw_memory_usage`), micro-cluster count.
-
-## Key principles enforced
-
-1. Ground truth never leaks into the model — the runner passes only the feature
-   dict; ground truth is used solely by the evaluator (§25 Principle 1).
-2. Evaluation is over time, not a single final score (Principle 2).
-3. Drift *adaptation* is central; a drift *detector* is not required (Principle 3).
-4. Hyperparameters are calibrated on separate streams then frozen (Principle 4).
-5. Fixed seed / stream / windows / params make runs reproducible (Principle 5).
+- **Efficiency:** `total_runtime_s`, `throughput_sps`, `ms_per_sample`,
+  `peak_memory_mb` (via river's `_raw_memory_usage`, includes the scaler),
+  `mean/max micro-clusters`, `final macro-clusters`. Sampled at checkpoints so
+  scalability over the stream is visible, not just a final number.
+- **Quality:** ARI, NMI, macro-average purity (README formula), computed over
+  all labeled samples. Skipped automatically for unlabeled datasets.
 
 ## Programmatic use
 
 ```python
-from benchmark.experiments import BenchmarkConfig, run_scenario
-from benchmark.reports import before_during_after_table, plot_quality_over_time
+from benchmark.datasets import SyntheticStream, StreamConfig
+from benchmark.experiments import BenchmarkConfig, Setting, run_benchmark
+from benchmark.reports import efficiency_table, quality_table
 
-config = BenchmarkConfig(seeds=(1,), n_samples=20_000, window_size=1000)
-results = run_scenario("S2_abrupt_movement", config)
-print(before_during_after_table(results))
-fig = plot_quality_over_time(results, "ari")
-fig.savefig("s2_ari.png")
+dataset = SyntheticStream(StreamConfig(n_samples=20_000, n_clusters=5, seed=42))
+config = BenchmarkConfig(
+    settings=[
+        Setting("DBSTREAM", scaler="standard"),
+        Setting("DBSTREAM", params={"clustering_threshold": 2.0}, scaler="standard",
+                label="DBSTREAM τ=2"),
+        Setting("STREAMKMeans", params={"n_clusters": 5}),
+        Setting("CluStream", params={"n_macro_clusters": 5}),
+    ],
+)
+results = run_benchmark(dataset, config)
+print(efficiency_table(results))
+print(quality_table(results))
 ```
+
+## Reproducibility rules enforced
+
+- Every setting consumes the **same** dataset stream from the start (record
+  order is the streaming order — no shuffling).
+- Datasets are re-iterable so each algorithm gets an identical sequence.
+- Runs are repeated over seeds and aggregated (`--seeds 1,2,3`).
+- Each result records its full params + scaler.
+
+## Notes on results (from the existing repo README)
+
+- **The scaler matters a lot.** KDD99 has features with an extreme range; a
+  `minmax` scaler can squash everything into one micro-cluster. Prefer
+  `standard`.
+- **`epsilon`/`clustering_threshold` must match the scale.** DenStream/DBSTREAM
+  presets are starting points; tune the radius param to the (scaled) data.
+- **River's DenStream is an online-adapted implementation**, not classic DBSCAN.

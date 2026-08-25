@@ -1,4 +1,4 @@
-"""Synthetic stream generators (§6) and scenario builders (§16)."""
+"""Synthetic static-cluster stream generator."""
 
 from __future__ import annotations
 

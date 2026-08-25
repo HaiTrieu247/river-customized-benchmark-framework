@@ -1,4 +1,4 @@
-"""Efficiency metrics: runtime, throughput, memory, micro-cluster count (§13)."""
+"""Efficiency metrics: runtime, throughput, memory, cluster counts."""
 
 from __future__ import annotations
 
@@ -7,13 +7,14 @@ from dataclasses import dataclass
 
 @dataclass
 class EfficiencyMetrics:
-    """Aggregate efficiency numbers for one run (§13)."""
+    """Aggregate efficiency numbers for one run."""
 
     total_runtime_s: float
     n_samples: int
     peak_memory_bytes: int | None = None
     mean_micro_clusters: float | None = None
     max_micro_clusters: int | None = None
+    final_macro_clusters: int | None = None
 
     @property
     def throughput_sps(self) -> float:
@@ -38,4 +39,5 @@ class EfficiencyMetrics:
                 round(self.mean_micro_clusters, 2) if self.mean_micro_clusters is not None else None
             ),
             "max_micro_clusters": self.max_micro_clusters,
+            "final_macro_clusters": self.final_macro_clusters,
         }

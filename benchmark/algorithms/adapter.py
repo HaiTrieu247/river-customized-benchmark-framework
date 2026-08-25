@@ -1,4 +1,11 @@
-"""Uniform adapter over any ``river.base.Clusterer`` (§9, §13)."""
+"""Uniform adapter over any ``river.base.Clusterer``.
+
+The adapter gives every clusterer the same interface for the benchmark runner
+and, optionally, chains an **online scaler** in front of the model (the README
+stresses that the scaler strongly affects the resulting number of clusters and
+quality). It also reports, best-effort, the micro-cluster count, macro-cluster
+count and model memory so efficiency can be compared across algorithms.
+"""
 
 from __future__ import annotations
 
@@ -36,16 +43,31 @@ class ClustererAdapter:
     model:
         The underlying river clusterer instance.
     params:
-        The constructor params used (recorded for reproducibility, §22).
+        The constructor params used (recorded for reproducibility).
+    scaler:
+        Optional online scaler applied to each ``x`` before predict/learn. Must
+        implement river's ``learn_one`` + ``transform_one``. ``None`` => raw.
+    scaler_name:
+        Human-readable scaler name for reporting (e.g. ``"StandardScaler"``).
     """
 
     name: str
     model: Any
     params: dict = field(default_factory=dict)
+    scaler: Any = None
+    scaler_name: str = "none"
+
+    # -- scaling -------------------------------------------------------------
+    def _scale(self, x: dict) -> dict:
+        """Learn-then-transform the point with the online scaler, if present."""
+        if self.scaler is None:
+            return x
+        self.scaler.learn_one(x)
+        return self.scaler.transform_one(x)
 
     # -- online protocol -----------------------------------------------------
     def predict_one(self, x: dict) -> int:
-        """Assign ``x`` to a cluster (called *before* learning, §core concepts).
+        """Assign ``x`` to a cluster.
 
         Some clusterers (e.g. STREAMKMeans) raise before they have initialised
         any center. During that cold-start phase we return label ``0`` so the
@@ -59,9 +81,20 @@ class ClustererAdapter:
     def learn_one(self, x: dict) -> None:
         self.model.learn_one(x)
 
+    def process_one(self, x: dict) -> int:
+        """Full per-sample step used by the runner: scale -> predict -> learn.
+
+        Returns the predicted cluster label. Prediction happens before learning
+        (test-then-train), matching a live streaming deployment.
+        """
+        xs = self._scale(x)
+        y_pred = self.predict_one(xs)
+        self.learn_one(xs)
+        return y_pred
+
     # -- introspection (best effort) ----------------------------------------
     def n_micro_clusters(self) -> int | None:
-        """Number of micro-clusters, if the model exposes them (§13)."""
+        """Number of micro-clusters, if the model exposes them."""
         m = self.model
         for attr in ("micro_clusters", "_micro_clusters"):
             mc = getattr(m, attr, None)
@@ -102,10 +135,28 @@ class ClustererAdapter:
         return c if isinstance(c, dict) else None
 
     def memory_bytes(self) -> int | None:
-        """Model object size via river's ``_raw_memory_usage`` (§13, README)."""
-        v = getattr(self.model, "_raw_memory_usage", None)
-        return int(v) if isinstance(v, (int, float)) else None
+        """Model object size via river's ``_raw_memory_usage`` (README).
+
+        Includes the scaler's footprint when one is attached.
+        """
+        total = 0
+        found = False
+        for obj in (self.model, self.scaler):
+            v = getattr(obj, "_raw_memory_usage", None) if obj is not None else None
+            if isinstance(v, (int, float)):
+                total += int(v)
+                found = True
+        return total if found else None
 
 
-def make_adapter(name: str, model: Any, params: dict | None = None) -> ClustererAdapter:
-    return ClustererAdapter(name=name, model=model, params=params or {})
+def make_adapter(
+    name: str,
+    model: Any,
+    params: dict | None = None,
+    scaler: Any = None,
+    scaler_name: str = "none",
+) -> ClustererAdapter:
+    return ClustererAdapter(
+        name=name, model=model, params=params or {},
+        scaler=scaler, scaler_name=scaler_name,
+    )

@@ -1,16 +1,20 @@
-"""Comparison tables (§18) — plain text / markdown, no heavy deps.
+"""Comparison tables (plain markdown, no heavy deps).
 
-The key table is the Before / Min / Recovery / After breakdown per drift (§18),
-which is far more informative than a single final-ARI column.
+Tables:
+
+* **efficiency** — runtime / throughput / memory / cluster counts;
+* **quality** — whole-stream ARI / NMI / AMI / purity (labeled datasets);
+* **stream-quality** — mean / median / final of a metric over evaluation windows
+  (time-aware evaluation, the top-priority quality criterion).
+
+Each has a flat (single-seed) form and an aggregated (mean ± std over seeds)
+form that consumes a ``run_benchmark_repeated`` digest.
 """
 
 from __future__ import annotations
 
-import numpy as np
 
-
-def format_table(headers, rows, align: str = "left") -> str:
-    """Render a simple markdown table from headers + row tuples."""
+def format_table(headers, rows) -> str:
     cols = [str(h) for h in headers]
     str_rows = [[_fmt(c) for c in row] for row in rows]
     widths = [len(h) for h in cols]
@@ -33,67 +37,89 @@ def _fmt(v) -> str:
     return str(v)
 
 
-def before_during_after_table(results, metric: str = "ari") -> str:
-    """Per-algorithm Before / Min / Recovery / After table for one scenario (§18).
-
-    ``results`` is a list of ExperimentResult on the *same* scenario. Uses the
-    first drift event of each result (extend as needed for multi-drift streams).
-    """
-    headers = ["Algorithm", f"Before {metric.upper()}", f"Min {metric.upper()}",
-               "Recovery", f"After {metric.upper()}", "Recovered"]
-    rows = []
-    for r in results:
-        if not r.adaptation:
-            rows.append([r.algorithm, None, None, None, None, "n/a"])
-            continue
-        a = r.adaptation[0]
-        rows.append([
-            r.algorithm,
-            a.quality_before,
-            a.quality_min,
-            a.recovery_time,
-            a.post_drift_quality,
-            "yes" if a.recovered else "no",
-        ])
-    return format_table(headers, rows)
-
-
-def adaptation_table(results, metric: str = "ari") -> str:
-    """All drifts x all algorithms: performance drop, recovery, delay, AUC (§12)."""
-    headers = ["Algorithm", "Drift", "Type", "Drop", "Recovery", "Delay", "PostQ", "AUC"]
-    rows = []
-    for r in results:
-        for a in r.adaptation:
-            rows.append([
-                r.algorithm, a.drift_id, a.drift_type, a.performance_drop,
-                a.recovery_time, a.adaptation_delay, a.post_drift_quality,
-                a.area_under_recovery,
-            ])
-    return format_table(headers, rows)
-
-
+# --- flat (single-seed) tables ---------------------------------------------
 def efficiency_table(results) -> str:
-    """Runtime / throughput / memory / micro-cluster comparison (§13)."""
-    headers = ["Algorithm", "Runtime (s)", "Throughput (sps)", "ms/sample",
-               "Memory (MB)", "Mean MC", "Max MC"]
+    """Runtime / throughput / memory / cluster comparison for a list of RunResult."""
+    headers = ["Setting", "Samples", "Runtime (s)", "Throughput (sps)", "ms/sample",
+               "Memory (MB)", "Mean MC", "Max MC", "Macro K"]
     rows = []
     for r in results:
         e = r.efficiency.to_dict()
         rows.append([
-            r.algorithm, e["total_runtime_s"], e["throughput_sps"], e["ms_per_sample"],
-            e["peak_memory_mb"], e["mean_micro_clusters"], e["max_micro_clusters"],
+            r.algorithm, r.n_samples, e["total_runtime_s"], e["throughput_sps"],
+            e["ms_per_sample"], e["peak_memory_mb"], e["mean_micro_clusters"],
+            e["max_micro_clusters"], e["final_macro_clusters"],
         ])
     return format_table(headers, rows)
 
 
-def quality_summary_table(results, metric: str = "ari") -> str:
-    """Mean / min / final quality over the whole stream, per algorithm."""
-    headers = ["Algorithm", f"Mean {metric.upper()}", f"Min {metric.upper()}", f"Final {metric.upper()}"]
+def quality_table(results, metrics=("ari", "nmi", "ami", "purity")) -> str:
+    """Whole-stream quality comparison; only meaningful for labeled datasets."""
+    headers = ["Setting"] + [m.upper() for m in metrics]
     rows = []
     for r in results:
-        _, ys = r.quality_curve(metric)
-        if ys:
-            rows.append([r.algorithm, float(np.mean(ys)), float(np.min(ys)), ys[-1]])
-        else:
-            rows.append([r.algorithm, None, None, None])
+        rows.append([r.algorithm] + [r.quality.get(m) for m in metrics])
+    return format_table(headers, rows)
+
+
+def stream_quality_table(results, metric="ari") -> str:
+    """Time-aware summary of one metric: mean / median / final over windows."""
+    headers = ["Setting", f"Mean {metric.upper()}", f"Median {metric.upper()}",
+               f"Final {metric.upper()}"]
+    rows = []
+    for r in results:
+        s = r.quality_stream.get(metric, {})
+        rows.append([r.algorithm, s.get("mean"), s.get("median"), s.get("final")])
+    return format_table(headers, rows)
+
+
+# --- aggregated (repeated-run) tables --------------------------------------
+def _agg_cell(agg: dict | None) -> str:
+    if not agg:
+        return "-"
+    return f"{agg['mean']:.4f} ± {agg['std']:.4f}"
+
+
+def efficiency_table_agg(digest: dict) -> str:
+    """Aggregated efficiency table from run_benchmark_repeated digest."""
+    headers = ["Setting", "Runs", "Runtime (s)", "Throughput (sps)", "Memory (MB)",
+               "Mean MC", "Max MC", "Macro K"]
+    rows = []
+    for label, block in digest.items():
+        agg = block["aggregate"]
+        e = agg["efficiency"]
+        rows.append([
+            label, agg["n_runs"], _agg_cell(e["total_runtime_s"]),
+            _agg_cell(e["throughput_sps"]), _agg_cell(e["peak_memory_mb"]),
+            _agg_cell(e["mean_micro_clusters"]), _agg_cell(e["max_micro_clusters"]),
+            _agg_cell(e["final_macro_clusters"]),
+        ])
+    return format_table(headers, rows)
+
+
+def quality_table_agg(digest: dict, metrics=("ari", "nmi", "ami", "purity")) -> str:
+    """Aggregated whole-stream quality (mean ± std over seeds)."""
+    headers = ["Setting", "Runs"] + [m.upper() for m in metrics]
+    rows = []
+    for label, block in digest.items():
+        agg = block["aggregate"]
+        row = [label, agg["n_runs"]]
+        for m in metrics:
+            row.append(_agg_cell(agg["quality"].get(m)))
+        rows.append(row)
+    return format_table(headers, rows)
+
+
+def stream_quality_table_agg(digest: dict, metric="ari") -> str:
+    """Aggregated time-aware summary: mean-over-stream of a metric (mean ± std)."""
+    headers = ["Setting", "Runs", f"Mean {metric.upper()}", f"Median {metric.upper()}",
+               f"Final {metric.upper()}"]
+    rows = []
+    for label, block in digest.items():
+        agg = block["aggregate"]
+        s = agg.get("quality_stream", {}).get(metric, {})
+        rows.append([
+            label, agg["n_runs"], _agg_cell(s.get("mean")),
+            _agg_cell(s.get("median")), _agg_cell(s.get("final")),
+        ])
     return format_table(headers, rows)

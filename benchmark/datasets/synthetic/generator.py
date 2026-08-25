@@ -1,153 +1,69 @@
-"""Materialise a data stream from a :class:`StreamGroundTruth` (§6).
+"""Synthetic static-cluster stream generator.
 
-The generator samples one point at a time from the active ground-truth clusters
-(spherical Gaussian blobs), so it can be consumed exactly like a live stream:
-``for x, y_true, t in stream``. During a *gradual* drift interval the affected
-cluster's center is linearly interpolated between its pre- and post-drift
-position (§5.7), instead of snapping at a single timestamp.
+Generates a labeled stream of Gaussian blobs with a fixed, configurable
+structure (no drift). Useful as a controlled dataset where ground-truth labels
+are known, so clustering quality can be measured exactly.
 """
 
 from __future__ import annotations
 
-import bisect
 from dataclasses import dataclass
 
 import numpy as np
 
-from ...ground_truth.events import DriftType
-from ...ground_truth.schema import ClusterState, StreamGroundTruth
+from ..base import Dataset
 
 
 @dataclass
 class StreamConfig:
-    """High-level knobs for a synthetic stream (§6)."""
+    """Configuration for a synthetic blob stream."""
 
-    n_samples: int = 100_000
+    n_samples: int = 20_000
     n_features: int = 2
-    noise: float = 0.0  # fraction of samples drawn as uniform background noise
-    noise_scale: float = 20.0  # half-range of the uniform noise box per feature
+    n_clusters: int = 5
+    cluster_std: float = 1.0
+    center_box: float = 20.0  # centers drawn uniformly in [-box, box]^d
+    noise: float = 0.0  # fraction of uniform background-noise samples
     seed: int = 42
 
 
-class SyntheticStream:
-    """Iterable stream backed by ground truth.
+class SyntheticStream(Dataset):
+    """Labeled stream of static Gaussian clusters.
 
-    Parameters
-    ----------
-    ground_truth:
-        The :class:`StreamGroundTruth` describing cluster evolution + drifts.
-    config:
-        Sampling configuration (noise, seed). ``n_samples``/``n_features`` are
-        taken from ``ground_truth`` to stay consistent.
+    Yields ``(x, y)`` where ``x`` is a feature dict and ``y`` is the cluster id
+    (``None`` for background-noise samples). Re-iterable and deterministic given
+    the seed, so every algorithm sees the identical sequence.
     """
 
-    def __init__(self, ground_truth: StreamGroundTruth, config: StreamConfig | None = None):
-        self.gt = ground_truth
-        self.config = config or StreamConfig(
-            n_samples=ground_truth.n_samples,
-            n_features=ground_truth.n_features,
-            seed=ground_truth.seed,
+    def __init__(self, config: StreamConfig | None = None):
+        self.config = config or StreamConfig()
+        self.n_features = self.config.n_features
+        self.has_labels = True
+        self.name = (
+            f"synthetic_k{self.config.n_clusters}"
+            f"_d{self.config.n_features}_n{self.config.n_samples}"
         )
-        # keep the two in sync
-        self.config.n_samples = ground_truth.n_samples
-        self.config.n_features = ground_truth.n_features
-        self._rng = np.random.default_rng(self.config.seed)
         self._feature_names = [f"x{i}" for i in range(self.config.n_features)]
-        # precompute gradual-movement interpolation plans
-        self._gradual = self._build_gradual_plans()
-
-    # -- gradual interpolation ----------------------------------------------
-    def _state_before(self, cluster_id: str, t: int) -> ClusterState | None:
-        line = self.gt.timelines.get(cluster_id, [])
-        starts = [s.t_start for s in line]
-        idx = bisect.bisect_left(starts, t) - 1
-        return line[idx] if idx >= 0 else None
-
-    def _state_at_start(self, cluster_id: str, t: int) -> ClusterState | None:
-        line = self.gt.timelines.get(cluster_id, [])
-        for s in line:
-            if s.t_start == t:
-                return s
-        return None
-
-    def _build_gradual_plans(self) -> list[dict]:
-        plans = []
-        for ev in self.gt.drift_events:
-            if not ev.is_gradual:
-                continue
-            if ev.type not in (DriftType.MOVEMENT, DriftType.RECURRING):
-                continue
-            for cid in ev.affected_clusters:
-                src = self._state_before(cid, ev.start)
-                dst = self._state_at_start(cid, ev.end)
-                if src is None or dst is None:
-                    continue
-                plans.append(
-                    {
-                        "cluster_id": cid,
-                        "start": ev.start,
-                        "end": ev.end,
-                        "from": src.center_array(),
-                        "to": dst.center_array(),
-                        "spread": src.spread,
-                        "weight": src.weight,
-                    }
-                )
-        return plans
-
-    def _effective_states(self, t: int) -> list[ClusterState]:
-        """Active states at ``t`` with gradual-drift centers interpolated."""
-        states = {s.cluster_id: s for s in self.gt.active_states_at(t)}
-        for plan in self._gradual:
-            if plan["start"] <= t < plan["end"]:
-                frac = (t - plan["start"]) / max(plan["end"] - plan["start"], 1)
-                center = plan["from"] + frac * (plan["to"] - plan["from"])
-                states[plan["cluster_id"]] = ClusterState(
-                    plan["cluster_id"],
-                    tuple(center.tolist()),
-                    plan["spread"],
-                    plan["weight"],
-                    True,
-                    t,
-                )
-        return list(states.values())
-
-    # -- sampling ------------------------------------------------------------
-    def _sample_point(self, t: int) -> tuple[dict, str | None]:
-        states = self._effective_states(t)
-        if not states:
-            # no active cluster: emit background noise
-            return self._noise_point(), None
-
-        if self.config.noise > 0 and self._rng.random() < self.config.noise:
-            return self._noise_point(), None
-
-        weights = np.array([s.weight for s in states], dtype=float)
-        weights = weights / weights.sum()
-        idx = int(self._rng.choice(len(states), p=weights))
-        state = states[idx]
-        center = state.center_array()
-        point = center + self._rng.normal(0.0, state.spread, size=self.config.n_features)
-        x = {name: float(v) for name, v in zip(self._feature_names, point)}
-        return x, state.cluster_id
-
-    def _noise_point(self) -> dict:
-        lo, hi = -self.config.noise_scale, self.config.noise_scale
-        vals = self._rng.uniform(lo, hi, size=self.config.n_features)
-        return {name: float(v) for name, v in zip(self._feature_names, vals)}
-
-    # -- iteration protocol --------------------------------------------------
-    def __iter__(self):
-        for t in range(self.config.n_samples):
-            x, y = self._sample_point(t)
-            yield x, y, t
+        # fixed centers + weights (independent of the sampling seed so the layout
+        # is stable, while per-run sampling uses the run seed)
+        rng = np.random.default_rng(self.config.seed)
+        box = self.config.center_box
+        self._centers = rng.uniform(-box, box, size=(self.config.n_clusters, self.config.n_features))
+        self._weights = np.full(self.config.n_clusters, 1.0 / self.config.n_clusters)
 
     def __len__(self) -> int:
         return self.config.n_samples
 
-    def take(self, n: int):
-        """Yield the first ``n`` samples (handy for smoke tests)."""
-        for i, item in enumerate(self):
-            if i >= n:
-                break
-            yield item
+    def __iter__(self):
+        cfg = self.config
+        rng = np.random.default_rng(cfg.seed)
+        lo, hi = -cfg.center_box, cfg.center_box
+        for _ in range(cfg.n_samples):
+            if cfg.noise > 0 and rng.random() < cfg.noise:
+                vals = rng.uniform(lo, hi, size=cfg.n_features)
+                yield {n: float(v) for n, v in zip(self._feature_names, vals)}, None
+                continue
+            k = int(rng.choice(cfg.n_clusters, p=self._weights))
+            point = self._centers[k] + rng.normal(0.0, cfg.cluster_std, size=cfg.n_features)
+            x = {n: float(v) for n, v in zip(self._feature_names, point)}
+            yield x, k

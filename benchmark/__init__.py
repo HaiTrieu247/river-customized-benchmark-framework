@@ -1,19 +1,17 @@
-"""Streaming clustering benchmark framework under concept drift.
+"""Streaming clustering benchmark framework.
 
-Built around the idea that, for streaming clustering, the benchmark must answer
-*"which algorithm adapts best when the cluster structure changes over time, at a
-reasonable compute/memory cost?"* rather than only *"which has the highest final
-clustering quality?"*.
+Run many River clustering algorithms — in several settings (params + scaler) —
+on the *same* dataset, and compare them on resource cost (execution time, RAM,
+micro/macro-cluster counts, throughput) and, when the dataset is labeled, on
+clustering quality (ARI / NMI / purity).
 
-The design follows ``streaming_clustering_concept_drift_benchmark_direction.md``:
-
-    Synthetic Stream -> Ground Truth Cluster Evolution -> Drift Events / States
-        -> Streaming Model -> Observed Clusters -> Evaluator
-        -> (Cluster Quality, Drift Adaptation, Efficiency)
+    Dataset -> [ algorithm + params + scaler ] x N -> Runner -> Report
+                                                        |
+                          (runtime, memory, cluster counts, quality)
 """
 
 from __future__ import annotations
 
 __all__ = ["__version__"]
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"

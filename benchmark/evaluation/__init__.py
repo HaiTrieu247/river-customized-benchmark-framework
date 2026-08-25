@@ -1,19 +1,32 @@
-"""Evaluation: cluster quality, drift adaptation, efficiency, aggregation (§10)."""
+"""Evaluation: cluster quality, efficiency, the online runner, aggregation."""
 
 from __future__ import annotations
 
-from .adaptation import AdaptationMetrics, compute_adaptation
-from .clustering_quality import ari, nmi, purity
+from .aggregation import aggregate_runs
+from .clustering_quality import (
+    ami,
+    ari,
+    calinski_harabasz,
+    davies_bouldin,
+    nmi,
+    purity,
+    silhouette,
+)
 from .efficiency import EfficiencyMetrics
-from .runner import WindowRecord, run_experiment
+from .runner import Checkpoint, RunResult, WindowQuality, run_once
 
 __all__ = [
     "ari",
     "nmi",
+    "ami",
     "purity",
-    "AdaptationMetrics",
-    "compute_adaptation",
+    "silhouette",
+    "davies_bouldin",
+    "calinski_harabasz",
     "EfficiencyMetrics",
-    "WindowRecord",
-    "run_experiment",
+    "Checkpoint",
+    "WindowQuality",
+    "RunResult",
+    "run_once",
+    "aggregate_runs",
 ]

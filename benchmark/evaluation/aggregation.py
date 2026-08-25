@@ -1,4 +1,9 @@
-"""Aggregate repeated runs across seeds -> mean +/- std (§20)."""
+"""Aggregate repeated runs (across seeds) into mean +/- std.
+
+Streaming clusterers can depend on seed / initialisation, so a robust benchmark
+repeats each (algorithm, setting, dataset) run over several seeds and reports
+mean +/- std rather than a single number.
+"""
 
 from __future__ import annotations
 
@@ -29,54 +34,37 @@ def _agg(values) -> Aggregate | None:
     return Aggregate(float(arr.mean()), float(arr.std(ddof=0)), len(vals))
 
 
-def aggregate_efficiency(results) -> dict:
-    """Aggregate efficiency across a list of ExperimentResult (same algo/scenario)."""
-    keys = ["total_runtime_s", "throughput_sps", "ms_per_sample", "peak_memory_mb", "mean_micro_clusters"]
-    buckets = defaultdict(list)
+_EFF_KEYS = [
+    "total_runtime_s", "throughput_sps", "ms_per_sample", "peak_memory_mb",
+    "mean_micro_clusters", "max_micro_clusters", "final_macro_clusters",
+]
+
+
+def aggregate_runs(results) -> dict:
+    """Aggregate a list of RunResult (same algorithm/setting/dataset) over seeds.
+
+    Returns aggregated efficiency, whole-stream quality, and the mean-over-stream
+    summary (mean/median/final per metric) — each as mean/std/n across seeds.
+    """
+    eff = defaultdict(list)
+    qual = defaultdict(list)
+    stream = defaultdict(lambda: defaultdict(list))  # metric -> stat -> [values]
     for r in results:
         d = r.efficiency.to_dict()
-        for k in keys:
-            buckets[k].append(d.get(k))
-    return {k: (_agg(v).to_dict() if _agg(v) else None) for k, v in buckets.items()}
+        for k in _EFF_KEYS:
+            eff[k].append(d.get(k))
+        for k, v in r.quality.items():
+            qual[k].append(v)
+        for m, stats in r.quality_stream.items():
+            for stat, v in stats.items():
+                stream[m][stat].append(v)
 
-
-def aggregate_adaptation(results) -> dict:
-    """Aggregate per-drift adaptation metrics across seeds, keyed by drift_id."""
-    by_drift: dict[int, dict[str, list]] = defaultdict(lambda: defaultdict(list))
-    meta: dict[int, dict] = {}
-    fields = [
-        "quality_before", "quality_min", "performance_drop", "recovery_time",
-        "adaptation_delay", "post_drift_quality", "area_under_recovery",
-    ]
-    for r in results:
-        for a in r.adaptation:
-            d = a.to_dict()
-            did = d["drift_id"]
-            meta[did] = {"drift_type": d["drift_type"], "drift_start": d["drift_start"]}
-            for f in fields:
-                by_drift[did][f].append(d.get(f))
-            by_drift[did]["_recovered"].append(1.0 if a.recovered else 0.0)
-    out = {}
-    for did, cols in by_drift.items():
-        entry = dict(meta[did])
-        for f in fields:
-            agg = _agg(cols[f])
-            entry[f] = agg.to_dict() if agg else None
-        rec = _agg(cols["_recovered"])
-        entry["recovery_rate"] = round(rec.mean, 3) if rec else None
-        out[did] = entry
-    return out
-
-
-def aggregate_quality_curves(results, metric: str = "ari"):
-    """Average quality curves aligned on window center (§23 plotting)."""
-    series = defaultdict(list)
-    for r in results:
-        for w in r.windows:
-            v = w.metrics.get(metric)
-            if v is not None:
-                series[w.center].append(v)
-    centers = sorted(series)
-    means = [float(np.mean(series[c])) for c in centers]
-    stds = [float(np.std(series[c], ddof=0)) for c in centers]
-    return centers, means, stds
+    return {
+        "n_runs": len(results),
+        "efficiency": {k: (_agg(v).to_dict() if _agg(v) else None) for k, v in eff.items()},
+        "quality": {k: (_agg(v).to_dict() if _agg(v) else None) for k, v in qual.items()},
+        "quality_stream": {
+            m: {stat: (_agg(v).to_dict() if _agg(v) else None) for stat, v in stats.items()}
+            for m, stats in stream.items()
+        },
+    }

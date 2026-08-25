@@ -51,3 +51,5 @@ Thumbs.db
 # Local data files (large / not for VCS)
 cup98LRN.txt
 *.txt.gz
+
+*.log

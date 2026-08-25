@@ -1,12 +1,14 @@
-"""Benchmark harness (§14, §16, §20).
+"""Benchmark harness: run many algorithm settings on the same dataset.
 
-Enforces the protocol from the direction doc:
+The core idea of this framework: define a dataset and a list of *settings*
+(algorithm + params + scaler), then run them all on the identical stream and
+compare execution time / RAM / cluster counts (and quality when labels exist).
 
-* every algorithm runs on the *same* stream for a given (scenario, seed) (§14);
-* runs are repeated over multiple seeds and aggregated to mean +/- std (§20);
-* nothing about the ground truth is passed to the model (Principle 1) — the
-  harness only hands the model the feature dict, and keeps ground truth for the
-  evaluator.
+Reproducibility rules enforced:
+
+* every setting consumes the *same* dataset stream from the start (no shuffling);
+* runs can be repeated over multiple seeds and aggregated to mean +/- std;
+* each setting records its full params + scaler so results are reproducible.
 """
 
 from __future__ import annotations
@@ -14,102 +16,98 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from ..algorithms.registry import get_algorithm
-from ..datasets.synthetic.scenarios import SCENARIOS
-from ..evaluation.aggregation import (
-    aggregate_adaptation,
-    aggregate_efficiency,
-    aggregate_quality_curves,
-)
-from ..evaluation.runner import ExperimentResult, run_experiment
+from ..datasets.base import Dataset
+from ..evaluation.aggregation import aggregate_runs
+from ..evaluation.runner import RunResult, run_once
+
+
+@dataclass
+class Setting:
+    """One benchmark configuration: an algorithm + params + scaler.
+
+    ``label`` is what shows up in reports; defaults to a readable combination of
+    algorithm and scaler. Add several settings of the same algorithm (different
+    params/scaler) to compare configurations side by side.
+    """
+
+    algorithm: str
+    params: dict = field(default_factory=dict)
+    scaler: str = "none"
+    label: str | None = None
+
+    def display(self) -> str:
+        if self.label:
+            return self.label
+        suffix = f" [{self.scaler}]" if self.scaler != "none" else ""
+        return f"{self.algorithm}{suffix}"
 
 
 @dataclass
 class BenchmarkConfig:
-    """Fixed experimental conditions for reproducibility (§14, Principle 5)."""
+    """Fixed experimental conditions for a benchmark run."""
 
-    algorithms: tuple[str, ...] = ("CluStream", "DenStream", "DBSTREAM", "STREAMKMeans")
-    seeds: tuple[int, ...] = (1, 2, 3)
-    n_samples: int | None = None  # None => each scenario's default size
+    settings: list[Setting] = field(default_factory=list)
+    seeds: tuple[int, ...] = (1,)
+    n_samples: int | None = None
+    n_checkpoints: int = 20
     window_size: int = 1000
-    metrics: tuple[str, ...] = ("ari", "nmi", "purity")
-    recovery_fraction: float = 0.95
-    # per-algorithm param overrides, e.g. {"DenStream": {"epsilon": 3.0}}
-    overrides: dict = field(default_factory=dict)
+    external_metrics: tuple[str, ...] = ("ari", "nmi", "ami", "purity")
+    internal_metrics: tuple[str, ...] = ()
 
 
-def _make_stream(scenario: str, seed: int, n_samples: int | None):
-    if scenario not in SCENARIOS:
-        raise KeyError(f"unknown scenario {scenario!r}; available: {sorted(SCENARIOS)}")
-    factory = SCENARIOS[scenario]
-    kwargs = {"seed": seed}
-    if n_samples is not None:
-        kwargs["n_samples"] = n_samples
-    return factory(**kwargs)
+def _apply_seed(params: dict, seed: int) -> dict:
+    """Best-effort: propagate the run seed to algorithms that accept one."""
+    out = dict(params)
+    out.setdefault("seed", seed)
+    return out
 
 
-def run_scenario(
-    scenario: str,
-    config: BenchmarkConfig | None = None,
-    seed: int | None = None,
-) -> list[ExperimentResult]:
-    """Run every configured algorithm once on ``scenario`` (single seed).
+def run_setting(
+    setting: Setting,
+    dataset: Dataset,
+    config: BenchmarkConfig,
+    seed: int,
+) -> RunResult:
+    """Run a single setting once on ``dataset`` with the given seed."""
+    params = dict(setting.params)
+    # only inject seed if the algorithm constructor takes one (get_algorithm
+    # passes **overrides straight to the factory; unknown kwargs would raise)
+    from ..algorithms.registry import ALGORITHMS  # local import to avoid cycle
 
-    All algorithms share the identical stream for the chosen seed (§14).
-    """
-    config = config or BenchmarkConfig()
-    seed = config.seeds[0] if seed is None else seed
-    results: list[ExperimentResult] = []
-    for alg in config.algorithms:
-        # rebuild the stream per algorithm so each consumes it from the start,
-        # but with the same seed => identical sample sequence (§14).
-        stream, gt = _make_stream(scenario, seed, config.n_samples)
-        overrides = config.overrides.get(alg, {})
-        adapter = get_algorithm(alg, **overrides)
-        results.append(
-            run_experiment(
-                adapter, stream, gt,
-                window_size=config.window_size,
-                metrics=config.metrics,
-                recovery_fraction=config.recovery_fraction,
-                scenario_name=scenario,
-            )
+    try:
+        adapter = get_algorithm(
+            setting.algorithm, display_name=setting.display(),
+            scaler=setting.scaler, **_apply_seed(params, seed),
         )
-    return results
+    except TypeError:
+        # algorithm does not accept a seed kwarg
+        adapter = get_algorithm(
+            setting.algorithm, display_name=setting.display(),
+            scaler=setting.scaler, **params,
+        )
+    return run_once(
+        adapter, dataset,
+        n_samples=config.n_samples,
+        n_checkpoints=config.n_checkpoints,
+        window_size=config.window_size,
+        external_metrics=config.external_metrics,
+        internal_metrics=config.internal_metrics,
+    )
 
 
-def run_scenario_repeated(
-    scenario: str,
-    config: BenchmarkConfig | None = None,
-) -> dict:
-    """Run ``scenario`` over all seeds and aggregate (§20).
+def run_benchmark(dataset: Dataset, config: BenchmarkConfig) -> list[RunResult]:
+    """Run every setting once (first seed) on ``dataset``. Returns flat results."""
+    seed = config.seeds[0]
+    return [run_setting(s, dataset, config, seed) for s in config.settings]
 
-    Returns a dict with raw results per seed plus aggregated efficiency,
-    adaptation and averaged quality curves per algorithm.
+
+def run_benchmark_repeated(dataset: Dataset, config: BenchmarkConfig) -> dict:
+    """Run every setting over all seeds and aggregate to mean +/- std.
+
+    Returns ``{setting_label: {"runs": [...], "aggregate": {...}}}``.
     """
-    config = config or BenchmarkConfig()
-    per_alg: dict[str, list[ExperimentResult]] = {a: [] for a in config.algorithms}
-    for seed in config.seeds:
-        for r in run_scenario(scenario, config, seed=seed):
-            per_alg[r.algorithm].append(r)
-
-    summary = {}
-    for alg, runs in per_alg.items():
-        centers, means, stds = aggregate_quality_curves(runs, metric=config.metrics[0])
-        summary[alg] = {
-            "efficiency": aggregate_efficiency(runs),
-            "adaptation": aggregate_adaptation(runs),
-            "quality_curve": {"center": centers, "mean": means, "std": stds},
-            "n_runs": len(runs),
-        }
-    return {"scenario": scenario, "seeds": list(config.seeds), "algorithms": summary,
-            "raw": per_alg}
-
-
-def run_matrix(
-    scenarios: tuple[str, ...] | None = None,
-    config: BenchmarkConfig | None = None,
-) -> dict:
-    """Run the whole scenario matrix (§16), repeated over seeds (§20)."""
-    config = config or BenchmarkConfig()
-    scenarios = scenarios or tuple(SCENARIOS.keys())
-    return {s: run_scenario_repeated(s, config) for s in scenarios}
+    out: dict[str, dict] = {}
+    for setting in config.settings:
+        runs = [run_setting(setting, dataset, config, seed) for seed in config.seeds]
+        out[setting.display()] = {"runs": runs, "aggregate": aggregate_runs(runs)}
+    return out
