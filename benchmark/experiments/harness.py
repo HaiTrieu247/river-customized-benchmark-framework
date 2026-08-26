@@ -33,13 +33,16 @@ class Setting:
     algorithm: str
     params: dict = field(default_factory=dict)
     scaler: str = "none"
+    scaler_params: dict = field(default_factory=dict)
     label: str | None = None
 
     def display(self) -> str:
         if self.label:
             return self.label
-        suffix = f" [{self.scaler}]" if self.scaler != "none" else ""
-        return f"{self.algorithm}{suffix}"
+        if self.scaler == "none":
+            return self.algorithm
+        detail = ",".join(f"{k}={v}" for k, v in sorted(self.scaler_params.items()))
+        return f"{self.algorithm} [{self.scaler}{'/' + detail if detail else ''}]"
 
 
 @dataclass
@@ -55,13 +58,6 @@ class BenchmarkConfig:
     internal_metrics: tuple[str, ...] = ()
 
 
-def _apply_seed(params: dict, seed: int) -> dict:
-    """Best-effort: propagate the run seed to algorithms that accept one."""
-    out = dict(params)
-    out.setdefault("seed", seed)
-    return out
-
-
 def run_setting(
     setting: Setting,
     dataset: Dataset,
@@ -69,22 +65,20 @@ def run_setting(
     seed: int,
 ) -> RunResult:
     """Run a single setting once on ``dataset`` with the given seed."""
-    params = dict(setting.params)
-    # only inject seed if the algorithm constructor takes one (get_algorithm
-    # passes **overrides straight to the factory; unknown kwargs would raise)
-    from ..algorithms.registry import ALGORITHMS  # local import to avoid cycle
+    from ..algorithms.registry import accepts_seed  # local import to avoid cycle
 
-    try:
-        adapter = get_algorithm(
-            setting.algorithm, display_name=setting.display(),
-            scaler=setting.scaler, **_apply_seed(params, seed),
-        )
-    except TypeError:
-        # algorithm does not accept a seed kwarg
-        adapter = get_algorithm(
-            setting.algorithm, display_name=setting.display(),
-            scaler=setting.scaler, **params,
-        )
+    params = dict(setting.params)
+    # Inject the run seed only into algorithms whose constructor declares one.
+    # Deciding by signature (rather than constructing and catching TypeError)
+    # keeps a genuine bad-parameter error visible instead of silently retrying
+    # with a different configuration than the one that was asked for.
+    if accepts_seed(setting.algorithm):
+        params.setdefault("seed", seed)
+
+    adapter = get_algorithm(
+        setting.algorithm, display_name=setting.display(),
+        scaler=setting.scaler, scaler_params=setting.scaler_params, **params,
+    )
     return run_once(
         adapter, dataset,
         n_samples=config.n_samples,
@@ -92,6 +86,7 @@ def run_setting(
         window_size=config.window_size,
         external_metrics=config.external_metrics,
         internal_metrics=config.internal_metrics,
+        seed=seed,
     )
 
 

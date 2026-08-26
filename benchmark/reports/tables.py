@@ -39,16 +39,21 @@ def _fmt(v) -> str:
 
 # --- flat (single-seed) tables ---------------------------------------------
 def efficiency_table(results) -> str:
-    """Runtime / throughput / memory / cluster comparison for a list of RunResult."""
+    """Runtime / throughput / memory / cluster comparison for a list of RunResult.
+
+    ``Model MB`` is river's model-only footprint (the comparable number);
+    ``RSS MB`` is whole-process resident memory, shown for context.
+    """
     headers = ["Setting", "Samples", "Runtime (s)", "Throughput (sps)", "ms/sample",
-               "Memory (MB)", "Mean MC", "Max MC", "Macro K"]
+               "Model MB", "RSS MB", "Mean MC", "Max MC", "Macro K", "Cold-start"]
     rows = []
     for r in results:
         e = r.efficiency.to_dict()
         rows.append([
             r.algorithm, r.n_samples, e["total_runtime_s"], e["throughput_sps"],
-            e["ms_per_sample"], e["peak_memory_mb"], e["mean_micro_clusters"],
-            e["max_micro_clusters"], e["final_macro_clusters"],
+            e["ms_per_sample"], e["peak_memory_mb"], e.get("peak_process_rss_mb"),
+            e["mean_micro_clusters"], e["max_micro_clusters"], e["final_macro_clusters"],
+            r.n_fallback_predictions,
         ])
     return format_table(headers, rows)
 
@@ -62,13 +67,21 @@ def quality_table(results, metrics=("ari", "nmi", "ami", "purity")) -> str:
     return format_table(headers, rows)
 
 
-def stream_quality_table(results, metric="ari") -> str:
-    """Time-aware summary of one metric: mean / median / final over windows."""
-    headers = ["Setting", f"Mean {metric.upper()}", f"Median {metric.upper()}",
-               f"Final {metric.upper()}"]
+def stream_quality_table(results, metric="ari", cumulative=False) -> str:
+    """Time-aware summary of one metric: mean / median / final over windows.
+
+    By default this summarises the **per-window** values (each window scored on
+    its own samples), which is the time-aware protocol number. Pass
+    ``cumulative=True`` to summarise the converging from-stream-start curve
+    instead.
+    """
+    source = "quality_cumulative_stream" if cumulative else "quality_stream"
+    kind = "cum." if cumulative else "win."
+    headers = ["Setting", f"Mean {metric.upper()} ({kind})",
+               f"Median {metric.upper()} ({kind})", f"Final {metric.upper()} ({kind})"]
     rows = []
     for r in results:
-        s = r.quality_stream.get(metric, {})
+        s = getattr(r, source).get(metric, {})
         rows.append([r.algorithm, s.get("mean"), s.get("median"), s.get("final")])
     return format_table(headers, rows)
 
@@ -82,7 +95,7 @@ def _agg_cell(agg: dict | None) -> str:
 
 def efficiency_table_agg(digest: dict) -> str:
     """Aggregated efficiency table from run_benchmark_repeated digest."""
-    headers = ["Setting", "Runs", "Runtime (s)", "Throughput (sps)", "Memory (MB)",
+    headers = ["Setting", "Runs", "Runtime (s)", "Throughput (sps)", "Model MB",
                "Mean MC", "Max MC", "Macro K"]
     rows = []
     for label, block in digest.items():
@@ -111,7 +124,7 @@ def quality_table_agg(digest: dict, metrics=("ari", "nmi", "ami", "purity")) -> 
 
 
 def stream_quality_table_agg(digest: dict, metric="ari") -> str:
-    """Aggregated time-aware summary: mean-over-stream of a metric (mean ± std)."""
+    """Aggregated time-aware summary over per-window values (mean ± std over seeds)."""
     headers = ["Setting", "Runs", f"Mean {metric.upper()}", f"Median {metric.upper()}",
                f"Final {metric.upper()}"]
     rows = []
@@ -122,4 +135,49 @@ def stream_quality_table_agg(digest: dict, metric="ari") -> str:
             label, agg["n_runs"], _agg_cell(s.get("mean")),
             _agg_cell(s.get("median")), _agg_cell(s.get("final")),
         ])
+    return format_table(headers, rows)
+
+
+def window_diagnostics_table(results) -> str:
+    """How much the per-window scores can be trusted on this stream.
+
+    On a window holding a single ground-truth class, ARI degenerates into a
+    "did you lump the whole window together?" test: 1.0 for lumping, 0.0 for any
+    split, whatever the clustering is worth. A stream that arrives block-ordered
+    by class therefore rewards under-segmentation, and this table makes that
+    visible instead of letting it pass as a good result.
+    """
+    d = next((r.window_label_diagnostics for r in results if r.window_label_diagnostics), None)
+    if not d:
+        return "(no labeled windows)"
+    headers = ["Windows", "Single-class windows", "Share", "Median majority-class share"]
+    rows = [[
+        d["n_windows"], d["n_single_class_windows"],
+        f"{d['single_class_window_share']:.0%}", d["median_majority_class_share"],
+    ]]
+    return format_table(headers, rows)
+
+
+def structure_table(results) -> str:
+    """Structure summary for clusterers that do not partition samples.
+
+    ODAC clusters the *variables*, so ARI/NMI/AMI/purity are undefined for it and
+    it is absent from the quality tables. What it does produce is a hierarchy,
+    and its size and depth are the meaningful outputs — reported here so the run
+    is still comparable on something rather than silently dropped.
+    """
+    rows = []
+    for r in results:
+        if r.partitions_samples or not r.structure:
+            continue
+        rows.append([
+            r.algorithm,
+            r.structure.get("n_clusters"),
+            r.structure.get("n_active_clusters"),
+            r.structure.get("height"),
+            round(r.efficiency.throughput_sps, 1),
+        ])
+    if not rows:
+        return "(no structure-only algorithms in this run)"
+    headers = ["Setting", "Variable clusters", "Active", "Tree height", "Throughput (sps)"]
     return format_table(headers, rows)

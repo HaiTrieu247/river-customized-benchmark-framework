@@ -34,10 +34,17 @@ _KDD99_DROP = {
     "land", "logged_in", "is_host_login", "is_guest_login",  # binary
 }
 _KDD99_CONTINUOUS = [c for c in _KDD99_COLUMNS if c not in _KDD99_DROP]  # 34
+#: The 3 nominal columns, streamed as strings when include_nominal is set.
+#: They need a categorical encoder in the preprocessing chain to be usable.
+_KDD99_NOMINAL = ["protocol_type", "service", "flag"]
 
 
-def load_kddcup99(n_samples: int | None = None, percent10: bool = True) -> IterableDataset:
-    """Load KDDCup99 as a benchmark dataset (34 continuous features, README).
+def load_kddcup99(
+    n_samples: int | None = None,
+    percent10: bool = True,
+    include_nominal: bool = False,
+) -> IterableDataset:
+    """Load KDDCup99 as a benchmark dataset.
 
     Parameters
     ----------
@@ -45,27 +52,86 @@ def load_kddcup99(n_samples: int | None = None, percent10: bool = True) -> Itera
         Cap the number of streamed records (``None`` => all).
     percent10:
         Use the standard 10% subset (much faster) instead of the full set.
+    include_nominal:
+        Also stream the 3 nominal columns (``protocol_type``, ``service``,
+        ``flag``) as strings, giving 37 features instead of 34.
+
+        They are dropped by default because a clusterer cannot take a distance
+        between two strings — but dropping them throws away real information
+        (``service`` alone has 60+ levels and separates attack types well). With
+        a categorical encoder in the preprocessing chain they become usable::
+
+            Setting("DBSTREAM", scaler="one_hot_categorical|standard")
+
+        Use ``one_hot_categorical`` rather than plain ``one_hot``: the latter
+        encodes *every* key it is handed, so on this dataset it would turn each
+        distinct value of ``duration`` into its own indicator column.
     """
 
+    columns = _KDD99_CONTINUOUS + (_KDD99_NOMINAL if include_nominal else [])
+
+    # Fetched once and cached on the loader, so repeated settings/seeds re-stream
+    # the identical records without re-reading the archive.
+    cache: dict = {}
+
+    def _fetch():
+        if not cache:
+            from sklearn.datasets import fetch_kddcup99
+
+            bunch = fetch_kddcup99(percent10=percent10, as_frame=True)
+            df = bunch.frame
+            limit = len(df) if n_samples is None else min(n_samples, len(df))
+            # Materialise once as a float matrix + label list. Going through
+            # `.iat` per cell instead costs 34 pandas lookups per record, which
+            # dominates the wall clock and adds nothing to what is measured.
+            cache["X"] = df[_KDD99_CONTINUOUS].to_numpy(dtype=float)[:limit]
+            cache["y"] = [
+                _as_text(v) for v in df["labels"].to_numpy()[:limit]
+            ]
+            cache["nominal"] = (
+                [
+                    [_as_text(v) for v in df[col].to_numpy()[:limit]]
+                    for col in _KDD99_NOMINAL
+                ]
+                if include_nominal
+                else []
+            )
+        return cache["X"], cache["y"], cache["nominal"]
+
     def factory():
-        from sklearn.datasets import fetch_kddcup99
+        X, y, nominal = _fetch()
+        n_num = len(_KDD99_CONTINUOUS)
+        for i, (row, label) in enumerate(zip(X, y)):
+            x = dict(zip(columns[:n_num], row.tolist()))
+            for name, values in zip(_KDD99_NOMINAL, nominal):
+                x[name] = values[i]
+            yield x, label
 
-        bunch = fetch_kddcup99(percent10=percent10, as_frame=True)
-        df = bunch.frame
-        labels = df["labels"]
-        rows = df[_KDD99_CONTINUOUS]
-        limit = len(df) if n_samples is None else min(n_samples, len(df))
-        for i in range(limit):
-            x = {c: float(rows.iat[i, j]) for j, c in enumerate(_KDD99_CONTINUOUS)}
-            y = labels.iat[i]
-            y = y.decode() if isinstance(y, bytes) else str(y)
-            yield x, y
+    def length_fn():
+        return len(_fetch()[1])
 
-    length = None
-    return IterableDataset(
-        factory, name="kddcup99", n_features=len(_KDD99_CONTINUOUS),
-        has_labels=True, length=length,
+    return _LazyLenDataset(
+        factory,
+        name="kddcup99_mixed" if include_nominal else "kddcup99",
+        n_features=len(columns),
+        has_labels=True,
+        length_fn=length_fn,
     )
+
+
+def _as_text(value) -> str:
+    return value.decode() if isinstance(value, bytes) else str(value)
+
+
+class _LazyLenDataset(IterableDataset):
+    """Dataset whose length is only known once the archive has been fetched."""
+
+    def __init__(self, factory, name, n_features, has_labels, length_fn):
+        super().__init__(factory, name=name, n_features=n_features, has_labels=has_labels)
+        self._length_fn = length_fn
+
+    def __len__(self) -> int:
+        return self._length_fn()
 
 
 # --- KDDCup98: the 56 RFM fields (README) ----------------------------------

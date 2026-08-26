@@ -1,176 +1,179 @@
-# River Customized Benchmark Framework
+# River clustering benchmark framework
 
-A set of **hand-written** benchmark notebooks for River's clustering module
-([River](https://riverml.xyz), `river.cluster`). Goal: reproduce and verify
-streaming clustering algorithms on real data, following the exact evaluation
-protocol of the original papers — rather than relying on the library's minimal
-built-in toy examples.
+A measurement framework for [River](https://riverml.xyz)'s `river.cluster` module.
 
-This repo is a **dedicated benchmark playground**: whenever a new aspect of
-`river.cluster` needs measuring (cluster quality, execution time, RAM, behavior on
-evolving streams...), add a notebook here instead of editing river's source.
+It runs whatever configuration you ask for under one consistent streaming
+protocol and reports the result honestly — including when a metric is
+meaningless for the configuration you chose.
 
----
-
-## Why this repo exists
-
-River ships many streaming clustering algorithms (CluStream, DenStream, DBSTREAM,
-STREAMKMeans...), but its bundled evaluation is very minimal. When you need to
-answer questions like:
-
-- Does this algorithm reproduce the **cluster purity** the original paper reports?
-- How much **time / RAM** does it cost as the stream grows?
-- How do preprocessing (scaler) and parameters (`epsilon`, `mu`, `beta`...) affect
-  the number of clusters `K` and purity?
-- Does river's implementation **match the paper's description**, or has it been
-  adapted for the online setting?
-
-...you need a tightly controlled measurement harness: correct features, correct
-stream order, correct purity formula, correct parameters. That is what this repo
-does.
+**What this is not:** a set of tuned results or recommended hyperparameters.
+Choosing and optimising parameters and dataset settings is your call; the
+framework's job is to make those choices measurable and comparable. Defaults that
+ship here are runnable placeholders, and say so.
 
 ---
 
-## Core concepts
+## Two rules
 
-### Streaming (online) clustering
-There is no separate "train" then "deploy" phase. Each incoming data point is first
-**assigned to a cluster** (`predict_one`) and then **learned** (`learn_one`),
-exactly like a system running on a live data stream. A dataset is turned into a
-stream by taking the **record order in the file as the streaming order** (data
-input order) — no shuffling.
+1. **The `river/` tree is never modified.** It is a vendored upstream dependency.
+   Suspected bugs go in [RIVER_BUGS.md](RIVER_BUGS.md) and are worked around on
+   this side of the boundary. Patching river locally would mean benchmarking a
+   modified library instead of the real one — and the patch disappears on the
+   next revert, which has already happened once.
+2. **Build the framework, not the results.** Expose knobs and diagnostics rather
+   than baking in opinions.
 
-## Data & preprocessing
-
-Both datasets are processed exactly as described in the streaming clustering papers.
-
-### KDDCup99 — Network Intrusion Detection
-- Uses exactly the **34 continuous attributes** out of 42. Dropped:
-  - 3 nominal columns: `protocol_type`, `service`, `flag`
-  - 4 binary columns: `land`, `logged_in`, `is_host_login`, `is_guest_login`
-  - the label column `labels` (used only as ground truth for purity, never fed to
-    clustering)
-  - → `42 − 3 − 4 − 1 = 34`.
-- Label `y` = connection type (`normal` / various attack types).
-- Loaded automatically via `sklearn.datasets.fetch_kddcup99` (no local file needed).
-
-### KDDCup98 — Charitable Donation
-- Uses **56 fields** extracted from the 481 fields of each record (the RFM donation
-  history set): 22 `RAMNT_3..24` (repeated donation amounts) + 22 `RDATE_3..24`
-  (repeated donation dates) + 12 summary fields (`RAMNTALL`, `NGIFTALL`, `MINRAMNT`,
-  `MAXRAMNT`, `LASTGIFT`, `AVGGIFT`, `CARDPROM`, `NUMPROM`, `CARDGIFT`, `NUMPRM12`,
-  `TIMELAG`, `CARDPM12`).
-- Label `y` = `TARGET_B` (0/1: whether the recipient donated).
-- Read from the local file `cup98LRN.txt` (481 columns). **Path must be adjusted** —
-  see below.
-
-> **Note:** the CluStream paper does not explicitly list the 56 fields, so this is
-> the RFM field set commonly used to reconstruct the KDD98 stream. If you have a
-> different official list, just edit `KDD98_FIELDS` in the loader.
+Full working rules: [AGENTS.md](AGENTS.md).
 
 ---
 
-## Environment requirements
+## Quick start
 
-- Python 3.10+
-- `river` — imported directly from the river source tree next to this repo (see
-  *Importing river*).
-- `numpy`, `pandas`, `matplotlib`, `scikit-learn`, `ipywidgets`
-- Jupyter (notebook / lab / VS Code) — the wizard needs a kernel with `ipywidgets`
-  support.
+```bash
+pip install -r requirements.txt      # river is imported from ../river, not pip
 
-### Importing river
-The `benchmark_cluster_initial.ipynb` notebook **does not install river via pip**;
-it inserts the river source tree root into `sys.path` to import directly from
-source:
-
-```python
-_repo_root = os.path.abspath(os.path.join(os.getcwd(), "..", ".."))
-sys.path.insert(0, _repo_root)
+python run_benchmark.py              # synthetic stream, sensible defaults
+python -m pytest tests -q            # 92 tests
 ```
 
-Expected directory layout (the benchmark repo sits **next to** the river tree):
+`run_benchmark.py` is the only entry point; everything is driven from the command
+line.
+
+```bash
+# your parameters, as JSON — anything unnamed falls back to river's own defaults
+python run_benchmark.py --dataset kdd99 --n-samples 50000 \
+    --algorithms DenStream,DBSTREAM \
+    --params '{"DenStream": {"epsilon": 0.5, "mu": 2.5}}' \
+    --scalers standard
+
+# compare preprocessing chains for one algorithm
+python run_benchmark.py --algorithms DBSTREAM \
+    --scalers 'standard,standard_safe,variance_threshold|standard'
+
+# a text stream and the clusterer that consumes token counts
+python run_benchmark.py --dataset sms_spam --algorithms TextClust \
+    --scalers bag_of_words --scaler-params '{"bag_of_words": {"on": "body"}}'
+
+# reproducible figures — see RIVER_BUGS.md BUG-2 for why this matters
+PYTHONHASHSEED=0 python run_benchmark.py --dataset insects --seeds 1,2,3
+```
+
+Results land in `benchmark_out/<dataset>/`: `report.md`, `results.json` (full
+per-window and per-checkpoint trajectories), and PNG plots. `--help` lists every
+flag.
+
+---
+
+## What it measures
+
+| Group | Metrics |
+|---|---|
+| Quality (needs labels) | ARI, NMI, AMI, purity — tracked **cumulatively and per evaluation window** |
+| Quality (no labels) | river's streaming silhouette (`--internal`) |
+| Efficiency | runtime, throughput, ms/sample, model memory, process RSS |
+| Model complexity | micro-cluster and macro-cluster counts, sampled along the stream |
+| Structure | for algorithms that cluster something other than samples |
+| Stability | mean ± std over seeds, with the real run count stated |
+
+Each sample is predicted before it is learned from (test-then-train), every
+setting consumes the identical stream in record order, and the environment is
+recorded with every run.
+
+Two measurement traps the framework handles explicitly:
+
+- **Averaging the cumulative curve is not a time average.** It weights the first
+  window most — exactly the cold start. The time-aware figure uses per-window
+  values; the cumulative curve is reported separately.
+- **A window holding a single class makes external metrics degenerate.** ARI
+  collapses to a "did you lump the whole window together?" test — 1.0 for
+  lumping, 0.0 for any split, regardless of clustering quality, so an
+  under-segmenting model scores well for the wrong reason. The framework measures
+  what share of windows are like this and warns above 30%. On KDDCup99 it is 72%.
+
+Details and formulas: [BENCHMARK.md](BENCHMARK.md) and
+[docs/benchmark_framework_report.tex](docs/benchmark_framework_report.tex).
+
+---
+
+## What it covers
+
+**All 7 clusterers in `river.cluster`**, across the three protocols they actually
+have:
+
+| Protocol | Algorithms |
+|---|---|
+| assigns each sample to a cluster | CluStream, DenStream, DBSTREAM, STREAMKMeans, KMeans |
+| clusters *variables*, not samples | ODAC — scored on structure; external metrics are undefined and omitted |
+| consumes token counts, not coordinates | TextClust — needs a bag-of-words step and a text stream |
+
+**26 unsupervised preprocessing steps**, chainable with `|`: scalers, imputers,
+categorical encoders, random projections, a variance filter, text extractors,
+kernel approximations, and column routing. Anything needing a target is excluded
+by construction — a clustering benchmark has no `y` at learn time.
+
+**Datasets:** a synthetic generator following MOA's `RandomRBFGeneratorEvents`
+(drift, cluster merge/split/appear/disappear, controllable overlap, 7 named
+scenarios), plus KDDCup99, CoverType, INSECTS, Keystroke, Shuttle, Electricity,
+SMS Spam and KDDCup98. All are downloaded and cached on first use except
+KDDCup98, which needs a local `cup98LRN.txt` via `--kdd98-path`. Adding your own
+is a small function — see [STRUCTURE.md](STRUCTURE.md).
+
+---
+
+## Known river bugs
+
+Found while building this, **recorded but not patched**:
+
+| | Effect | Workaround here |
+|---|---|---|
+| BUG-1 | `StandardScaler(window_size=...)` emits **complex numbers** on a constant feature, crashing far from the cause | use the `standard_safe` step |
+| BUG-2 | `KMeans` results depend on `PYTHONHASHSEED`, so `seed` does **not** make a run reproducible across processes | pin `PYTHONHASHSEED`; the environment record carries it |
+
+Reproductions, root causes and suggested upstream fixes: [RIVER_BUGS.md](RIVER_BUGS.md).
+
+---
+
+## Layout
+
+River is imported from the sibling source tree, not from pip:
 
 ```
 OnlineML/
-├── river/                              # river source tree (contains the river/ package)
+├── river/                                  # river source tree — never modified
 └── river-customized-benchmark-framework/
-    ├── benchmark_cluster_initial.ipynb
-    └── evaluate_river_resource_benchmark.ipynb
+    ├── run_benchmark.py                    # the only runner
+    ├── benchmark/                          # the framework package
+    │   ├── algorithms/   datasets/   evaluation/   experiments/   reports/
+    ├── tests/
+    └── docs/
 ```
 
-If your layout differs, adjust `_repo_root` to point at the directory containing the
-`river` package. (The resource notebook uses the river installed in the environment,
-so it does not need this step.)
+`benchmark/algorithms/adapter.py` registers `../river` on `sys.path` at import
+time, so no installation step is needed. If your layout differs, adjust
+`build_river_path()` there.
+
+Requirements: Python 3.10+, plus `requirements.txt`. `matplotlib` and `psutil`
+are listed there but genuinely optional — without them you lose the PNG plots
+and the process-RSS figures respectively, and everything else still runs.
 
 ---
 
-## How to run
+## Documentation
 
-### 1. `benchmark_cluster_initial.ipynb` (cluster quality — with wizard)
-1. Edit `KDD98_PATH` in the data loader cell to point at your `cup98LRN.txt` (KDD99
-   is fetched automatically).
-2. Check that `_repo_root` points at the correct river tree.
-3. Run the cells in order until the wizard opens, then use the widget UI:
-   - **Step 1 — Choose algorithm:** lists **every** clusterer in `river.cluster`
-     (auto-discovered via `base.Clusterer`), pick by number.
-   - **Step 2 — Enter params:** input fields auto-generated from the algorithm's
-     `__init__`, pre-filled with a preset when available.
-   - **Step 3 — Configure scenarios:** each scenario is an independent bundle of
-     *dataset · max samples · horizon · stream speed · scaler · chart type (purity /
-     exec-time) · marks*.
-   - **Step 4 — Run & plot:** only plots the chart type selected per scenario.
-
-   You can add the same algorithm class multiple times with different params
-   (suffixed `#2`, `#3`...) to compare configurations.
-
-### 2. `evaluate_river_resource_benchmark.ipynb` (time & RAM)
-Run top to bottom. Adjustable:
-- `N_SAMPLES` — number of streamed points (`None` = the full 567,498 samples of
-  KDDCup99 HTTP).
-- `N_CHECKPOINTS` — number of `(time, memory)` measurements per model.
-
-Output: **execution time vs samples**, **RAM vs samples**, and a **summary table**.
-`Memory` is measured via `model._raw_memory_usage` (the size of the model object,
-not the whole process).
+| File | Contents |
+|---|---|
+| [STRUCTURE.md](STRUCTURE.md) | what each module does, how to use it, how to add a dataset |
+| [BENCHMARK.md](BENCHMARK.md) | what is measured and why, in detail |
+| [RIVER_BUGS.md](RIVER_BUGS.md) | suspected river bugs, reproductions, workarounds |
+| [AGENTS.md](AGENTS.md) | working rules for this repo |
+| [streaming_clustering_benchmark_evaluation_criteria.md](streaming_clustering_benchmark_evaluation_criteria.md) | the evaluation protocol this implements |
+| [docs/benchmark_framework_report.tex](docs/benchmark_framework_report.tex) | technical report: protocol, formulas, pseudocode, validation |
 
 ---
 
-## Reference parameters (from the original papers)
+## Legacy notebooks
 
-Pre-filled in the presets to reproduce the experiments:
-
-- **DenStream** (Cao et al. 2006): `InitN=1000`, `v (stream_speed)=1000`,
-  `λ (decaying_factor)=0.25`, `ε (epsilon)=16`, `µ (mu)=10`, `β (beta)=0.2`.
-- **CluStream** (Aggarwal et al., VLDB 2003): `q=50` micro-clusters (`=10·k`),
-  `t=2`, `k=5`, `stream_speed=200`, macro-clustering every time unit
-  (`time_gap=200`).
-
----
-
-## Things to keep in mind when reading results
-
-- **The scaler matters a lot.** KDD99 has a few features with an extreme range
-  (`src_bytes`, `dst_bytes` up to the millions). `MinMaxScaler` divides by the max,
-  squashing nearly every point to ~0 → everything merges into a single
-  micro-cluster (`K=1`). Use `StandardScaler`.
-- **`epsilon` must match the scaler.** After `StandardScaler` (std≈1), an `epsilon`
-  that is too large (e.g. 16) makes the **online** phase merge every point into one
-  micro-cluster → `K=1` regardless of what the offline phase does. `epsilon` must be
-  small enough to create multiple micro-clusters first.
-- **River's DenStream is an online-adapted implementation**, not the original
-  DBSCAN: the offline phase runs DBSCAN over **micro-cluster centers** with its own
-  density-reachability definition (weight > `mu`, distance < `2ε` and ≤ the sum of
-  radii). Account for this difference when comparing against the paper.
-
----
-
-## Extending the repo
-
-Adding a new benchmark = adding a notebook, keeping the same conventions:
-- Stream in **data input order**, no shuffling.
-- Purity uses the macro-average formula (per-cluster dominant-class ratio, averaged
-  over `K`).
-- State the scaler + parameters at the top of the notebook so results are
-  reproducible.
-- Be explicit about what is measured (quality / time / RAM) and what is ignored.
+`benchmark_cluster_initial.ipynb` and `evaluate_river_resource_benchmark.ipynb`
+predate the `benchmark/` package and are **superseded by it**. They are kept for
+reference only; they have not been updated for the current framework and are not
+covered by the test suite.

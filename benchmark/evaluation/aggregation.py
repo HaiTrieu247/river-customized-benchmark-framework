@@ -36,7 +36,8 @@ def _agg(values) -> Aggregate | None:
 
 _EFF_KEYS = [
     "total_runtime_s", "throughput_sps", "ms_per_sample", "peak_memory_mb",
-    "mean_micro_clusters", "max_micro_clusters", "final_macro_clusters",
+    "peak_process_rss_mb", "mean_micro_clusters", "max_micro_clusters",
+    "final_macro_clusters",
 ]
 
 

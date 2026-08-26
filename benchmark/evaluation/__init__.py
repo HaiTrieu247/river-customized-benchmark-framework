@@ -4,8 +4,13 @@ from __future__ import annotations
 
 from .aggregation import aggregate_runs
 from .clustering_quality import (
+    EXTERNAL_METRICS,
+    INTERNAL_METRICS,
+    StreamingPurity,
     ami,
     ari,
+    build_external_metrics,
+    build_internal_metrics,
     calinski_harabasz,
     davies_bouldin,
     nmi,
@@ -16,6 +21,17 @@ from .efficiency import EfficiencyMetrics
 from .runner import Checkpoint, RunResult, WindowQuality, run_once
 
 __all__ = [
+    "EfficiencyMetrics",
+    "Checkpoint",
+    "WindowQuality",
+    "RunResult",
+    "run_once",
+    "aggregate_runs",
+    "EXTERNAL_METRICS",
+    "INTERNAL_METRICS",
+    "StreamingPurity",
+    "build_external_metrics",
+    "build_internal_metrics",
     "ari",
     "nmi",
     "ami",
@@ -23,10 +39,4 @@ __all__ = [
     "silhouette",
     "davies_bouldin",
     "calinski_harabasz",
-    "EfficiencyMetrics",
-    "Checkpoint",
-    "WindowQuality",
-    "RunResult",
-    "run_once",
-    "aggregate_runs",
 ]

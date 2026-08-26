@@ -1,127 +1,171 @@
 """Cluster-quality metrics.
 
-External metrics (need ground-truth labels): ARI, NMI, AMI, macro-average
-purity. Internal metrics (no labels needed): silhouette, Davies-Bouldin,
-Calinski-Harabasz. All external metrics operate on the labels seen in a set of
-samples, so the runner can compute them per time-window and build a
-quality-over-time picture rather than a single final score.
+Two families, both needed by the evaluation protocol:
+
+* **streaming metrics** (``build_external_metrics`` / ``build_internal_metrics``)
+  — river metric objects updated one sample at a time. These are what the runner
+  uses along the stream.
+* **batch helpers** (``ari``, ``nmi``, ``ami``, ``purity``, ``silhouette``,
+  ``davies_bouldin``, ``calinski_harabasz``) — one-shot functions over a whole
+  list of labels/points, used by tests and for offline cross-checks against
+  scikit-learn's reference implementations.
+
+External metrics need ground-truth labels; internal ones do not. Samples whose
+ground truth is ``None`` (e.g. injected background noise) are dropped from the
+external computations rather than treated as a class of their own.
 """
 
 from __future__ import annotations
 
-import numpy as np
-from sklearn import metrics as _skm
+import collections
 
-# External metrics keyed by name (all take (y_true, y_pred) -> float | None).
+from river import metrics
+
+
+class StreamingPurity(metrics.base.Metric):
+    """Purity: fraction of samples that fall in their cluster's majority class.
+
+    Maintains a ``cluster -> class -> weight`` matrix and returns
+    ``sum_over_clusters(max_class_weight) / n_samples``. Bounded in [0, 1] but
+    *not* chance-corrected: it grows mechanically with the number of clusters,
+    so read it alongside ARI/AMI rather than on its own.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.matrix = collections.defaultdict(lambda: collections.defaultdict(float))
+        self.n_samples = 0.0
+
+    @property
+    def requires_labels(self):
+        return True
+
+    def update(self, y_true, y_pred, sample_weight=1.0):
+        # river metrics conventionally take y_true, y_pred in update
+        self.matrix[y_pred][y_true] += sample_weight
+        self.n_samples += sample_weight
+        return self
+
+    def revert(self, y_true, y_pred, sample_weight=1.0):
+        self.matrix[y_pred][y_true] -= sample_weight
+        self.n_samples -= sample_weight
+        return self
+
+    def get(self):
+        if self.n_samples == 0:
+            return 0.0
+        majority_sum = 0
+        for cluster_classes in self.matrix.values():
+            if cluster_classes:
+                majority_sum += max(cluster_classes.values())
+        return majority_sum / self.n_samples
+
+    @property
+    def bigger_is_better(self):
+        return True
+
+    def works_with(self, model):
+        return True
+
+
+#: External metrics (need ground truth) exposed by name.
 EXTERNAL_METRICS = ("ari", "nmi", "ami", "purity")
-# Internal metrics keyed by name (all take (x_rows, y_pred) -> float | None).
-INTERNAL_METRICS = ("silhouette", "davies_bouldin", "calinski_harabasz")
+#: Internal metrics (no labels needed) exposed by name.
+INTERNAL_METRICS = ("silhouette",)
 
 
-def _clean(y_true, y_pred):
-    """Drop pairs where the ground-truth label is missing (noise samples)."""
-    yt, yp = [], []
-    for a, b in zip(y_true, y_pred):
-        if a is None or b is None:
-            continue
-        yt.append(a)
-        yp.append(b)
-    return yt, yp
+def build_external_metrics() -> dict:
+    """Fresh river metric objects, keyed by name. Updated as ``(y_true, y_pred)``."""
+    return {
+        "ari": metrics.AdjustedRand(),
+        "nmi": metrics.NormalizedMutualInfo(),
+        "ami": metrics.AdjustedMutualInfo(),
+        "purity": StreamingPurity(),
+    }
+
+
+def build_internal_metrics() -> dict:
+    """Fresh label-free metric objects, keyed by name.
+
+    river's streaming ``Silhouette`` is updated as ``(x, y_pred, centers)`` and,
+    unlike the batch silhouette, is a *cohesion / separation* ratio where
+    **lower is better** (``bigger_is_better is False``). The runner passes the
+    model's centers; clusterers that do not expose centers simply never update
+    it and it reports no value.
+    """
+    return {"silhouette": metrics.Silhouette()}
+
+
+# --- batch helpers (offline cross-checks) ----------------------------------
+def _paired(y_true, y_pred):
+    """Drop pairs whose ground truth is None; return ([...], [...]) or None."""
+    pairs = [(t, p) for t, p in zip(y_true, y_pred) if t is not None]
+    if not pairs:
+        return None
+    return [t for t, _ in pairs], [p for _, p in pairs]
 
 
 def ari(y_true, y_pred) -> float | None:
-    yt, yp = _clean(y_true, y_pred)
-    if len(yt) < 2 or len(set(yt)) < 1:
-        return None
-    return float(_skm.adjusted_rand_score(yt, yp))
+    """Adjusted Rand Index over a whole label sequence (scikit-learn)."""
+    from sklearn.metrics import adjusted_rand_score
+
+    pair = _paired(y_true, y_pred)
+    return None if pair is None else float(adjusted_rand_score(*pair))
 
 
 def nmi(y_true, y_pred) -> float | None:
-    yt, yp = _clean(y_true, y_pred)
-    if len(yt) < 2:
-        return None
-    return float(_skm.normalized_mutual_info_score(yt, yp))
+    """Normalized Mutual Information over a whole label sequence."""
+    from sklearn.metrics import normalized_mutual_info_score
+
+    pair = _paired(y_true, y_pred)
+    return None if pair is None else float(normalized_mutual_info_score(*pair))
 
 
 def ami(y_true, y_pred) -> float | None:
-    """Adjusted Mutual Information — chance-corrected variant of NMI."""
-    yt, yp = _clean(y_true, y_pred)
-    if len(yt) < 2:
-        return None
-    return float(_skm.adjusted_mutual_info_score(yt, yp))
+    """Adjusted Mutual Information over a whole label sequence."""
+    from sklearn.metrics import adjusted_mutual_info_score
+
+    pair = _paired(y_true, y_pred)
+    return None if pair is None else float(adjusted_mutual_info_score(*pair))
 
 
 def purity(y_true, y_pred) -> float | None:
-    """Macro-average purity: per-cluster dominant-class ratio, averaged over K.
-
-    Matches the README convention (macro-average, not the sample-weighted
-    variant), so results line up with the existing notebooks.
-    """
-    yt, yp = _clean(y_true, y_pred)
-    if not yt:
+    """Batch counterpart of :class:`StreamingPurity`."""
+    pair = _paired(y_true, y_pred)
+    if pair is None:
         return None
-    clusters: dict[object, dict[object, int]] = {}
-    for t, p in zip(yt, yp):
-        clusters.setdefault(p, {}).setdefault(t, 0)
-        clusters[p][t] += 1
-    ratios = []
-    for counts in clusters.values():
-        total = sum(counts.values())
-        if total:
-            ratios.append(max(counts.values()) / total)
-    return float(np.mean(ratios)) if ratios else None
+    metric = StreamingPurity()
+    for t, p in zip(*pair):
+        metric.update(t, p)
+    return metric.get()
 
 
-def _valid_internal(x_rows, y_pred):
-    """Shared guard for internal metrics: enough points and >=2 distinct labels."""
-    if len(x_rows) < 3:
+def _n_clusters(labels) -> int:
+    return len(set(labels))
+
+
+def silhouette(X, labels) -> float | None:
+    """Batch silhouette (higher is better). ``None`` when fewer than 2 clusters."""
+    from sklearn.metrics import silhouette_score
+
+    if _n_clusters(labels) < 2 or len(labels) <= _n_clusters(labels):
         return None
-    labels = list(y_pred)
-    n_labels = len(set(labels))
-    if n_labels < 2 or n_labels >= len(labels):
+    return float(silhouette_score(X, labels))
+
+
+def davies_bouldin(X, labels) -> float | None:
+    """Batch Davies-Bouldin index (lower is better)."""
+    from sklearn.metrics import davies_bouldin_score
+
+    if _n_clusters(labels) < 2:
         return None
-    return np.asarray(x_rows, dtype=float), labels
+    return float(davies_bouldin_score(X, labels))
 
 
-def silhouette(x_rows, y_pred) -> float | None:
-    """Silhouette score in [-1, 1]; higher is better."""
-    guard = _valid_internal(x_rows, y_pred)
-    if guard is None:
+def calinski_harabasz(X, labels) -> float | None:
+    """Batch Calinski-Harabasz index (higher is better)."""
+    from sklearn.metrics import calinski_harabasz_score
+
+    if _n_clusters(labels) < 2:
         return None
-    X, labels = guard
-    try:
-        return float(_skm.silhouette_score(X, labels))
-    except Exception:
-        return None
-
-
-def davies_bouldin(x_rows, y_pred) -> float | None:
-    """Davies-Bouldin index; lower is better (>= 0)."""
-    guard = _valid_internal(x_rows, y_pred)
-    if guard is None:
-        return None
-    X, labels = guard
-    try:
-        return float(_skm.davies_bouldin_score(X, labels))
-    except Exception:
-        return None
-
-
-def calinski_harabasz(x_rows, y_pred) -> float | None:
-    """Calinski-Harabasz index; higher is better."""
-    guard = _valid_internal(x_rows, y_pred)
-    if guard is None:
-        return None
-    X, labels = guard
-    try:
-        return float(_skm.calinski_harabasz_score(X, labels))
-    except Exception:
-        return None
-
-
-EXTERNAL_FNS = {"ari": ari, "nmi": nmi, "ami": ami, "purity": purity}
-INTERNAL_FNS = {
-    "silhouette": silhouette,
-    "davies_bouldin": davies_bouldin,
-    "calinski_harabasz": calinski_harabasz,
-}
+    return float(calinski_harabasz_score(X, labels))

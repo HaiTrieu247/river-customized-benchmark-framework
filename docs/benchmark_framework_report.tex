@@ -1,0 +1,1917 @@
+% =====================================================================
+%  Benchmark Framework cho Streaming Clustering tren River
+%  Bien dich:  pdflatex / xelatex / lualatex  (chay 2 lan de co muc luc)
+%    pdflatex benchmark_framework_report.tex
+%    pdflatex benchmark_framework_report.tex
+% =====================================================================
+\documentclass[11pt,a4paper]{article}
+
+\usepackage{iftex}
+\ifPDFTeX
+  \usepackage[utf8]{inputenc}
+  \usepackage[T5]{fontenc}
+  \usepackage{lmodern}
+\else
+  \usepackage{fontspec}
+  \setmainfont{Latin Modern Roman}
+  \setmonofont{Latin Modern Mono}
+\fi
+
+\usepackage[margin=2.5cm]{geometry}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{booktabs}
+\usepackage{multirow}
+\usepackage{array}
+\usepackage{graphicx}
+\usepackage{xcolor}
+\usepackage{tikz}
+\usepackage{pgfplots}
+\pgfplotsset{compat=1.17}
+\usetikzlibrary{arrows.meta,positioning,shapes.geometric,fit,backgrounds}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{listings}
+\usepackage{caption}
+\usepackage[hidelinks]{hyperref}
+
+\definecolor{codebg}{RGB}{246,247,249}
+\definecolor{codekw}{RGB}{20,90,160}
+\definecolor{codecm}{RGB}{110,120,130}
+\lstset{
+  basicstyle=\ttfamily\small,
+  backgroundcolor=\color{codebg},
+  keywordstyle=\color{codekw}\bfseries,
+  commentstyle=\color{codecm}\itshape,
+  frame=single,
+  rulecolor=\color{codebg},
+  breaklines=true,
+  showstringspaces=false,
+  columns=fullflexible,
+  xleftmargin=6pt,
+  framexleftmargin=6pt,
+}
+
+\newtheorem{proposition}{Mệnh đề}
+\newtheorem{definition}{Định nghĩa}
+\theoremstyle{remark}
+\newtheorem{remark}{Nhận xét}
+
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\E}{\mathbb{E}}
+\newcommand{\xt}{\mathbf{x}}
+\newcommand{\ind}[1]{\mathbf{1}\!\left[#1\right]}
+
+\title{\bfseries Một framework benchmark cho \texttt{river.cluster}:\\
+Giao thức đánh giá, độ đo, và những cái bẫy đo lường}
+\author{Báo cáo kỹ thuật --- \texttt{river-customized-benchmark-framework}}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+\noindent
+Báo cáo này mô tả một \textbf{framework đo lường} cho mô-đun
+\texttt{river.cluster}: nó đo cái gì, đo bằng công thức nào, chạy theo giao thức
+nào, và tại sao một số cách đo tưởng như hiển nhiên lại cho kết luận sai. Sản
+phẩm ở đây là \emph{bộ máy đo}, không phải một bảng xếp hạng thuật toán: việc
+chọn và tối ưu siêu tham số cũng như cấu hình dataset thuộc về người dùng, còn
+framework có nhiệm vụ đảm bảo mọi cấu hình đều được chạy dưới cùng một giao thức
+và được báo cáo trung thực.
+
+Chúng tôi hình thức hoá giao thức \emph{test-then-train}; phân biệt rõ hai họ chỉ
+số chất lượng --- \emph{luỹ kế} và \emph{theo cửa sổ} --- và chứng minh rằng lấy
+trung bình đường luỹ kế không phải là ``trung bình theo thời gian''
+(Mệnh đề~\ref{prop:cumbias}). Đóng góp chính về phương pháp là \textbf{chẩn đoán
+cửa sổ thoái hoá}: trên một cửa sổ chỉ chứa một lớp ground truth, ARI suy biến
+thành hàm nhị phân $\{0,1\}$ chỉ phụ thuộc vào việc mô hình có gộp toàn bộ cửa sổ
+lại hay không, hoàn toàn độc lập với chất lượng phân cụm
+(Mệnh đề~\ref{prop:degenerate}). Trên KDDCup99, $72\%$ số cửa sổ kích thước
+$1000$ rơi vào trường hợp này, khiến bảng xếp hạng theo hai chỉ số gần như phản
+bác nhau ($\rho_s = -0.8$); framework do đó đo và cảnh báo trực tiếp tình trạng
+này thay vì để nó lọt qua thành một con số trông như kết quả.
+
+Framework bao phủ \textbf{cả bảy} clusterer của River, kể cả hai cái phá vỡ giao
+thức thông thường (ODAC gom cụm \emph{các biến}; TextClust ăn \emph{token
+counts}), và toàn bộ 25 bước tiền xử lý không giám sát của River, ghép chuỗi
+được. Trong quá trình xây dựng, hai lỗi của River được phát hiện và \textbf{chỉ
+được ghi lại} --- cây nguồn River không bị chỉnh sửa --- kèm phương án né phía
+framework (Mục~\ref{sec:riverbugs}).
+\end{abstract}
+
+\tableofcontents
+\newpage
+
+% =====================================================================
+\section{Giới thiệu}
+% =====================================================================
+
+Phân cụm trên luồng dữ liệu (\emph{streaming clustering}) khác phân cụm truyền
+thống ở ba điểm khiến việc đánh giá trở nên khó: dữ liệu đến tuần tự và chỉ được
+xem một lần, mô hình phải trả lời ngay tại thời điểm nhận mẫu, và tài nguyên
+(thời gian, bộ nhớ) là ràng buộc cứng chứ không phải yếu tố phụ. Vì vậy một
+benchmark cho lớp thuật toán này không thể chỉ báo một con số chất lượng cuối
+cùng; nó phải mô tả được \emph{quỹ đạo} của cả chất lượng lẫn tài nguyên dọc
+theo luồng.
+
+Framework được mô tả ở đây trả lời câu hỏi:
+
+\begin{quote}
+\itshape
+Thuật toán nào cho phân cụm tốt hơn, xử lý nhanh hơn, tốn ít bộ nhớ hơn, và
+mở rộng tốt hơn trên dữ liệu luồng?
+\end{quote}
+
+Nó gồm bốn nhóm chỉ số --- chất lượng, hiệu năng tính toán, độ phức tạp mô
+hình, khả năng mở rộng --- cộng một nhóm thứ năm về độ ổn định qua nhiều seed.
+Phần đóng góp mà chúng tôi cho là quan trọng nhất lại không nằm ở việc thêm chỉ
+số, mà ở việc chỉ ra \emph{khi nào một chỉ số mất ý nghĩa} và đo trực tiếp điều
+đó (Mục~\ref{sec:degenerate}).
+
+\paragraph{Bố cục.}
+Mục~\ref{sec:notation} thiết lập ký hiệu và giao thức trực tuyến.
+Mục~\ref{sec:arch} mô tả kiến trúc.
+Mục~\ref{sec:scaler} trình bày các bộ chuẩn hoá trực tuyến kèm công thức đệ quy.
+Mục~\ref{sec:algos} tóm tắt bốn thuật toán được benchmark.
+Mục~\ref{sec:protocol} là phần trọng tâm: giao thức đánh giá và toàn bộ công
+thức độ đo.
+Mục~\ref{sec:degenerate} trình bày và chứng minh vấn đề cửa sổ thoái hoá.
+Mục~\ref{sec:pseudocode} cho mã giả đầy đủ.
+Mục~\ref{sec:results} là kết quả thực nghiệm.
+Mục~\ref{sec:usage} hướng dẫn chạy.
+Mục~\ref{sec:limits} nêu hạn chế.
+Hình~\ref{fig:arch} tóm tắt kiến trúc và Hình~\ref{fig:timeline} tóm tắt hai
+trục thời gian của phép đánh giá; Mục~\ref{sec:fullbench} là kết quả tổng hợp
+trên cả bốn thuật toán.
+
+% =====================================================================
+\section{Ký hiệu và mô hình bài toán}
+\label{sec:notation}
+% =====================================================================
+
+\subsection{Luồng dữ liệu}
+
+Một \emph{luồng} là dãy hữu hạn có thứ tự
+\begin{equation}
+  \mathcal{S} \;=\; \big( (\xt_t,\, y_t) \big)_{t=1}^{T},
+  \qquad
+  \xt_t \in \R^{d},
+  \qquad
+  y_t \in \mathcal{Y} \cup \{\bot\},
+\end{equation}
+trong đó $\xt_t$ là véc-tơ đặc trưng tại bước $t$ (trong River được biểu diễn
+bằng \texttt{dict} ánh xạ tên đặc trưng sang giá trị), $y_t$ là nhãn ground truth
+dùng \emph{duy nhất} để chấm điểm, và $\bot$ ký hiệu mẫu không có nhãn (ví dụ
+nhiễu nền do bộ sinh dữ liệu chèn vào). Thứ tự $t$ là thứ tự bản ghi trong tập
+dữ liệu --- không xáo trộn, vì thứ tự đến \emph{chính là} một phần của bài toán.
+
+\subsection{Bộ phân cụm trực tuyến}
+
+Một bộ phân cụm trực tuyến là cặp ánh xạ hoạt động trên trạng thái $\theta$:
+\begin{align}
+  \texttt{predict}&:\ (\theta,\ \xt) \;\mapsto\; \hat{y} \in \mathbb{N}, \\
+  \texttt{learn}&:\ (\theta,\ \xt) \;\mapsto\; \theta'.
+\end{align}
+Khác với học có giám sát, \texttt{learn} \emph{không} nhận $y$. Nhãn cụm $\hat y$
+chỉ là định danh, không mang ngữ nghĩa: hai phân hoạch chỉ khác nhau ở cách đánh
+số cụm phải được coi là giống hệt nhau. Đây chính là lý do mọi độ đo ngoại
+(external metric) ở Mục~\ref{sec:external} đều bất biến với hoán vị nhãn.
+
+\subsection{Giao thức test-then-train}
+
+Tại mỗi bước $t$, framework thực hiện đúng ba thao tác theo thứ tự:
+\begin{equation}
+  \label{eq:ttt}
+  \boxed{\;
+  \xt_t \;\xrightarrow{\ \text{scale}\ }\; \tilde\xt_t
+  \;\xrightarrow{\ \texttt{predict}\ }\; \hat y_t
+  \;\xrightarrow{\ \texttt{learn}\ }\; \theta_t
+  \;}
+\end{equation}
+Dự đoán xảy ra \emph{trước} khi học, đúng như một hệ thống chạy thật: khi mẫu
+đến, ta phải trả lời ngay, chưa kịp học từ chính nó. Cách đánh giá này gọi là
+\emph{prequential} (predictive sequential): mỗi mẫu vừa là dữ liệu kiểm thử vừa
+là dữ liệu huấn luyện, và không cần tách tập test riêng.
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  node distance=3mm,
+  box/.style={draw,rounded corners=2pt,minimum height=7mm,minimum width=15mm,
+              font=\small,fill=blue!5},
+  lab/.style={font=\scriptsize\itshape,text=gray!70!black},
+]
+% timeline
+\draw[-{Stealth[length=2mm]},thick] (0,0) -- (14.6,0);
+\node[lab] at (14.9,-0.32) {$t$};
+
+% window blocks
+\foreach \i/\x in {1/0.2, 2/3.8, 3/7.4, 4/11.0} {
+  \draw[fill=blue!8,draw=blue!40] (\x,0.15) rectangle (\x+3.4,1.05);
+  \node[font=\scriptsize] at (\x+1.7,0.6) {cửa sổ $W_{\i}$ ($m$ mẫu)};
+}
+% flush markers
+\foreach \x in {3.6, 7.2, 10.8, 14.4} {
+  \draw[dashed,red!70] (\x,-0.55) -- (\x,1.25);
+}
+\node[lab,text=red!70,anchor=west] at (3.65,1.45) {flush: chốt $M^{\mathrm{win}}_k$, reset metric cửa sổ};
+
+% checkpoints
+\foreach \x in {1.9, 5.5, 9.1, 12.7} {
+  \draw[-{Stealth[length=1.5mm]},orange!85!black,thick] (\x,-1.15) -- (\x,-0.62);
+  \node[circle,fill=orange!85!black,inner sep=1pt] at (\x,-0.55) {};
+}
+\node[lab,text=orange!70!black,anchor=west] at (0.0,-1.45)
+  {checkpoint: đo runtime luỹ kế, bộ nhớ mô hình, số micro-cluster};
+
+% cumulative bar
+\draw[{Stealth[length=2mm]}-{Stealth[length=2mm]},thick,green!45!black]
+  (0.2,1.85) -- (14.4,1.85);
+\node[lab,text=green!35!black,anchor=south] at (7.3,1.9)
+  {metric luỹ kế $M^{\mathrm{cum}}$: không bao giờ reset, chạy suốt luồng};
+\end{tikzpicture}
+\caption{Hai trục thời gian của phép đánh giá. Các metric \emph{luỹ kế} chạy
+liên tục từ đầu luồng; các metric \emph{theo cửa sổ} được reset ở mỗi biên. Các
+checkpoint đo tài nguyên nằm trên một lưới độc lập, thưa hơn, vì phép đo bộ nhớ
+rất đắt (Mục~\ref{sec:efficiency}).}
+\label{fig:timeline}
+\end{figure}
+
+% =====================================================================
+\section{Kiến trúc framework}
+\label{sec:arch}
+% =====================================================================
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  node distance=8mm and 12mm,
+  mod/.style={draw,rounded corners=3pt,minimum height=11mm,minimum width=27mm,
+              align=center,font=\small,fill=blue!6,draw=blue!45},
+  out/.style={draw,rounded corners=3pt,minimum height=11mm,minimum width=27mm,
+              align=center,font=\small,fill=green!7,draw=green!45!black},
+  ar/.style={-{Stealth[length=2.2mm]},thick,gray!60!black},
+]
+\node[mod] (ds)  {\texttt{datasets/}\\[-1pt]\scriptsize luồng $(\xt_t,y_t)$};
+\node[mod,right=of ds] (set) {\texttt{Setting}\\[-1pt]\scriptsize thuật toán + params\\[-2pt]\scriptsize + scaler + scaler\_params};
+\node[mod,right=of set] (ad) {\texttt{ClustererAdapter}\\[-1pt]\scriptsize scale $\to$ predict $\to$ learn};
+\node[mod,below=14mm of ad] (run) {\texttt{run\_once}\\[-1pt]\scriptsize runner trực tuyến};
+\node[out,left=of run] (ev) {\texttt{evaluation/}\\[-1pt]\scriptsize metric + checkpoint};
+\node[out,left=of ev] (rep) {\texttt{reports/}\\[-1pt]\scriptsize bảng, đồ thị, JSON};
+
+\draw[ar] (ds) -- (set);
+\draw[ar] (set) -- (ad);
+\draw[ar] (ad) -- (run);
+\draw[ar] (run) -- (ev);
+\draw[ar] (ev) -- (rep);
+\draw[ar] (ds.south) |- ([yshift=-3mm]run.east) -- (run.east);
+\end{tikzpicture}
+\caption{Luồng dữ liệu qua framework. Mọi \texttt{Setting} tiêu thụ \emph{cùng
+một} đối tượng dataset, và dataset trả về iterator mới ở mỗi lần lặp, nên mọi
+thuật toán thấy đúng cùng một dãy bản ghi theo đúng thứ tự.}
+\label{fig:arch}
+\end{figure}
+
+Bảng~\ref{tab:modules} liệt kê vai trò từng mô-đun.
+
+\begin{table}[htbp]
+\centering
+\small
+\caption{Các mô-đun của framework.}
+\label{tab:modules}
+\begin{tabular}{@{}lp{10.2cm}@{}}
+\toprule
+\textbf{Mô-đun} & \textbf{Trách nhiệm} \\
+\midrule
+\texttt{datasets/} & Nguồn luồng \emph{lặp lại được}: sinh Gaussian tổng hợp, KDDCup99 (34 đặc trưng liên tục), KDDCup98 (56 trường RFM). \\
+\texttt{algorithms/registry} & Đăng ký thuật toán + preset tham số; nhà máy tạo scaler theo tên kèm tham số. \\
+\texttt{algorithms/adapter} & Bọc mọi \texttt{river.base.Clusterer} sau một giao diện chung; gắn scaler; trích số micro/macro-cluster và bộ nhớ. \\
+\texttt{evaluation/runner} & Vòng lặp trực tuyến; quản lý cửa sổ đánh giá và checkpoint tài nguyên. \\
+\texttt{evaluation/clustering\_quality} & Metric streaming của River + hàm tham chiếu theo lô để đối chứng. \\
+\texttt{experiments/harness} & Chạy nhiều setting trên cùng luồng; lặp seed; tổng hợp mean $\pm$ std. \\
+\texttt{reports/} & Bảng markdown, đồ thị matplotlib, bản ghi môi trường chạy. \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% =====================================================================
+\section{Tiền xử lý trực tuyến}
+\label{sec:scaler}
+% =====================================================================
+
+Bộ chuẩn hoá (scaler) đứng ngay trước bộ phân cụm trong~\eqref{eq:ttt}. Với các
+thuật toán dựa trên khoảng cách, nó quyết định thang đo mà mọi ngưỡng bán kính
+($\varepsilon$ của DenStream, \texttt{clustering\_threshold} của DBSTREAM) được
+diễn giải --- nói cách khác, scaler và tham số bán kính \emph{không độc lập}.
+
+\subsection{Thứ tự học rồi biến đổi}
+
+Với mỗi mẫu, adapter thực hiện
+\begin{equation}
+  \label{eq:scaleorder}
+  \theta^{\text{sc}}_t \leftarrow \texttt{learn}(\theta^{\text{sc}}_{t-1}, \xt_t),
+  \qquad
+  \tilde\xt_t \leftarrow \texttt{transform}(\theta^{\text{sc}}_t, \xt_t).
+\end{equation}
+Tức là mẫu hiện tại \emph{có} đóng góp vào thống kê trước khi chính nó được biến
+đổi. Thứ tự này trùng khớp với \texttt{river.compose.Pipeline}, nơi các bước
+biến đổi không giám sát học trước rồi mới biến đổi; do đó adapter tương đương với
+\texttt{StandardScaler() | cluster.X()}.
+
+\begin{remark}[Khởi động lạnh]
+Ở $t=1$ ta có $\sigma^2=0$ nên mọi đặc trưng đều được ánh xạ về $0$. Vài trăm mẫu
+đầu vì thế được chuẩn hoá bằng thống kê chưa ổn định. Đây là đặc tính cố hữu của
+chuẩn hoá trực tuyến, không phải lỗi; nhưng nó có nghĩa là mọi chỉ số luỹ kế đều
+mang theo giai đoạn khởi động lạnh này mãi mãi (xem Mục~\ref{sec:cumwin}).
+\end{remark}
+
+\subsection{StandardScaler: đệ quy Welford}
+
+Với mỗi đặc trưng $j$, gọi $n$ là số quan sát đã thấy. River cập nhật theo
+đệ quy Welford:
+\begin{align}
+  n_t &= n_{t-1} + 1, \\
+  \mu_t &= \mu_{t-1} + \frac{x_t - \mu_{t-1}}{n_t},
+  \label{eq:welford-mean}\\
+  \sigma^2_t &= \sigma^2_{t-1}
+    + \frac{(x_t - \mu_{t-1})(x_t - \mu_t) - \sigma^2_{t-1}}{n_t},
+  \label{eq:welford-var}
+\end{align}
+cho phương sai tổng thể (\texttt{ddof}$=0$). Đệ quy~\eqref{eq:welford-mean}
+và~\eqref{eq:welford-var} chỉ cần $\mathcal{O}(1)$ bộ nhớ cho mỗi đặc trưng và
+không bao giờ phải lưu lại quan sát nào. Phép biến đổi là
+\begin{equation}
+  \label{eq:zscore}
+  z_t \;=\;
+  \begin{cases}
+    \dfrac{x_t - \mu_t}{\sqrt{\sigma^2_t}}, & \sigma^2_t > 0,\\[6pt]
+    0, & \text{ngược lại}.
+  \end{cases}
+\end{equation}
+
+\begin{remark}[Điều kiện $\sigma^2_t>0$ chứ không phải $\sigma^2_t \neq 0$]
+\label{rem:guard}
+Trong bản River gốc, điều kiện trong~\eqref{eq:zscore} được viết dưới dạng kiểm
+tra ``khác không''. Với
+một đặc trưng hằng số, sai số dấu phẩy động có thể đẩy $\sigma^2$ xuống một giá
+trị \emph{âm} rất nhỏ; khi đó $(\sigma^2)^{1/2}$ trong Python trả về \emph{số
+phức}, và giá trị phức này lọt vào mô hình rồi mới gây lỗi ở tận hàm tính khoảng
+cách. Chúng tôi đo được hiện tượng này trên KDDCup99; River \emph{không} được sửa,
+lỗi chỉ được ghi lại và né ở phía framework (Mục~\ref{sec:bug1}).
+\end{remark}
+
+\subsection{Biến thể cửa sổ trượt}
+
+Khi đặt \texttt{window\_size} $=W$, trung bình và phương sai được tính trên $W$
+quan sát gần nhất:
+\begin{equation}
+  \mu^{(W)}_t = \frac{1}{|B_t|}\sum_{s \in B_t} x_s,
+  \qquad
+  \big(\sigma^{(W)}_t\big)^2 = \frac{1}{|B_t|}\sum_{s \in B_t} (x_s - \mu^{(W)}_t)^2,
+  \qquad
+  B_t = \{\,t-W+1,\dots,t\,\} \cap \mathbb{N}^{+}.
+\end{equation}
+Điều này đòi hỏi \emph{lưu trữ} $W$ quan sát cho \emph{mỗi} đặc trưng, tức
+$\mathcal{O}(dW)$ bộ nhớ --- một cái giá rất thật mà chúng tôi đo được ở
+Mục~\ref{sec:ablation}.
+
+\subsection{AdaptiveStandardScaler: quên theo hàm mũ}
+
+Đây là bộ chuẩn hoá duy nhất \emph{quên} dữ liệu cũ mà chỉ tốn $\mathcal{O}(d)$
+bộ nhớ. Với hệ số phai $\alpha \in [0,1]$, đặt $\delta_t = x_t - m_{t-1}$:
+\begin{align}
+  m_t &= m_{t-1} + \alpha\,\delta_t, & m_1 &= x_1,
+  \label{eq:ewmean}\\
+  v_t &= (1-\alpha)\big(v_{t-1} + \alpha\,\delta_t^2\big), & v_1 &= 0,
+  \label{eq:ewvar}
+\end{align}
+rồi $z_t = (x_t - m_t)/\sqrt{v_t}$. Các công thức~\eqref{eq:ewmean}
+và~\eqref{eq:ewvar} đã được chúng tôi kiểm chứng trùng khớp từng chữ số với
+\texttt{river.stats.EWMean} và \texttt{river.stats.EWVar}. Trọng số của quan sát
+cách hiện tại $k$ bước suy giảm như $\alpha(1-\alpha)^{k}$, cho ``bán kính nhớ''
+hiệu dụng cỡ $1/\alpha$ mẫu.
+
+\subsection{Các scaler còn lại}
+
+\begin{align}
+  \text{MinMax:}\quad & z_t = \frac{x_t - \min_{s\le t} x_s}{\max_{s\le t} x_s - \min_{s\le t} x_s},\\
+  \text{MaxAbs:}\quad & z_t = \frac{x_t}{\max_{s \le t} |x_s|},\\
+  \text{Robust:}\quad & z_t = \frac{x_t - Q_{0.5}}{Q_{q_{\sup}} - Q_{q_{\inf}}},
+    \quad (q_{\inf},q_{\sup}) = (0.25,\,0.75)\ \text{mặc định},\\
+  \text{Normalizer:}\quad & \tilde\xt_t = \frac{\xt_t}{\|\xt_t\|_p} \quad (\text{không có trạng thái}).
+\end{align}
+
+Bảng~\ref{tab:scalers} tóm tắt các scaler theo hai tiêu chí quyết định: khả năng
+quên và chi phí bộ nhớ.
+
+\begin{table}[htbp]
+\centering
+\small
+\caption{Các scaler trực tuyến: điều khác biệt thực chất là \emph{nhớ bao nhiêu}
+và \emph{tốn bao nhiêu bộ nhớ}. $d$ là số đặc trưng, $W$ là kích thước cửa sổ.}
+\label{tab:scalers}
+\begin{tabular}{@{}llcc@{}}
+\toprule
+\textbf{Scaler} & \textbf{Thống kê} & \textbf{Quên dữ liệu cũ?} & \textbf{Bộ nhớ} \\
+\midrule
+\texttt{standard} & mean/var Welford & không & $\mathcal{O}(d)$ \\
+\texttt{standard(window\_size=$W$)} & mean/var trượt & có, cứng & $\mathcal{O}(dW)$ \\
+\texttt{minmax}, \texttt{maxabs} & min/max (hoặc trượt) & không (trừ khi trượt) & $\mathcal{O}(d)$ / $\mathcal{O}(dW)$ \\
+\texttt{robust} & trung vị + IQR & không & $\mathcal{O}(d)$ xấp xỉ \\
+\texttt{adaptive\_standard} & EW mean/var & \textbf{có}, mềm & $\mathcal{O}(d)$ \\
+\texttt{normalizer} & không có trạng thái & --- & $\mathcal{O}(1)$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Không chỉ scaler: toàn bộ bước tiền xử lý không giám sát}
+\label{sec:preproc-all}
+
+Slot đứng trước bộ phân cụm nhận \emph{mọi} transformer không giám sát của River,
+tổng cộng 25 bước. Benchmark clustering không có $y$ lúc học nên mọi thứ cần
+target bị loại theo định nghĩa; phần còn lại lấp những lỗ hổng thật, và bỏ chúng
+đi thì có những câu hỏi không đặt ra được (Bảng~\ref{tab:preproc}). Nhận
+xét~\ref{rem:onehot} là ví dụ cụ thể về việc chọn nhầm bước trong nhóm này phá
+hỏng phép đo ra sao.
+
+\begin{table}[htbp]
+\centering
+\small
+\caption{Các nhóm bước tiền xử lý và lỗ hổng chúng lấp. Cố ý vắng mặt:
+\texttt{SelectKBest}, \texttt{PoissonInclusion}, các \texttt{Target*} (cần
+target); \texttt{PredClipper} (bọc regressor); \texttt{PolynomialExtender} (nhân
+số chiều và bóp méo đúng cái khoảng cách mà bộ phân cụm dựa vào).}
+\label{tab:preproc}
+\begin{tabular}{@{}lp{8.4cm}@{}}
+\toprule
+\textbf{Nhóm} & \textbf{Vì sao benchmark clustering cần} \\
+\midrule
+Scaling & mọi tham số bán kính ($\varepsilon$ của DenStream,
+\texttt{clustering\_threshold} của DBSTREAM) được đọc theo đơn vị scaler tạo ra \\
+Missing values & stream thật có thiếu giá trị, và quy ước của River là thiếu
+$=$ \emph{vắng key}, nên bộ phân cụm sẽ so hai điểm trên hai tập key khác nhau \\
+Categorical & không có thì phải \emph{vứt} cột nominal --- KDDCup99 mất 3 cột,
+CoverType mất 44 \\
+Projection & giảm chiều bảo toàn khoảng cách (Johnson--Lindenstrauss), công cụ
+tiêu chuẩn cho clustering luồng nhiều chiều \\
+Variance filter & cột hằng số không đóng góp gì vào khoảng cách và còn phá
+scaler --- chính một cột hằng số đẩy rolling \texttt{StandardScaler} của River
+xuống phương sai âm (Mục~\ref{sec:riverbugs}) \\
+Text & TextClust ăn token counts; \texttt{lda} biến text thành vector dày để các
+bộ phân cụm \emph{số} cũng xử lý được text \\
+Kernel & random Fourier features cho phép phương pháp tâm-cụm tách được cụm
+không có dạng cầu \\
+Routing & chọn/bỏ cột trước một bước không tự phân biệt được kiểu dữ liệu \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{Ghép chuỗi.}
+Pipeline hữu ích hiếm khi chỉ một bước: dữ liệu thô thường cần điền thiếu và mã
+hoá phạm trù \emph{trước khi} chuẩn hoá có ý nghĩa, còn luồng nhiều chiều muốn
+bỏ cột hằng số rồi chiếu xuống trước khi tính bất kỳ khoảng cách nào. Các bước
+ghép bằng \texttt{|}, chạy trái sang phải:
+
+\begin{lstlisting}[language=Python]
+make_preprocessor("impute|one_hot_categorical|standard")
+make_preprocessor("variance_threshold|sparse_projection|standard",
+                  sparse_projection={"n_components": 16})
+\end{lstlisting}
+
+Một bước nhận tham số phẳng; một chuỗi bắt buộc lồng tham số theo tên bước, vì
+hai bước trong cùng chuỗi rất dễ trùng tên tham số (\texttt{seed}) và không có
+cách nào đoán đúng chủ sở hữu.
+
+\begin{remark}[Bẫy \texttt{one\_hot}]
+\label{rem:onehot}
+\texttt{OneHotEncoder} của River mã hoá \emph{mọi} key nó nhận. Trên một bản ghi
+lẫn số và chữ, nó biến cột số thành một indicator cho \emph{mỗi giá trị từng
+thấy}: với \texttt{duration} của KDDCup99 là hàng chục nghìn cột, mỗi cột mang
+đúng một quan sát, và mọi khoảng cách sụp về gần như nhau. Framework do đó cung
+cấp \texttt{one\_hot\_categorical}, chỉ mã hoá giá trị không phải số:
+\[
+\begin{array}{ll}
+\texttt{one\_hot} & \to \{\texttt{dur\_1.0}: 0,\ \texttt{dur\_5.0}: 0,\ \texttt{dur\_7.0}: 1,\ \dots\}\\
+\texttt{one\_hot\_categorical} & \to \{\texttt{dur}: 7.0,\ \texttt{proto\_tcp}: 0,\ \texttt{proto\_udp}: 1\}
+\end{array}
+\]
+\end{remark}
+
+% =====================================================================
+\section{Các thuật toán được benchmark}
+\label{sec:algos}
+% =====================================================================
+
+Framework bao phủ \textbf{cả bảy} clusterer trong \texttt{river.cluster}
+(Bảng~\ref{tab:protocols}), với các bước tiền xử lý ở Mục~\ref{sec:preproc-all}.
+Điều này không phải chuyện đếm số: hai trong bảy phá vỡ giao thức ``gán mẫu này
+vào một cụm'' mà phần lớn framework benchmark ngầm giả định, và nếu giả định đó không
+được kiểm tra thì hoặc là chương trình sập, hoặc --- tệ hơn --- một điểm chất
+lượng vô nghĩa được ghi ra như thể là kết quả.
+
+\begin{table}[htbp]
+\centering
+\small
+\caption{Ba dạng giao thức trong \texttt{river.cluster} và cách framework xử lý.}
+\label{tab:protocols}
+\begin{tabular}{@{}llll@{}}
+\toprule
+\textbf{Thuật toán} & \textbf{Gán mẫu?} & \textbf{Đầu vào} & \textbf{Được chấm bằng} \\
+\midrule
+CluStream    & có & vector số & ARI/NMI/AMI/purity + tài nguyên \\
+DenStream    & có & vector số & ARI/NMI/AMI/purity + tài nguyên \\
+DBSTREAM     & có & vector số & ARI/NMI/AMI/purity + tài nguyên \\
+STREAMKMeans & có & vector số & ARI/NMI/AMI/purity + tài nguyên \\
+KMeans       & có & vector số & ARI/NMI/AMI/purity + tài nguyên \\
+ODAC         & \textbf{không} & vector số & \textbf{cấu trúc} + tài nguyên \\
+TextClust    & có & \textbf{token counts} & ARI/NMI/AMI/purity + tài nguyên \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{ODAC: gom cụm các \emph{biến}.}
+ODAC dựng cây phân cấp trên \emph{tập đặc trưng}, không phải trên các mẫu; hàm
+\texttt{predict\_one} của nó \texttt{raise NotImplementedError} theo thiết kế.
+Không có nhãn per-sample thì ARI/NMI/AMI/purity \emph{không định nghĩa được}, nên
+framework bỏ nó khỏi mọi bảng chất lượng --- đó là đúng, không phải lỗi --- và
+chấm nó bằng \emph{tóm tắt cấu trúc}: số cụm biến, số cụm còn hoạt động, chiều
+cao cây. Cột ``Macro $K$'' cũng để trống cho ODAC, vì \texttt{n\_clusters} của nó
+đếm nhóm \emph{biến}: khác đơn vị, đặt cạnh số cụm mẫu của các thuật toán khác là
+mời người đọc so hai thứ không so được.
+
+\begin{remark}[River là thẩm quyền về giao thức, không phải siêu dữ liệu của ta]
+Nếu registry khai sai rằng một mô hình phân hoạch mẫu, mô hình đó vẫn phát hiện
+\texttt{NotImplementedError} giữa chừng và tự hạ cờ. Điều này quan trọng vì các
+đối tượng metric khi đó chưa nhận cập nhật nào mà vẫn trả về giá trị: ARI trả
+$1.0$ trên bảng liên hợp rỗng theo quy ước $0/0$. Nghĩa là một mô hình
+\emph{chưa hề dự đoán gì} sẽ được ghi điểm tuyệt đối. Runner do đó đọc lại cờ ở
+cuối lượt chạy và huỷ bỏ các metric thay vì báo cáo chúng.
+\end{remark}
+
+\paragraph{TextClust: đầu vào không phải toạ độ.}
+TextClust nhận dictionary tần suất từ và so sánh bằng cosine trên tf--idf, không
+phải một metric trên toạ độ. Nó cần bước \texttt{bag\_of\_words} và một text
+stream; chuẩn hoá tần suất từ bằng \texttt{StandardScaler} là vô nghĩa. Nó cũng
+nhận vị trí stream qua tham số \texttt{t} khi bật chế độ fading theo thời gian
+thực --- thiếu \texttt{t} thì River báo
+\texttt{TypeError: unsupported operand type(s) for -}, rất xa nguyên nhân. Adapter
+quyết định một lần bằng nội quan chữ ký hàm rồi truyền vào, thay vì đoán ở từng
+mẫu.
+
+\paragraph{Mô hình hai pha.}
+Năm thuật toán trên vector số đều theo mô hình \emph{hai pha}: pha trực tuyến duy
+trì một tóm tắt nhẹ của luồng (các \emph{micro-cluster}), pha ngoại tuyến gộp các
+tóm tắt đó thành cụm cuối (\emph{macro-cluster}) khi được hỏi.
+
+\paragraph{CluStream.}
+Duy trì tối đa $q$ micro-cluster, mỗi cái là véc-tơ đặc trưng cụm
+\begin{equation}
+  \mathrm{CF} = \big(\overline{CF2^x},\ \overline{CF1^x},\ CF2^t,\ CF1^t,\ n\big),
+\end{equation}
+với $\overline{CF1^x}=\sum \xt_i$, $\overline{CF2^x}=\sum \xt_i^2$ (theo từng
+toạ độ). Nhờ tính cộng tính của $\mathrm{CF}$, tâm và bán kính tính được trong
+thời gian hằng:
+\begin{equation}
+  \mathbf{c} = \frac{\overline{CF1^x}}{n},
+  \qquad
+  r = \sqrt{\frac{\overline{CF2^x}}{n} - \left(\frac{\overline{CF1^x}}{n}\right)^{\!2}}.
+\end{equation}
+
+\paragraph{DenStream.}
+Dựa trên mật độ, với suy giảm theo thời gian. Trọng số của một mẫu tuổi $\Delta t$
+là $f(\Delta t) = 2^{-\lambda \Delta t}$ với $\lambda$ là \texttt{decaying\_factor}.
+Một micro-cluster có trọng số $w$ được coi là \emph{lõi} nếu $w \ge \beta\mu$.
+Một mẫu được thu nhận vào micro-cluster gần nhất khi
+\begin{equation}
+  \label{eq:denstream-eps}
+  r\big(\text{mc} \cup \{\xt\}\big) \;\le\; \varepsilon ,
+\end{equation}
+và hai cụm lõi được gộp khi khoảng cách tâm nhỏ hơn $2\varepsilon$.
+
+\begin{remark}[$\varepsilon$ phải khớp với thang sau tiền xử lý]
+\label{rem:eps}
+Sau \texttt{StandardScaler}, mỗi toạ độ có phương sai xấp xỉ $1$, nên khoảng
+cách Euclid điển hình giữa hai điểm trong $\R^{d}$ là
+$\E\|\xt-\xt'\|_2 \approx \sqrt{2d}$. Với KDDCup99 ($d=34$) con số này là
+$\sqrt{68}\approx 8.2$: một $\varepsilon$ lớn hơn ngưỡng đó khiến
+điều~\eqref{eq:denstream-eps} hầu như luôn đúng và toàn bộ luồng sụp về một
+micro-cluster. Đây là một \emph{quan hệ} mà framework phơi bày qua cột
+$\max|\mathcal{M}|$, chứ không phải một giá trị framework tự chọn: hiệu chuẩn
+$\varepsilon$ là việc của người dùng, trên luồng hiệu chuẩn riêng.
+\end{remark}
+
+\paragraph{DBSTREAM.}
+Cũng dựa trên mật độ nhưng dùng \emph{mật độ chia sẻ} giữa các micro-cluster.
+Mẫu được gán vào mọi micro-cluster nằm trong bán kính
+\texttt{clustering\_threshold}; trọng số suy giảm theo \texttt{fading\_factor}.
+Tâm được cập nhật theo quy tắc kéo $\mathbf{c} \leftarrow \mathbf{c} + \eta(\xt - \mathbf{c})$.
+
+\paragraph{STREAMKMeans và KMeans.}
+STREAMKMeans tích luỹ luồng thành các khối kích thước $B$; mỗi khi đầy một khối
+nó chạy một \texttt{KMeans} trên khối rồi nạp các tâm thu được vào một
+\texttt{KMeans} chạy liên tục. Vì thế mô hình chưa có tâm nào cho tới khi khối
+đầu tiên hoàn tất --- giai đoạn khởi động lạnh này được framework đếm và báo cáo
+tường minh ở cột \emph{Cold-start}, để nó không âm thầm bóp méo các metric.
+
+% =====================================================================
+\section{Nguồn dữ liệu}
+\label{sec:datasets}
+% =====================================================================
+
+Một dataset trong framework là nguồn \emph{lặp lại được} của các cặp $(\xt, y)$.
+Tính lặp lại được chính là thứ cho phép mọi setting tiêu thụ đúng cùng một luồng:
+đối tượng dataset trả về một iterator mới ở mỗi lần lặp. Nhãn $y$ chỉ dùng để
+chấm điểm, và $y = \bot$ nghĩa là ``đừng chấm mẫu này''.
+
+\subsection{Bộ sinh tổng hợp}
+
+Theo cấu trúc của \texttt{RandomRBFGeneratorEvents} trong MOA. Điểm được sinh
+dưới dạng \emph{hướng ngẫu nhiên $\times$ biên độ Gaussian} chứ không phải
+Gaussian đẳng hướng, và khác biệt này có ý nghĩa: nó giữ kích thước vật lý của
+cụm \textbf{độc lập với} $d$, nên phép quét ``chất lượng theo số chiều'' chỉ thay
+đổi đúng số chiều thay vì âm thầm thổi mọi cụm lên $\sqrt{d}$ lần.
+
+Ground truth là \textbf{id của cụm sinh ra điểm}, không phải một class label gộp
+nhiều cụm --- với bài toán clustering thì khôi phục đúng thành phần hỗn hợp mới
+là mục tiêu.
+
+\begin{table}[htbp]
+\centering
+\small
+\caption{Các núm điều khiển của bộ sinh.}
+\label{tab:generator}
+\begin{tabular}{@{}lp{8.6cm}@{}}
+\toprule
+\textbf{Tham số} & \textbf{Tác dụng} \\
+\midrule
+\texttt{separation} & khoảng cách giữa cặp tâm gần nhất, tính theo bán kính cụm.
+Núm độ khó chính: $1$ chồng lấn nặng, $6$ tầm thường \\
+\texttt{radius\_range}, \texttt{weight\_range} & cụm không đều về kích thước và mật độ \\
+\texttt{noise}, \texttt{noise\_in\_cluster} & nhiễu nền, nhãn $\bot$ nên metric bỏ qua \\
+\texttt{drift\_speed}, \texttt{drift\_every} & tâm cụm trôi và dội lại ở biên hypercube \\
+\texttt{event\_frequency}, \texttt{events} & cụm gộp, tách, sinh ra, biến mất \\
+\texttt{block\_ordered} & \textbf{control}: phát theo khối cùng lớp \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{remark}[Vì sao \texttt{separation} phải \emph{suy ra} bán kính]
+\label{rem:separation}
+Cách hiển nhiên là đặt \texttt{separation} làm ràng buộc khoảng cách tối thiểu
+khi rải tâm. Cách đó \emph{không hoạt động}: hypercube càng rộng khi $d$ tăng,
+nên với $d = 10$ các tâm rải đều luôn cách nhau khoảng $1.2$ trong khi ràng buộc
+chỉ đòi $0.1$--$0.4$; ràng buộc không bao giờ bị chạm và mọi layout đều dễ như
+nhau. Đo được: \texttt{separation=0.8} và \texttt{separation=3.0} cho kết quả
+\emph{giống hệt} từng chữ số. Framework vì thế suy ra bán kính từ layout,
+$r = d_{\min} / (2\,\texttt{separation})$, khiến ràng buộc đúng theo dựng hình và
+độ khó so sánh được giữa các $d$ và các $k$.
+\end{remark}
+
+\noindent
+Bảy kịch bản đặt tên sẵn: \texttt{static\_easy}, \texttt{static\_overlap},
+\texttt{unbalanced}, \texttt{noisy}, \texttt{incremental\_drift},
+\texttt{evolving}, \texttt{block\_ordered}. Bảng~\ref{tab:generator} liệt kê các
+núm điều khiển, và Nhận xét~\ref{rem:separation} giải thích vì sao núm độ khó
+phải suy ra bán kính thay vì chặn khoảng cách.
+
+\subsection{Luồng thực tế}
+
+Cột $\rho_{\text{deg}}$ là tỉ lệ cửa sổ $1000$ mẫu chỉ chứa một lớp, đo trên
+$50\,000$ bản ghi đầu. Nó không phải điểm chất lượng của dataset mà là
+\emph{điều kiện đọc}: $\rho_{\text{deg}}$ cao nghĩa là chỉ số per-window thoái
+hoá ở đó (Mục~\ref{sec:degenerate}) và chỉ nên đọc con số toàn stream.
+
+\begin{table}[htbp]
+\centering
+\small
+\caption{Các luồng thực tế framework nạp sẵn.}
+\label{tab:realdata}
+\begin{tabular}{@{}lrrrrr@{}}
+\toprule
+\textbf{Dataset} & $n$ & $d$ & \textbf{lớp} & $\rho_{\text{deg}}$ & \textbf{trung vị lớp áp đảo} \\
+\midrule
+\texttt{kdd99} & 494k & 34 & 23 & $\mathbf{72\%}$ & 1.000 \\
+\texttt{covtype} & 581k & 10 & 7 & $0\%$ & 0.735 \\
+\texttt{insects} & 24k--355k & 33 & 6 & $2\%$ & \textbf{0.276} \\
+\texttt{keystroke} & 20k & 31 & 51 & $0\%$ & 0.400 \\
+\texttt{shuttle} & 49k & 9 & 2 & $0\%$ & 0.931 \\
+\texttt{electricity} & 45k & 8 & 2 & $0\%$ & 0.579 \\
+\texttt{sms\_spam} & 5.5k & text & 2 & --- & --- \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\texttt{sms\_spam} có mặt vì không phải mọi clusterer của River đều ăn véc-tơ toạ
+độ: TextClust cần token counts, nên cần một luồng văn bản và bước
+\texttt{bag\_of\_words}.
+
+\paragraph{Thêm dataset của bạn.}
+\begin{lstlisting}[language=Python]
+from benchmark.datasets import IterableDataset
+
+def load_mine(path):
+    def factory():                     # called fresh on every iteration
+        for row in read(path):
+            yield {"a": row.a, "b": row.b}, row.label
+    return IterableDataset(factory, name="mine", n_features=2, has_labels=True)
+\end{lstlisting}
+
+\noindent
+Với một dataset của River, \texttt{from\_river\_dataset()} lo phần còn lại --- kể
+cả các dataset mà cột số đến dưới dạng \emph{chuỗi}, một chi tiết đủ để một bộ
+lọc \texttt{isinstance(v, Number)} loại sạch mọi đặc trưng và trả về luồng rỗng.
+
+% =====================================================================
+\section{Giao thức đánh giá}
+\label{sec:protocol}
+% =====================================================================
+
+\subsection{Điều kiện so sánh công bằng}
+
+Mọi setting phải chạy trong điều kiện giống hệt nhau: cùng dataset, cùng thứ tự
+luồng, cùng số mẫu, cùng lưới cửa sổ đánh giá, cùng phần cứng, cùng tập seed.
+Framework cưỡng chế điều này bằng cách cho mọi setting dùng chung một đối tượng
+dataset trả về iterator mới ở mỗi lần lặp, và ghi lại toàn bộ siêu tham số ---
+\emph{kể cả tham số của scaler} --- vào kết quả.
+
+Về siêu tham số, chúng tôi tuân theo nguyên tắc không tinh chỉnh trên chính tập
+kiểm thử:
+\[
+\text{luồng hiệu chuẩn} \longrightarrow \text{tinh chỉnh} \longrightarrow
+\text{đóng băng tham số} \longrightarrow \text{luồng kiểm thử} \longrightarrow
+\text{benchmark cuối}.
+\]
+Trong mã nguồn, các tham số đã đóng băng nằm trong hằng \texttt{PRESETS} ở đầu
+script benchmark.
+
+\subsection{Hai họ chỉ số chất lượng: luỹ kế và theo cửa sổ}
+\label{sec:cumwin}
+
+Chia luồng thành các cửa sổ liên tiếp $W_1, W_2, \dots, W_K$ kích thước $m$
+(mặc định $m=1000$), $W_k = \{(k-1)m+1,\dots,km\}$. Với một độ đo $M$ bất kỳ,
+framework theo dõi \emph{đồng thời} hai đại lượng:
+
+\begin{definition}[Chỉ số luỹ kế]
+\begin{equation}
+  M^{\mathrm{cum}}_k \;=\; M\Big(\{(y_t,\hat y_t)\}_{t \le km}\Big).
+\end{equation}
+Đối tượng metric không bao giờ được reset. Dãy này hội tụ, và
+$M^{\mathrm{cum}}_K$ chính là điểm số toàn luồng.
+\end{definition}
+
+\begin{definition}[Chỉ số theo cửa sổ]
+\begin{equation}
+  M^{\mathrm{win}}_k \;=\; M\Big(\{(y_t,\hat y_t)\}_{t \in W_k}\Big).
+\end{equation}
+Đối tượng metric được khởi tạo lại ở mỗi biên cửa sổ, nên $M^{\mathrm{win}}_k$
+chỉ phụ thuộc vào các mẫu \emph{bên trong} $W_k$.
+\end{definition}
+
+Mỗi họ được tóm tắt bằng ba con số:
+\begin{equation}
+  \label{eq:summary}
+  \operatorname{mean}(M) = \frac{1}{K}\sum_{k=1}^{K} M_k,
+  \qquad
+  \operatorname{median}(M),
+  \qquad
+  \operatorname{final}(M) = M_K.
+\end{equation}
+
+\begin{proposition}[Trung bình đường luỹ kế không phải trung bình theo thời gian]
+\label{prop:cumbias}
+Nếu $M$ là trung bình cộng của một đại lượng theo mẫu, thì
+\begin{equation}
+  M^{\mathrm{cum}}_k \;=\; \frac{1}{k}\sum_{j=1}^{k} M^{\mathrm{win}}_j,
+\end{equation}
+và do đó
+\begin{equation}
+  \frac{1}{K}\sum_{k=1}^{K} M^{\mathrm{cum}}_k
+  \;=\; \sum_{j=1}^{K} w_j\, M^{\mathrm{win}}_j,
+  \qquad
+  w_j \;=\; \frac{1}{K}\sum_{k=j}^{K}\frac{1}{k},
+\end{equation}
+với các trọng số $w_j$ \emph{giảm nghiêm ngặt} theo $j$.
+\end{proposition}
+
+\begin{proof}
+Đổi thứ tự lấy tổng:
+$\sum_{k=1}^{K}\frac{1}{k}\sum_{j=1}^{k}M^{\mathrm{win}}_j
+= \sum_{j=1}^{K} M^{\mathrm{win}}_j \sum_{k=j}^{K}\frac1k$.
+Vì $\sum_{k=j}^{K}1/k$ giảm khi $j$ tăng, ta có $w_1 > w_2 > \cdots > w_K$.
+\end{proof}
+
+Nói cách khác, lấy trung bình đường luỹ kế đặt trọng số cao nhất lên cửa sổ
+\emph{đầu tiên} --- đúng giai đoạn khởi động lạnh, khi cả scaler lẫn mô hình đều
+chưa ổn định. Đây không phải là ``chất lượng trung bình dọc luồng''; nó là một
+ước lượng bị kéo lệch về phía đầu luồng. Trên luồng dừng, hệ quả là
+$\operatorname{mean}(M^{\mathrm{cum}})$ \emph{đánh giá thấp} chất lượng ổn định
+của mô hình --- điều chúng tôi đo được ở Bảng~\ref{tab:cumwin}. Vì vậy chỉ số
+time-aware mà framework báo cáo mặc định là $\operatorname{mean}(M^{\mathrm{win}})$.
+Đường luỹ kế vẫn được giữ và báo cáo riêng, vì nó là đường hội tụ và
+$\operatorname{final}(M^{\mathrm{cum}})$ chính là điểm toàn luồng.
+
+\subsection{Độ đo ngoại (cần ground truth)}
+\label{sec:external}
+
+Cho bảng liên hợp (contingency table) giữa $R$ lớp thật và $C$ cụm dự đoán trên
+tập mẫu kích thước $n$:
+\begin{equation}
+  n_{ij} = \big|\{t : y_t = i \wedge \hat y_t = j\}\big|,
+  \qquad
+  a_i = \sum_j n_{ij},
+  \qquad
+  b_j = \sum_i n_{ij}.
+\end{equation}
+
+\paragraph{Adjusted Rand Index.}
+River tính ARI qua ma trận nhầm lẫn theo \emph{cặp} điểm. Đặt
+\begin{align}
+  \mathrm{TP} &= \textstyle\sum_{ij} n_{ij}^2 - n
+    &&\text{(cặp cùng lớp, cùng cụm)},\\
+  \mathrm{FP} &= \textstyle\sum_{j} b_j^2 - \sum_{ij} n_{ij}^2
+    &&\text{(cặp khác lớp, cùng cụm)},\\
+  \mathrm{FN} &= \textstyle\sum_{i} a_i^2 - \sum_{ij} n_{ij}^2
+    &&\text{(cặp cùng lớp, khác cụm)},\\
+  \mathrm{TN} &= n^2 - (\mathrm{FP}+\mathrm{FN}) - \textstyle\sum_{ij} n_{ij}^2
+    &&\text{(cặp khác lớp, khác cụm)},
+\end{align}
+(tất cả đếm theo cặp có thứ tự). Khi đó
+\begin{equation}
+  \label{eq:ari}
+  \boxed{\;
+  \mathrm{ARI} \;=\;
+  \frac{2\big(\mathrm{TP}\cdot\mathrm{TN} \;-\; \mathrm{FN}\cdot\mathrm{FP}\big)}
+       {(\mathrm{TP}+\mathrm{FN})(\mathrm{FN}+\mathrm{TN})
+        \;+\;(\mathrm{TP}+\mathrm{FP})(\mathrm{FP}+\mathrm{TN})}
+  \;}
+\end{equation}
+với quy ước: nếu mẫu số bằng $0$ thì $\mathrm{ARI} = 1$. Giá trị $1$ nghĩa là
+trùng khớp hoàn hảo, $0$ nghĩa là bằng mức ngẫu nhiên, và ARI \emph{có thể âm}
+khi phân hoạch còn tệ hơn ngẫu nhiên.
+
+\paragraph{Mutual Information và các biến thể chuẩn hoá.}
+\begin{align}
+  I(U,V) &= \sum_{i=1}^{R}\sum_{j=1}^{C}
+    \frac{n_{ij}}{n}\,\log\!\frac{n\,n_{ij}}{a_i\,b_j},
+    \label{eq:mi}\\
+  H(U) &= -\sum_{i=1}^{R} \frac{a_i}{n}\log\frac{a_i}{n},
+  \qquad
+  H(V) = -\sum_{j=1}^{C} \frac{b_j}{n}\log\frac{b_j}{n},\\
+  \mathrm{NMI} &= \frac{I(U,V)}{\tfrac{1}{2}\big(H(U)+H(V)\big)},
+    \label{eq:nmi}\\
+  \mathrm{AMI} &= \frac{I(U,V) - \E[I(U,V)]}
+                       {\tfrac{1}{2}\big(H(U)+H(V)\big) - \E[I(U,V)]},
+    \label{eq:ami}
+\end{align}
+trong đó chuẩn hoá mặc định là trung bình cộng của hai entropy, và $\E[I]$ là kỳ
+vọng của thông tin tương hỗ dưới mô hình siêu bội với các biên $\{a_i\},\{b_j\}$
+cố định. Công thức~\eqref{eq:mi} là thông tin tương hỗ,~\eqref{eq:nmi} và~\eqref{eq:ami}
+là hai cách chuẩn hoá nó. NMI \emph{không} hiệu chỉnh theo may rủi nên tăng một
+cách máy móc theo số cụm; AMI thì có. Các trường hợp biên được River quy ước như sau:
+$R=C=1 \Rightarrow \mathrm{NMI}=\mathrm{AMI}=1$, và
+$(R=1) \veebar (C=1) \Rightarrow \mathrm{AMI}=0$.
+
+\paragraph{Purity.}
+\begin{equation}
+  \label{eq:purity}
+  \mathrm{Purity} \;=\; \frac{1}{n}\sum_{j=1}^{C} \max_{i} n_{ij}.
+\end{equation}
+Purity nằm trong $[0,1]$ nhưng \emph{không} hiệu chỉnh theo may rủi: nó tăng đơn
+điệu theo số cụm và đạt $1$ khi mỗi mẫu là một cụm riêng. Nó cũng bị thổi phồng
+khi phân bố lớp mất cân bằng nặng --- trên KDDCup99, gán mọi thứ vào một cụm duy
+nhất vẫn cho purity $\approx 0.80$. Vì vậy purity chỉ nên đọc kèm ARI/AMI.
+
+\subsection{Độ đo nội (không cần ground truth)}
+
+River cài đặt một phiên bản streaming của hệ số Silhouette dựa trên tâm cụm chứ
+không phải khoảng cách từng cặp,~\eqref{eq:silhouette}:
+\begin{equation}
+  \label{eq:silhouette}
+  \mathrm{Sil}^{\text{stream}}
+  \;=\;
+  \frac{\sum_{t} \big\| \tilde\xt_t - \mathbf{c}_{\hat y_t} \big\|_2}
+       {\sum_{t} \big\| \tilde\xt_t - \mathbf{c}^{(2)}(\tilde\xt_t) \big\|_2},
+  \qquad
+  \mathbf{c}^{(2)}(\xt) = \operatorname*{arg\,min}_{\mathbf{c} \neq \mathbf{c}_{\hat y}} \|\xt - \mathbf{c}\|_2 .
+\end{equation}
+
+\begin{remark}[Hai cái bẫy của Silhouette streaming]
+Thứ nhất, đây là tỉ số \emph{cố kết / phân tách}, nên \textbf{nhỏ hơn là tốt
+hơn} --- ngược chiều với silhouette theo lô của scikit-learn.
+Thứ hai, tử số và mẫu số phải được tính trong \emph{cùng không gian} mà mô hình
+làm việc: tâm $\mathbf{c}$ sống trong không gian đã chuẩn hoá, nên phải dùng
+$\tilde\xt_t$ chứ không phải $\xt_t$. Đưa nhầm điểm thô vào làm chỉ số sai lệch
+hơn một bậc độ lớn (chúng tôi quan sát $0.90$ so với $0.04$ trên cùng một lần
+chạy).
+\end{remark}
+
+\subsection{Chỉ số hiệu năng}
+\label{sec:efficiency}
+
+Gọi $\tau_t$ là thời gian tường (wall time) của bước~\eqref{eq:ttt} tại mẫu $t$,
+đo bằng đồng hồ đơn điệu bao quanh \emph{chỉ} phần scale--predict--learn. Chi
+phí đọc dữ liệu và cập nhật metric nằm ngoài phép đo, vì chúng không thuộc về
+thuật toán.
+\begin{equation}
+  T_{\text{total}} = \sum_{t=1}^{n}\tau_t,
+  \qquad
+  \text{throughput} = \frac{n}{T_{\text{total}}}\ \text{[mẫu/s]},
+  \qquad
+  \text{ms/mẫu} = \frac{1000\,T_{\text{total}}}{n}.
+\end{equation}
+
+Về bộ nhớ, framework báo hai đại lượng khác nhau về bản chất:
+\begin{itemize}
+  \item \textbf{Bộ nhớ mô hình} --- kích thước đồ thị đối tượng của bộ phân cụm
+        cộng scaler, lấy qua \texttt{river.base.Base.\_raw\_memory\_usage}. Đây
+        là con số \emph{so sánh được} giữa các thuật toán: nó không tính
+        interpreter, dataset hay các đối tượng metric.
+  \item \textbf{RSS tiến trình} --- bộ nhớ thường trú của cả tiến trình. Chỉ để
+        tham chiếu như một chặn trên.
+\end{itemize}
+
+\begin{remark}[Vì sao chỉ đo bộ nhớ tại checkpoint]
+\label{rem:memcost}
+\texttt{\_raw\_memory\_usage} duyệt toàn bộ đồ thị đối tượng bằng
+\texttt{gc.get\_referents}, nên chi phí của nó là $\mathcal{O}(|\theta|)$ --- tỉ
+lệ với \emph{kích thước mô hình}, không phải hằng số. Với một bộ phân cụm giữ
+đệm $2000$ điểm, một lần gọi tốn khoảng $14$\,ms, tức gấp hơn hai bậc độ lớn so
+với chi phí xử lý một mẫu. Gọi nó mỗi mẫu sẽ biến một benchmark $400\,000$ mẫu
+thành hàng giờ đồng hồ thuần tuý cho việc \emph{đo}. Vì vậy phép đo bộ nhớ chỉ
+chạy tại các checkpoint, và hệ quả là
+\begin{equation}
+  \text{peak memory} = \max_{\text{checkpoint } c} |\theta_c|
+\end{equation}
+là một \emph{chặn dưới} của đỉnh thật. Với mô hình có tỉa (DenStream, DBSTREAM),
+cần tăng số checkpoint nếu muốn chặn chặt hơn.
+\end{remark}
+
+Số micro-cluster $|\mathcal{M}_t|$ cũng được lấy mẫu tại checkpoint; nó là biến
+giải thích chính cho cả runtime lẫn bộ nhớ, vì hầu hết các thuật toán có chi phí
+mỗi mẫu tăng theo $|\mathcal{M}_t|$ (DBSTREAM thậm chí có bước dọn dẹp
+$\mathcal{O}(|\mathcal{M}|^2)$).
+
+\subsection{Độ ổn định qua nhiều seed}
+
+Với thuật toán có thành phần ngẫu nhiên, mỗi cấu hình được chạy lại trên tập
+seed $\mathcal{Z}$ và báo cáo dưới dạng
+\begin{equation}
+  \bar{M} \pm s_M,
+  \qquad
+  \bar{M} = \frac{1}{|\mathcal{Z}|}\sum_{z\in\mathcal{Z}} M^{(z)},
+  \qquad
+  s_M = \sqrt{\frac{1}{|\mathcal{Z}|}\sum_{z\in\mathcal{Z}}\big(M^{(z)}-\bar M\big)^2}.
+\end{equation}
+
+Framework xác định tính ngẫu nhiên bằng cách nội quan chữ ký hàm khởi tạo: nếu
+lớp có tham số \texttt{seed} (hoặc có \texttt{**kwargs} chuyển tiếp xuống một mô
+hình con có \texttt{seed}) thì seed được tiêm vào. Thuật toán \emph{tất định}
+(DenStream, DBSTREAM) chỉ chạy một lần, vì lặp lại chúng trên cùng một luồng cho
+đúng cùng con số; báo cáo ghi rõ số lần chạy thật của từng setting để độ lệch
+chuẩn bằng $0$ không bị đọc nhầm là ``rất ổn định''.
+
+% =====================================================================
+\section{Cửa sổ thoái hoá: khi chỉ số time-aware mất ý nghĩa}
+\label{sec:degenerate}
+% =====================================================================
+
+Đây là phần đóng góp phương pháp chính của báo cáo.
+
+\begin{definition}[Cửa sổ thoái hoá]
+Cửa sổ $W_k$ được gọi là \emph{thoái hoá} nếu tập nhãn thật bên trong nó chỉ có
+một phần tử: $\big|\{y_t : t \in W_k\}\big| = 1$.
+\end{definition}
+
+\begin{proposition}[ARI suy biến trên cửa sổ thoái hoá]
+\label{prop:degenerate}
+Trên một cửa sổ thoái hoá, giá trị ARI theo~\eqref{eq:ari} chỉ nhận hai giá trị:
+\begin{equation}
+  \mathrm{ARI}\big(W_k\big) =
+  \begin{cases}
+    1, & \text{nếu mô hình gán toàn bộ cửa sổ vào đúng một cụm},\\
+    0, & \text{với mọi cách chia khác, bất kể chia thế nào}.
+  \end{cases}
+\end{equation}
+\end{proposition}
+
+\begin{proof}
+Vì chỉ có một lớp thật, mọi cặp điểm trong cửa sổ đều là cặp ``cùng lớp''. Do đó
+không tồn tại cặp khác lớp, kéo theo
+\[
+  \mathrm{FP} = 0, \qquad \mathrm{TN} = 0 .
+\]
+Thay vào~\eqref{eq:ari}, tử số trở thành
+$2(\mathrm{TP}\cdot 0 - \mathrm{FN}\cdot 0) = 0$, còn mẫu số là
+\[
+  (\mathrm{TP}+\mathrm{FN})\,\mathrm{FN} \;+\; (\mathrm{TP}+0)\cdot 0
+  \;=\; (\mathrm{TP}+\mathrm{FN})\,\mathrm{FN}.
+\]
+Nếu mô hình chia cửa sổ thành từ hai cụm trở lên thì tồn tại cặp cùng lớp khác
+cụm, tức $\mathrm{FN}>0$, nên mẫu số dương và $\mathrm{ARI}=0$. Nếu mô hình gộp
+toàn bộ vào một cụm thì $\mathrm{FN}=0$, mẫu số bằng $0$, và theo quy ước
+$0/0 \mapsto 1$ ta được $\mathrm{ARI}=1$.
+\end{proof}
+
+\begin{remark}
+Kết quả tương tự đúng cho AMI theo quy ước biên của River: $R=1$ cho
+$\mathrm{AMI}=0$ trừ khi $C=1$, lúc đó $\mathrm{AMI}=1$. Purity thì luôn bằng
+$1$ trên cửa sổ thoái hoá, bất kể mô hình làm gì.
+\end{remark}
+
+Hệ quả thực tiễn rất nghiêm trọng: trên cửa sổ thoái hoá, chỉ số per-window
+không đo chất lượng phân cụm mà đo \emph{mô hình có gộp cửa sổ lại hay không}.
+Một mô hình \emph{phân mảnh quá ít} (under-segmenting) --- thường là mô hình
+tồi --- sẽ ăn trọn điểm $1.0$ trên mọi cửa sổ thoái hoá. Nếu luồng đến theo từng
+khối cùng lớp, trung bình per-window vì thế trở thành một phần thưởng cho việc
+phân cụm kém.
+
+\paragraph{Thống kê chẩn đoán.}
+Framework do đó tính và báo cáo, cho mỗi lần chạy:
+\begin{align}
+  \rho_{\text{deg}} &= \frac{1}{K}\sum_{k=1}^{K}
+    \ind{\,\big|\{y_t : t \in W_k\}\big| = 1\,}
+    &&\text{(tỉ lệ cửa sổ thoái hoá)},\\
+  \tilde{p} &= \operatorname{median}_{k}
+    \left( \frac{\max_i |\{t\in W_k : y_t = i\}|}{|W_k|} \right)
+    &&\text{(trung vị tỉ lệ lớp áp đảo)}.
+\end{align}
+Bảng chẩn đoán được in \emph{trước} bảng time-aware, kèm cảnh báo tự động khi
+$\rho_{\text{deg}} \ge 0.3$.
+
+% =====================================================================
+\section{Mã giả}
+\label{sec:pseudocode}
+% =====================================================================
+
+\begin{algorithm}[htbp]
+\caption{\textsc{RunOnce} --- benchmark một setting trên một luồng}
+\label{alg:runonce}
+\begin{algorithmic}[1]
+\Require luồng $\mathcal{S}$; adapter $A$ (scaler + bộ phân cụm); cỡ cửa sổ $m$;
+         số checkpoint $P$; tập độ đo ngoại $\mathcal{E}$, nội $\mathcal{I}$
+\Ensure  quỹ đạo chất lượng, quỹ đạo tài nguyên, chẩn đoán
+\State $M^{\mathrm{cum}} \gets \textsc{NewMetrics}(\mathcal{E}\cup\mathcal{I})$
+       \Comment{không bao giờ reset}
+\State $M^{\mathrm{win}} \gets \textsc{NewMetrics}(\mathcal{E}\cup\mathcal{I})$
+       \Comment{reset mỗi cửa sổ}
+\State $L \gets \emptyset$ \Comment{đa tập nhãn của cửa sổ hiện tại}
+\State $g \gets \lfloor |\mathcal{S}| / P \rfloor$;\quad
+       $T \gets 0$;\quad $n \gets 0$
+\ForAll{$(\xt, y) \in \mathcal{S}$}
+  \If{$n > 0$ \textbf{and} $n \bmod m = 0$}
+      \Comment{biên cửa sổ}
+    \State \textsc{FlushWindow}$(M^{\mathrm{cum}}, M^{\mathrm{win}}, L)$
+    \State $M^{\mathrm{win}} \gets \textsc{NewMetrics}(\mathcal{E}\cup\mathcal{I})$;\quad
+           $L \gets \emptyset$
+  \EndIf
+  \State $t_0 \gets \textsc{Clock}()$
+  \State $\tilde\xt \gets A.\textsc{Scale}(\xt)$
+         \Comment{learn rồi mới transform, \eqref{eq:scaleorder}}
+  \State $\hat y \gets A.\textsc{Predict}(\tilde\xt)$
+         \Comment{test truớc}
+  \State $A.\textsc{Learn}(\tilde\xt)$
+         \Comment{train sau}
+  \State $T \gets T + (\textsc{Clock}() - t_0)$;\quad $n \gets n+1$
+  \If{$y \neq \bot$}
+    \State $L \gets L \uplus \{y\}$
+    \State cập nhật mọi độ đo ngoại trong $M^{\mathrm{cum}}$ và $M^{\mathrm{win}}$ bằng $(y,\hat y)$
+  \EndIf
+  \If{$\mathcal{I} \neq \emptyset$ \textbf{and} $A.\textsc{Centers}() \neq \emptyset$}
+    \State cập nhật mọi độ đo nội bằng $(\tilde\xt, \hat y, A.\textsc{Centers}())$
+           \Comment{cùng không gian với tâm cụm}
+  \EndIf
+  \If{$n \bmod g = 0$}
+    \State \textsc{Checkpoint}$(n, T)$ \Comment{Thuật toán~\ref{alg:checkpoint}}
+  \EndIf
+\EndFor
+\State \textsc{FlushWindow}$(\cdot)$ cho cửa sổ dở dang cuối; \textsc{Checkpoint}$(n,T)$
+\State \Return tóm tắt~\eqref{eq:summary} trên $\{M^{\mathrm{win}}_k\}$ \emph{và} trên
+       $\{M^{\mathrm{cum}}_k\}$, cùng $\rho_{\text{deg}}, \tilde p$
+\end{algorithmic}
+\end{algorithm}
+
+\begin{algorithm}[htbp]
+\caption{\textsc{Checkpoint} --- lấy mẫu tài nguyên (đắt, nên thưa)}
+\label{alg:checkpoint}
+\begin{algorithmic}[1]
+\Require số mẫu đã xử lý $n$, runtime luỹ kế $T$
+\State $\mu \gets A.\textsc{MicroClusterCount}()$;\quad
+       $\kappa \gets A.\textsc{MacroClusterCount}()$
+\State $b \gets A.\textsc{ModelMemoryBytes}()$
+       \Comment{$\mathcal{O}(|\theta|)$ --- xem Nhận xét~\ref{rem:memcost}}
+\State $\varrho \gets \textsc{ProcessRSS}()$
+\State $\text{peak}_{\text{mem}} \gets \max(\text{peak}_{\text{mem}}, b)$;\quad
+       $\text{peak}_{\text{rss}} \gets \max(\text{peak}_{\text{rss}}, \varrho)$
+\State ghi bộ $(n,\ T,\ b,\ \varrho,\ \mu,\ \kappa)$
+\end{algorithmic}
+\end{algorithm}
+
+\begin{algorithm}[htbp]
+\caption{\textsc{RunBenchmark} --- nhiều setting, nhiều seed, cùng một luồng}
+\label{alg:harness}
+\begin{algorithmic}[1]
+\Require danh sách setting $\mathcal{P}$; dataset $D$; tập seed $\mathcal{Z}$
+\State ghi lại môi trường: CPU, RAM, OS, phiên bản Python và River
+\ForAll{$p \in \mathcal{P}$}
+  \If{\textsc{AcceptsSeed}$(p.\text{algorithm})$}
+     \Comment{nội quan chữ ký hàm khởi tạo}
+    \State $Z_p \gets \mathcal{Z}$
+  \Else
+    \State $Z_p \gets \{\,\text{seed đầu tiên}\,\}$
+           \Comment{tất định: lặp lại là lãng phí}
+  \EndIf
+  \ForAll{$z \in Z_p$}
+    \State $A \gets$ \textsc{BuildAdapter}$(p, z)$
+           \Comment{tham số scaler cũng được ghi lại}
+    \State $r_{p,z} \gets$ \textsc{RunOnce}$(D, A, \dots)$
+           \Comment{$D$ trả iterator mới $\Rightarrow$ cùng luồng}
+  \EndFor
+  \State $\text{agg}_p \gets$ mean $\pm$ std trên $\{r_{p,z}\}_{z \in Z_p}$
+\EndFor
+\State \Return bảng, đồ thị, JSON, kèm số lần chạy thật $|Z_p|$ của từng setting
+\end{algorithmic}
+\end{algorithm}
+
+Thuật toán~\ref{alg:runonce} là vòng lặp trực tuyến chính,
+Thuật toán~\ref{alg:checkpoint} là bước lấy mẫu tài nguyên, và
+Thuật toán~\ref{alg:harness} là lớp điều phối nhiều setting--nhiều seed bên trên.
+
+Thuật toán~\ref{alg:runonce} là vòng lặp trực tuyến chính,
+Thuật toán~\ref{alg:checkpoint} là bước lấy mẫu tài nguyên đắt tiền, và
+Thuật toán~\ref{alg:harness} là lớp điều phối nhiều setting, nhiều seed bên
+trên. Nhận xét~\ref{rem:guard} giải thích vì sao bước chuẩn hoá ở dòng~11 của
+Thuật toán~\ref{alg:runonce} cần một điều kiện bảo vệ chặt hơn vẻ ngoài của nó.
+
+% =====================================================================
+\section{Kiểm chứng framework}
+\label{sec:results}
+% =====================================================================
+
+Các số đo dưới đây tồn tại để \emph{kiểm chứng bộ máy đo}, không phải để xếp
+hạng thuật toán hay đề xuất siêu tham số. Chúng trả lời những câu hỏi về chính
+phép đo: chi phí của một phép đo có làm hỏng thứ nó đo không
+(Mục~\ref{sec:memcost-res}); hai họ chỉ số chất lượng có thực sự khác nhau không
+(Mục~\ref{sec:cumwin-res}); Mệnh đề~\ref{prop:degenerate} có đúng trên dữ liệu
+thật không (Mục~\ref{sec:degen-res}). Mọi cấu hình thuật toán xuất hiện ở đây là
+\emph{ví dụ chạy được}, không phải khuyến nghị. Các luồng dữ liệu dùng ở đây mô
+tả ở Mục~\ref{sec:datasets} (Bảng~\ref{tab:generator} và~\ref{tab:realdata}).
+
+\subsection{Môi trường}
+
+Bảng~\ref{tab:env} là bản ghi môi trường áp dụng cho mọi số đo trong mục này;
+framework tự sinh nó ở mỗi lần chạy.
+
+\begin{table}[htbp]
+\centering
+\small
+\caption{Môi trường chạy, do framework tự ghi lại ở mỗi lần benchmark.}
+\label{tab:env}
+\begin{tabular}{@{}ll@{}}
+\toprule
+CPU & AMD64 Family 25 Model 80 (8 nhân vật lý / 16 luồng) \\
+RAM & 27.86 GB \\
+OS & Windows 11 (10.0.26200) \\
+Python & 3.13.3 (CPython) \\
+River & 0.26.1 (cây nguồn cục bộ); bản phân phối đã cài: 0.26.0 \\
+NumPy / SciPy / scikit-learn & 2.4.3 / 1.17.1 / 1.8.0 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Chênh lệch giữa \texttt{0.26.1} (phiên bản trong cây nguồn đang được import) và
+\texttt{0.26.0} (siêu dữ liệu gói đã cài) chính là loại sai lệch mà bản ghi môi
+trường sinh ra để phát hiện.
+
+\subsection{Chi phí của phép đo bộ nhớ}
+\label{sec:memcost-res}
+
+Bảng~\ref{tab:memcost} đo trực tiếp chi phí nêu ở Nhận xét~\ref{rem:memcost}:
+thời gian xử lý $3000$ mẫu $34$ chiều, so với $3000$ lần đọc
+\texttt{\_raw\_memory\_usage}.
+
+\begin{table}[htbp]
+\centering
+\small
+\caption{Chi phí đo bộ nhớ so với chi phí xử lý, trên $3000$ mẫu.}
+\label{tab:memcost}
+\begin{tabular}{@{}lrrr@{}}
+\toprule
+\textbf{Thuật toán} & \textbf{Xử lý (s)} & \textbf{$3000$ lần đo (s)} & \textbf{Hệ số} \\
+\midrule
+DBSTREAM      & 0.104 & 0.207  & $2.0\times$ \\
+STREAMKMeans  & 0.241 & 42.771 & $\mathbf{177.6\times}$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Ngoại suy sang một benchmark $400\,000$ mẫu, riêng phép đo bộ nhớ của
+STREAMKMeans sẽ tốn khoảng $1.6$ giờ --- nhiều hơn toàn bộ phần tính toán thật
+hàng trăm lần. Đây là lý do phép đo được dời về checkpoint.
+
+\subsection{Luỹ kế so với theo cửa sổ}
+\label{sec:cumwin-res}
+
+\begin{table}[htbp]
+\centering
+\small
+\caption{Hai cách tóm tắt ARI trên luồng Gaussian tổng hợp
+($n=20\,000$, $d=10$, $k=5$, $m=1000$). Trung bình đường luỹ kế \emph{đánh giá
+thấp} chất lượng ổn định, đúng như Mệnh đề~\ref{prop:cumbias} dự đoán: nó mang
+theo giai đoạn khởi động lạnh với trọng số lớn nhất.}
+\label{tab:cumwin}
+\begin{tabular}{@{}llrrrr@{}}
+\toprule
+\textbf{Thuật toán} & \textbf{Seed}
+ & $\operatorname{mean}(M^{\mathrm{cum}})$ & $\operatorname{final}(M^{\mathrm{cum}})$
+ & $\operatorname{mean}(M^{\mathrm{win}})$ & $\operatorname{final}(M^{\mathrm{win}})$ \\
+\midrule
+CluStream     & 1 & 0.868 & 0.958 & \textbf{0.965} & 1.000 \\
+CluStream     & 2 & 0.177 & 0.175 & \textbf{0.299} & 0.278 \\
+DenStream     & 1 & 0.092 & 0.084 & \textbf{0.198} & 0.201 \\
+DBSTREAM      & 1 & 0.959 & 0.988 & \textbf{0.989} & 1.000 \\
+STREAMKMeans  & 1 & 0.657 & 0.746 & \textbf{0.750} & 0.777 \\
+STREAMKMeans  & 2 & 0.386 & 0.444 & \textbf{0.457} & 0.453 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Trong cả sáu lần chạy, $\operatorname{mean}(M^{\mathrm{cum}}) <
+\operatorname{mean}(M^{\mathrm{win}})$, độ lệch từ $0.03$ đến $0.12$ điểm ARI.
+Hình~\ref{fig:cumwin} vẽ hai đường cho CluStream (seed 1): đường per-window đạt
+$1.0$ sau cửa sổ thứ ba và giữ nguyên, còn đường luỹ kế mất tới cuối luồng mới
+bò lên $0.958$ vì nó vẫn đang gánh $500$ mẫu đầu tiên.
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}
+\begin{axis}[
+  width=13cm, height=6.2cm,
+  xlabel={số mẫu đã xử lý $t$},
+  ylabel={ARI},
+  ymin=0.3, ymax=1.06,
+  xmin=0, xmax=20000,
+  legend pos=south east,
+  legend cell align=left,
+  grid=both,
+  grid style={gray!18},
+  tick label style={font=\small},
+  label style={font=\small},
+  legend style={font=\small},
+]
+\addplot[thick,blue!70!black,mark=*,mark size=1.2pt] coordinates {
+(499,0.4315)(1499,0.6305)(2499,0.7403)(3499,0.8012)(4499,0.8380)(5499,0.8640)
+(6499,0.8827)(7499,0.8971)(8499,0.9083)(9499,0.9170)(10499,0.9246)(11499,0.9308)
+(12499,0.9360)(13499,0.9404)(14499,0.9444)(15499,0.9478)(16499,0.9508)
+(17499,0.9535)(18499,0.9560)(19499,0.9582)
+};
+\addlegendentry{luỹ kế (cumulative)}
+\addplot[thick,orange!85!black,mark=square*,mark size=1.2pt] coordinates {
+(499,0.4315)(1499,0.8644)(2499,1.0000)(3499,1.0000)(4499,1.0000)(5499,1.0000)
+(6499,1.0000)(7499,1.0000)(8499,1.0000)(9499,1.0000)(10499,1.0000)(11499,1.0000)
+(12499,1.0000)(13499,1.0000)(14499,1.0000)(15499,1.0000)(16499,1.0000)
+(17499,1.0000)(18499,1.0000)(19499,1.0000)
+};
+\addlegendentry{theo cửa sổ (per-window)}
+\end{axis}
+\end{tikzpicture}
+\caption{CluStream trên luồng tổng hợp, seed 1. Đường luỹ kế là đường
+\emph{hội tụ}; đường per-window là đường \emph{tức thời}. Tóm tắt đường luỹ kế
+rồi gọi đó là ``chất lượng trung bình dọc luồng'' sẽ báo $0.868$ trong khi mô
+hình thực tế đã hoàn hảo từ mẫu thứ $2000$.}
+\label{fig:cumwin}
+\end{figure}
+
+\subsection{Kiểm chứng thực nghiệm
+  \texorpdfstring{Mệnh đề~\ref{prop:degenerate}}{Mệnh đề 2}}
+\label{sec:degen-res}
+
+Hình~\ref{fig:degenerate} là bằng chứng trực tiếp. Nó vẽ ARI per-window của
+DBSTREAM trên $20\,000$ mẫu đầu KDDCup99 với hai scaler khác nhau, và tô nền
+những cửa sổ thoái hoá.
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}
+\begin{axis}[
+  width=14cm, height=6.4cm,
+  xlabel={số mẫu đã xử lý $t$},
+  ylabel={ARI trong cửa sổ},
+  ymin=-0.08, ymax=1.12,
+  xmin=0, xmax=20000,
+  legend pos=outer north east,
+  legend cell align=left,
+  grid=both, grid style={gray!18},
+  tick label style={font=\small},
+  label style={font=\small},
+  legend style={font=\scriptsize},
+]
+% shade degenerate windows (n_true_classes == 1)
+\pgfplotsinvokeforeach{1000,2000,3000,5000,6000,8000,9000,10000,12000,13000,14000,16000,17000,18000}{
+  \addplot[draw=none,fill=red!9,forget plot] coordinates
+    {(#1,-0.08) (\the\numexpr#1+1000\relax,-0.08)
+     (\the\numexpr#1+1000\relax,1.12) (#1,1.12)} \closedcycle;
+}
+\addplot[thick,blue!70!black,mark=*,mark size=1.3pt] coordinates {
+(499,0.0001)(1499,0.0000)(2499,0.0000)(3499,0.0000)(4499,0.0007)(5499,0.0000)
+(6499,0.0000)(7499,0.1059)(8499,0.0000)(9499,0.0000)(10499,0.0000)(11499,0.4111)
+(12499,0.0000)(13499,0.0000)(14499,0.0000)(15499,0.0150)(16499,0.0000)
+(17499,0.0000)(18499,0.0000)(19499,0.0537)
+};
+\addlegendentry{\texttt{standard}}
+\addplot[thick,orange!85!black,mark=square*,mark size=1.3pt] coordinates {
+(499,0.0084)(1499,0.0000)(2499,1.0000)(3499,0.0000)(4499,0.0783)(5499,1.0000)
+(6499,0.0000)(7499,0.0983)(8499,0.0000)(9499,1.0000)(10499,1.0000)(11499,0.0021)
+(12499,0.0000)(13499,1.0000)(14499,1.0000)(15499,0.5080)(16499,0.0000)
+(17499,1.0000)(18499,0.0000)(19499,0.8462)
+};
+\addlegendentry{\texttt{minmax}}
+\end{axis}
+\end{tikzpicture}
+\caption{DBSTREAM trên KDDCup99 ($n=20\,000$, $m=1000$). Vùng nền hồng là các
+cửa sổ \emph{thoái hoá} (chỉ chứa một lớp thật). Trên mọi cửa sổ đó, cả hai
+đường chỉ nhận giá trị $0$ hoặc $1$ --- không có giá trị trung gian nào ---
+đúng như Mệnh đề~\ref{prop:degenerate}. \texttt{minmax} nén dữ liệu mạnh nên gộp
+được nhiều cửa sổ và ăn bảy điểm $1.0$ miễn phí; \texttt{standard} trải dữ liệu
+ra nên luôn chia nhỏ và nhận $0$.}
+\label{fig:degenerate}
+\end{figure}
+
+Trên $14$ cửa sổ thoái hoá, \texttt{minmax} nhận đúng bảy giá trị $1.0000$ và
+bảy giá trị $0.0000$, không có giá trị nào khác; \texttt{standard} nhận $0.0000$
+trên cả $14$. Không có ngoại lệ nào --- đúng như dự đoán lý thuyết.
+
+Với KDDCup99 ở quy mô lớn hơn, mức độ thoái hoá còn cao hơn:
+
+\begin{table}[htbp]
+\centering
+\small
+\caption{Chẩn đoán cửa sổ trên KDDCup99 ($m=1000$).}
+\label{tab:diag}
+\begin{tabular}{@{}lrrrr@{}}
+\toprule
+$n$ & \# cửa sổ & \# thoái hoá & $\rho_{\text{deg}}$ & $\tilde p$ \\
+\midrule
+$20\,000$ & 20 & 14 & $70\%$ & 1.000 \\
+$50\,000$ & 50 & 36 & $\mathbf{72\%}$ & 1.000 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Bảng~\ref{tab:diag} tổng hợp ở hai quy mô.
+Ở $n=50\,000$, ngoài $36$ cửa sổ thoái hoá còn có $40/50$ cửa sổ mà một lớp
+chiếm $\ge 99\%$. Trung vị tỉ lệ lớp áp đảo bằng $1.000$.
+
+\subsection{Khảo sát scaler: một cái bẫy hoàn chỉnh}
+\label{sec:ablation}
+
+Bảng~\ref{tab:ablation} khảo sát sáu biến thể chuẩn hoá với cùng một thuật toán
+(DBSTREAM), cùng tham số, cùng luồng.
+
+\begin{table}[htbp]
+\centering
+\small
+\caption{Khảo sát scaler --- DBSTREAM trên KDDCup99, $n=50\,000$, seed 1.
+Cột $\mathrm{ARI}^{\text{toàn}}$ là chỉ số toàn luồng; cột
+$\overline{\mathrm{ARI}}^{\text{win}}$ là trung bình per-window.}
+\label{tab:ablation}
+\begin{tabular}{@{}lrrrrr@{}}
+\toprule
+\textbf{Scaler} & $\mathrm{ARI}^{\text{toàn}}$ & $\overline{\mathrm{ARI}}^{\text{win}}$
+ & \textbf{mẫu/s} & \textbf{Model MB} & $\overline{|\mathcal{M}|}$ \\
+\midrule
+\texttt{standard}                       & $\mathbf{0.1458}$ & 0.0228 & 1\,022 & 0.66 & 109.5 \\
+\texttt{standard(window\_size=10000)}   & 0.1225 & 0.0182 & 914 & $\mathbf{122.8}$ & 113.3 \\
+\texttt{none}                           & 0.0491 & 0.0216 & $\mathbf{39\,860}$ & 0.05 & 4.9 \\
+\texttt{robust}                         & 0.0039 & 0.0054 & 1\,692 & 0.81 & 140.0 \\
+\texttt{adaptive\_standard(0.01)}       & $-0.0498$ & 0.0608 & 513 & 1.14 & 198.6 \\
+\texttt{minmax}                         & $\mathbf{-0.0850}$ & $\mathbf{0.5377}$ & 4\,313 & 0.10 & 20.5 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Bảng này chứa ba bài học tách biệt.
+
+\paragraph{(a) Hai cột chất lượng cho hai bảng xếp hạng ngược nhau.}
+Theo $\overline{\mathrm{ARI}}^{\text{win}}$, \texttt{minmax} thắng áp đảo
+($0.5377$ so với $0.0228$, tức gấp $24$ lần). Theo $\mathrm{ARI}^{\text{toàn}}$,
+\texttt{minmax} là biến thể \emph{tệ nhất} và điểm của nó \emph{âm} --- tệ hơn
+gán ngẫu nhiên. Mệnh đề~\ref{prop:degenerate} cùng Hình~\ref{fig:degenerate}
+giải thích trọn vẹn nghịch lý: điểm per-window của \texttt{minmax} gần như hoàn
+toàn cấu thành từ những giá trị $1.0$ miễn phí trên cửa sổ thoái hoá. Trên luồng
+kiểu này, \textbf{chỉ số toàn luồng mới là chỉ số nên tin}, và kết luận đúng là
+dùng \texttt{standard}.
+
+\paragraph{(b) Cái giá bộ nhớ của cửa sổ trượt.}
+\texttt{standard(window\_size=10000)} tốn $122.8$ MB so với $0.66$ MB của
+\texttt{standard} thường --- gấp $187$ lần. Điều này khớp với phân tích
+$\mathcal{O}(dW)$: với $d=34$ và $W=10^4$, bộ chuẩn hoá phải lưu $3.4\times10^5$
+quan sát. Đây là đánh đổi có thật, và nó chỉ hiện ra khi hàm tạo scaler cho phép
+truyền tham số.
+
+\paragraph{(c) Chuẩn hoá vừa là lợi ích vừa là chi phí.}
+So với \texttt{none}, \texttt{standard} tăng $\mathrm{ARI}^{\text{toàn}}$ gấp
+gần ba lần ($0.049 \to 0.146$) nhưng làm thông lượng giảm $39$ lần
+($39\,860 \to 1\,022$ mẫu/s). Nguyên nhân nằm ở cột cuối: chuẩn hoá trải dữ liệu
+ra nên số micro-cluster trung bình tăng từ $4.9$ lên $109.5$, và chi phí mỗi mẫu
+của DBSTREAM tăng theo $|\mathcal{M}|$. Hình~\ref{fig:ablation} trình bày lại
+hai cột chất lượng của Bảng~\ref{tab:ablation} cạnh nhau.
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}
+\begin{axis}[
+  width=14cm, height=6.4cm,
+  ybar=1.2pt,
+  bar width=8pt,
+  symbolic x coords={standard,rolling,none,robust,adaptive,minmax},
+  xtick=data,
+  x tick label style={font=\scriptsize,rotate=18,anchor=east},
+  ylabel={ARI},
+  ymin=-0.15, ymax=0.62,
+  legend pos=north west,
+  legend cell align=left,
+  legend style={font=\small},
+  grid=both, grid style={gray!18},
+  label style={font=\small},
+  tick label style={font=\small},
+  extra y ticks={0},
+  extra y tick labels={},
+  extra y tick style={grid=major, grid style={black!55,thick,dashed}},
+]
+\addplot[fill=blue!55,draw=blue!70!black] coordinates {
+(standard,0.1458)(rolling,0.1225)(none,0.0491)(robust,0.0039)(adaptive,-0.0498)(minmax,-0.0850)
+};
+\addlegendentry{ARI toàn stream (đáng tin)}
+\addplot[fill=orange!65,draw=orange!80!black] coordinates {
+(standard,0.0228)(rolling,0.0182)(none,0.0216)(robust,0.0054)(adaptive,0.0608)(minmax,0.5377)
+};
+\addlegendentry{ARI trung bình per-window (thoái hoá)}
+\end{axis}
+\end{tikzpicture}
+\caption{Cùng sáu lần chạy, hai cách chấm điểm, hai bảng xếp hạng đối nghịch.
+Cột cam của \texttt{minmax} vọt lên $0.5377$ hoàn toàn nhờ các cửa sổ thoái hoá;
+cột xanh cho thấy phân hoạch thật của nó còn tệ hơn ngẫu nhiên.}
+\label{fig:ablation}
+\end{figure}
+
+\subsection{Hệ quả trên một lượt chạy đầy đủ: hai bảng xếp hạng ngược nhau}
+\label{sec:fullbench}
+
+Đây là kết quả tổng hợp (Bảng~\ref{tab:fullperf} cho hiệu năng,
+Bảng~\ref{tab:fullquality} cho chất lượng), và cũng là minh chứng mạnh nhất cho
+Mệnh đề~\ref{prop:degenerate}. Bốn thuật toán chạy trên cùng $50\,000$ mẫu đầu
+KDDCup99, cùng \texttt{standard} scaler, $m=1000$, $25$ checkpoint, seed
+$\{1,2,3\}$ cho thuật toán ngẫu nhiên.
+
+\begin{table}[htbp]
+\centering
+\small
+\caption{Hiệu năng và độ phức tạp mô hình. Cột ``Chạy'' là số lần chạy thật:
+DenStream và DBSTREAM tất định nên chỉ chạy một seed, và độ lệch chuẩn $0$ của
+chúng là hệ quả định nghĩa chứ không phải bằng chứng về độ ổn định.}
+\label{tab:fullperf}
+\begin{tabular}{@{}lrrrrrr@{}}
+\toprule
+\textbf{Thuật toán} & \textbf{Chạy} & \textbf{Runtime (s)} & \textbf{mẫu/s}
+ & \textbf{Model MB} & $\overline{|\mathcal{M}|}$ & \textbf{Macro} $K$ \\
+\midrule
+CluStream    & 3 & $162.7 \pm 5.1$ & $308 \pm 10$    & 0.913 & 100.0 & 5 \\
+DenStream    & 1 & $2.5$           & $19\,921$       & 0.012 & $\mathbf{1.0}$ & $\mathbf{1}$ \\
+DBSTREAM     & 1 & $53.2$          & $941$           & 0.657 & 109.5 & 1 \\
+STREAMKMeans & 3 & $5.6 \pm 0.1$   & $8\,928 \pm 88$ & 3.246 & --- & 10 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[htbp]
+\centering
+\small
+\caption{Chất lượng theo hai cách chấm. Thứ hạng trong ngoặc. Với
+$\rho_{\text{deg}}=72\%$ trên luồng này, cột trái là cột đáng tin.}
+\label{tab:fullquality}
+\begin{tabular}{@{}lrrrr@{}}
+\toprule
+\multirow{2}{*}{\textbf{Thuật toán}}
+ & \multicolumn{2}{c}{\textbf{Toàn stream (đáng tin)}}
+ & \multicolumn{2}{c}{\textbf{Per-window (thoái hoá)}} \\
+\cmidrule(lr){2-3}\cmidrule(lr){4-5}
+ & ARI & AMI & mean ARI & median ARI \\
+\midrule
+DBSTREAM     & $\mathbf{0.1458}$~(1) & 0.1530 & 0.0228 \;(4) & 0.0000 \\
+STREAMKMeans & $0.0734 \pm 0.0719$~(2) & 0.2245 & $0.3488 \pm 0.0076$~(2) & 0.0001 \\
+CluStream    & $0.0282 \pm 0.0092$~(3) & 0.1298 & $0.1533 \pm 0.0466$~(3) & 0.0000 \\
+DenStream    & $\mathbf{0.0000}$~(4) & 0.0000 & $\mathbf{0.7200}$~(1) & 1.0000 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{Đảo ngược hoàn toàn ở hai đầu bảng.}
+DenStream ở cấu hình này \emph{đã sụp hoàn toàn}: đúng một micro-cluster, đúng
+một macro-cluster, ARI toàn stream bằng chính xác $0.0000$, AMI bằng $0.0000$.
+Về mọi mặt, nó không phân cụm gì cả. Vậy mà nó đứng \textbf{nhất} về ARI
+per-window với $0.7200$ --- gấp $32$ lần DBSTREAM, mô hình thực sự tốt nhất
+theo chỉ số toàn stream. Trung vị ARI per-window của nó bằng $1.0000$.
+
+Điều này không phải là một sự trùng hợp mà là hệ quả trực tiếp của
+Mệnh đề~\ref{prop:degenerate}: một mô hình gán \emph{mọi} điểm vào \emph{một}
+cụm sẽ đạt điểm tối đa trên \emph{mọi} cửa sổ thoái hoá, và $72\%$ số cửa sổ ở
+đây thoái hoá. DenStream là mô hình under-segment cực đại, nên nó là mô hình
+thắng cực đại theo chỉ số đã bị thoái hoá.
+
+Tương quan hạng Spearman giữa hai cột là
+\begin{equation}
+  \rho_s \;=\; 1 - \frac{6\sum_i d_i^2}{K(K^2-1)}
+  \;=\; 1 - \frac{6 \cdot 18}{4 \cdot 15} \;=\; -0.8,
+\end{equation}
+tức hai chỉ số gần như phản bác nhau. Đây chính là lý do bảng chẩn đoán cửa sổ
+được in \emph{trước} bảng time-aware trong báo cáo tự động, kèm cảnh báo khi
+$\rho_{\text{deg}} \ge 0.3$.
+
+\paragraph{Đọc bảng hiệu năng cho đúng.}
+Bảng~\ref{tab:fullperf} cũng nhắc rằng thông lượng cao không phải lúc nào cũng
+là tin tốt: DenStream đạt $19\,921$ mẫu/s \emph{vì} nó chỉ duy trì một
+micro-cluster --- tốc độ ở đây là triệu chứng của sự sụp đổ, không phải của
+hiệu quả. Ngược lại, CluStream chậm nhất ($308$ mẫu/s) vì nó bị ràng buộc luôn
+giữ đủ $100$ micro-cluster (\texttt{max\_micro\_clusters}) và tái phân cụm định
+kỳ. Cột $\overline{|\mathcal{M}|}$ là biến giải thích cho cả hai, và
+Hình~\ref{fig:scalability} cho thấy quan hệ đó dọc theo luồng.
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}
+\begin{axis}[
+  width=7.1cm, height=5.4cm,
+  xlabel={số mẫu đã xử lý},
+  ylabel={runtime luỹ kế (s)},
+  xmin=0, xmax=50000,
+  ymin=0,
+  legend pos=north west,
+  legend style={font=\scriptsize},
+  legend cell align=left,
+  grid=both, grid style={gray!18},
+  label style={font=\small}, tick label style={font=\scriptsize},
+  scaled x ticks=false,
+  xticklabel style={/pgf/number format/fixed,/pgf/number format/1000 sep={\,}},
+]
+\addplot[thick,red!70!black,mark=*,mark size=1pt] coordinates {
+(2000,7.62)(8000,31.40)(14000,48.69)(20000,70.88)(26000,92.91)(32000,114.59)
+(38000,136.84)(44000,155.18)(50000,168.36)};
+\addlegendentry{CluStream}
+\addplot[thick,blue!70!black,mark=square*,mark size=1pt] coordinates {
+(2000,0.92)(8000,6.59)(14000,11.87)(20000,17.69)(26000,24.92)(32000,31.78)
+(38000,40.06)(44000,49.74)(50000,53.15)};
+\addlegendentry{DBSTREAM}
+\addplot[thick,green!45!black,mark=triangle*,mark size=1.2pt] coordinates {
+(2000,0.22)(8000,0.91)(14000,1.57)(20000,2.25)(26000,2.91)(32000,3.60)
+(38000,4.27)(44000,4.97)(50000,5.65)};
+\addlegendentry{STREAMKMeans}
+\addplot[thick,orange!85!black,mark=diamond*,mark size=1.2pt] coordinates {
+(2000,0.08)(8000,0.39)(14000,0.69)(20000,0.99)(26000,1.28)(32000,1.58)
+(38000,1.88)(44000,2.19)(50000,2.51)};
+\addlegendentry{DenStream}
+\end{axis}
+\end{tikzpicture}
+\hfill
+\begin{tikzpicture}
+\begin{axis}[
+  width=7.1cm, height=5.4cm,
+  xlabel={số mẫu đã xử lý},
+  ylabel={số micro-cluster $|\mathcal{M}|$},
+  xmin=0, xmax=50000,
+  ymin=0, ymax=240,
+  legend pos=north west,
+  legend style={font=\scriptsize},
+  legend cell align=left,
+  grid=both, grid style={gray!18},
+  label style={font=\small}, tick label style={font=\scriptsize},
+  scaled x ticks=false,
+  xticklabel style={/pgf/number format/fixed,/pgf/number format/1000 sep={\,}},
+]
+\addplot[thick,red!70!black,mark=*,mark size=1pt] coordinates {
+(2000,100)(8000,100)(14000,100)(20000,100)(26000,100)(32000,100)
+(38000,100)(44000,100)(50000,100)};
+\addlegendentry{CluStream (bị chặn trên)}
+\addplot[thick,blue!70!black,mark=square*,mark size=1pt] coordinates {
+(2000,91)(8000,130)(14000,75)(20000,132)(26000,103)(32000,123)
+(38000,117)(44000,206)(50000,2)};
+\addlegendentry{DBSTREAM (tăng rồi tỉa)}
+\addplot[thick,orange!85!black,mark=diamond*,mark size=1.2pt] coordinates {
+(2000,1)(8000,1)(14000,1)(20000,1)(26000,1)(32000,1)
+(38000,1)(44000,1)(50000,1)};
+\addlegendentry{DenStream (đã sụp)}
+\end{axis}
+\end{tikzpicture}
+\caption{Trái: runtime luỹ kế tăng \emph{tuyến tính} theo số mẫu ở cả bốn thuật
+toán --- không có thuật toán nào suy biến về bậc cao hơn trên khoảng này. Phải:
+số micro-cluster giải thích độ dốc của đồ thị trái. CluStream bị chặn cứng ở
+$100$; DBSTREAM dao động giữa $75$ và $206$ theo nhịp phai--tỉa và tụt xuống $2$
+ở cuối; DenStream nằm bẹp ở $1$ suốt luồng. Quỹ đạo dao động của DBSTREAM cũng
+minh hoạ Nhận xét~\ref{rem:memcost}: với mô hình có tỉa, đỉnh đo tại checkpoint
+là một chặn dưới của đỉnh thật.}
+\label{fig:scalability}
+\end{figure}
+
+\subsection{Framework phơi bày quan hệ tham số--thang đo}
+\label{sec:eps}
+
+Chạy DenStream với $\varepsilon = 16.0$ trên KDDCup99 đã chuẩn hoá
+(Nhận xét~\ref{rem:eps}) cho kết quả đúng như dự đoán lý thuyết
+(Bảng~\ref{tab:eps}):
+
+\begin{table}[htbp]
+\centering
+\small
+\caption{DenStream, $\varepsilon=16.0$, \texttt{standard}, KDDCup99, $n=5000$.}
+\label{tab:eps}
+\begin{tabular}{@{}lrrrr@{}}
+\toprule
+\textbf{Thuật toán} & $\max|\mathcal{M}|$ & \textbf{Macro} $K$ & \textbf{ARI} & \textbf{Purity} \\
+\midrule
+DenStream ($\varepsilon=16$) & $\mathbf{1}$ & 1 & $\mathbf{0.0000}$ & 0.9992 \\
+DBSTREAM  & 132 & 52 & 0.0002 & 0.9992 \\
+STREAMKMeans & --- & 10 & 0.0016 & 0.9992 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Toàn bộ luồng sụp về đúng một micro-cluster và ARI bằng $0$. Đáng chú ý là
+purity vẫn báo $0.9992$ cho \emph{cả ba} thuật toán, kể cả cái đã sụp hoàn toàn
+--- một minh hoạ cụ thể cho cảnh báo ở~\eqref{eq:purity} rằng purity không hiệu
+chỉnh theo may rủi và vô dụng khi phân bố lớp cực kỳ mất cân bằng.
+
+% =====================================================================
+\section{Hai lỗi của River: ghi lại, không vá}
+\label{sec:riverbugs}
+% =====================================================================
+
+Trong quá trình xây dựng framework, hai lỗi của River lộ ra. Cây nguồn River
+\textbf{không bị chỉnh sửa}: nguyên tắc của dự án là framework đo thư viện
+\emph{thật}, chứ không phải một bản đã vá cục bộ --- một bản vá cục bộ sẽ biến
+mất ở lần cập nhật hoặc revert kế tiếp, và điều đó đã thực sự xảy ra một lần.
+Hai lỗi được ghi trong \texttt{RIVER\_BUGS.md} kèm cách tái hiện tối thiểu, và
+được né ở phía framework.
+
+\subsection{BUG-1 --- StandardScaler cửa sổ trượt sinh ra số phức}
+\label{sec:bug1}
+
+\texttt{StandardScaler(window\_size=10000)} làm DBSTREAM dừng với
+\texttt{TypeError: VectorDict values must be real numbers}, báo lỗi ở tận hàm
+khoảng cách Minkowski. Nguyên nhân là điều kiện bảo vệ trong~\eqref{eq:zscore}
+được cài dưới dạng kiểm tra ``khác không'' thay vì ``lớn hơn không''. Trên đặc
+trưng \texttt{num\_shells} --- hằng số $0$ trong suốt cửa sổ --- phương sai trượt
+trôi xuống một giá trị \emph{âm} cực nhỏ do triệt tiêu dấu phẩy động:
+\[
+  \sigma^2 = -2.0095 \times 10^{-18}
+  \;\Longrightarrow\;
+  (\sigma^2)^{1/2} = 1.4176\times10^{-9}\,i
+  \;\Longrightarrow\;
+  z = 2.517\times10^{-26} - 4.111\times10^{-10}\,i .
+\]
+Trong Python, luỹ thừa $0.5$ của một float âm trả về \emph{số phức} chứ không
+raise, nên giá trị này đi thẳng vào mô hình và chỉ bộc lộ rất xa nguồn gốc.
+
+\textbf{Sửa ở thượng nguồn:} đổi điều kiện thành $\sigma^2 > 0$ ở cả hai nhánh.
+
+\textbf{Né ở framework:} bước \texttt{standard\_safe} bọc scaler của River và ép
+mọi giá trị không phải số thực hữu hạn về $0.0$ --- đúng ý định ban đầu của điều
+kiện bảo vệ với một đặc trưng không có độ tán. Bước \texttt{standard} vẫn giữ
+nguyên hành vi River để hai bên so sánh được. Đo trên $20\,000$ mẫu KDDCup99:
+
+\begin{center}
+\small
+\begin{tabular}{@{}lr@{}}
+\toprule
+\textbf{Bước} & \textbf{Số giá trị phức} \\
+\midrule
+\texttt{standard(window\_size=10000)} & $5\,887$ \\
+\texttt{standard\_safe(window\_size=10000)} & $\mathbf{0}$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{BUG-2 --- \texorpdfstring{\texttt{seed}}{seed} của KMeans không đủ để tái lập}
+\label{sec:bug2}
+
+Cùng \texttt{seed}, cùng dữ liệu, cùng mã --- nhưng kết quả khác nhau giữa các
+tiến trình. Đo qua chính framework này trên luồng tổng hợp
+($n=3000$, $d=10$, $k=5$, STREAMKMeans, \texttt{seed=1}):
+
+\begin{center}
+\small
+\begin{tabular}{@{}lr@{}}
+\toprule
+\texttt{PYTHONHASHSEED} & \textbf{ARI} \\
+\midrule
+0 & 0.2360384106 \\
+1 & 0.5360306622 \\
+7 & 0.5784372243 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Luồng dữ liệu giống hệt nhau ở cả ba lần --- cùng nhãn, cùng giá trị sau tiền xử
+lý. Chỉ đầu ra của mô hình khác. Nguyên nhân là sự kết hợp của hai chi tiết
+trong \texttt{predict\_one}:
+
+\begin{enumerate}
+  \item khoảng cách được tính bằng cách duyệt hợp các key dưới dạng
+        \emph{set literal}, mà thứ tự duyệt set của khoá chuỗi phụ thuộc vào
+        \texttt{PYTHONHASHSEED} --- giá trị Python ngẫu nhiên hoá theo tiến trình;
+  \item các tâm cụm được giữ trong \texttt{defaultdict(rand\_gauss)}, nên
+        \emph{chạm} vào một key mà tâm chưa thấy sẽ \textbf{rút giá trị kế tiếp
+        từ RNG đã seed} --- đây chính là cơ chế khởi tạo tâm.
+\end{enumerate}
+
+Thứ tự duyệt vì thế quyết định \emph{toạ độ ngẫu nhiên nào rơi vào đặc trưng
+nào}. Tâm khởi tạo khác nhau, và trong k-means một khác biệt sớm trong phép gán
+lan thành một phân cụm hoàn toàn khác. STREAMKMeans thừa hưởng lỗi này vì nó tạo
+một \texttt{KMeans} mới cho mỗi khối.
+
+\textbf{Sửa ở thượng nguồn:} duyệt hợp các key theo thứ tự xác định, vật chất hoá
+key của tâm trước khi chạm vào key mới:
+\begin{lstlisting}[language=Python]
+keys = list(center)
+keys += [k for k in x if k not in center]
+return sum((abs(center[k] - x.get(k, 0))) ** self.p for k in keys)
+\end{lstlisting}
+
+\textbf{Né ở framework:} không có cách sửa từ bên ngoài, nên framework làm cho
+lỗi \emph{hiện ra} thay vì che đi. \texttt{capture\_environment()} ghi lại
+\texttt{PYTHONHASHSEED} vào mọi báo cáo, và runner cảnh báo khi giá trị này không
+được ghim. Bảo đảm mà framework có thể đứng sau là bảo đảm yếu hơn nhưng đúng:
+\emph{ghim hash seed thì kết quả tái lập được}.
+
+\begin{lstlisting}[language=bash]
+PYTHONHASHSEED=0 python run_benchmark.py --dataset insects --seeds 1,2,3
+\end{lstlisting}
+
+Một bài kiểm thử khẳng định trường hợp đã ghim là tái lập, và một bài khác khẳng
+định \emph{sự nhạy cảm vẫn còn} --- nếu bài thứ hai bắt đầu fail thì River đã sửa
+lỗi và mục này nên được đóng lại.
+
+\begin{remark}[Vì sao điều này quan trọng với một benchmark]
+Tham số \texttt{seed} quảng cáo một tính tái lập mà nó không cung cấp giữa các
+tiến trình. Chạy lặp nhiều seed rồi báo mean $\pm$ std sẽ trộn phương sai do seed
+với phương sai do thứ tự hash, và kết quả không tái lập được trên máy khác hay
+ngày khác nếu không biết hash seed đang có hiệu lực. Đây đúng là loại sai lệch mà
+bản ghi môi trường (Bảng~\ref{tab:env}) sinh ra để phát hiện.
+\end{remark}
+
+% =====================================================================
+\section{Cách chạy}
+\label{sec:usage}
+% =====================================================================
+
+Một entry point duy nhất, \texttt{run\_benchmark.py}, điều khiển hoàn toàn qua
+dòng lệnh. Framework \emph{không} chọn siêu tham số hay dataset thay người dùng:
+mọi giá trị mặc định chỉ là chỗ khởi động chạy được, và tham số không được nêu
+trên dòng lệnh sẽ rơi về mặc định của chính River.
+
+\begin{lstlisting}[language=bash]
+# defaults: synthetic stream, sample-partitioning algorithms, no preprocessing
+python run_benchmark.py
+
+# your parameters, as JSON
+python run_benchmark.py --dataset kdd99 --n-samples 50000 \
+    --algorithms DenStream,DBSTREAM \
+    --params '{"DenStream": {"epsilon": 0.5, "mu": 2.5}}' \
+    --scalers standard
+
+# compare preprocessing chains for one algorithm
+python run_benchmark.py --algorithms DBSTREAM \
+    --scalers 'standard,standard_safe,variance_threshold|standard'
+
+# a text stream and the clusterer that consumes token counts
+python run_benchmark.py --dataset sms_spam --algorithms TextClust \
+    --scalers bag_of_words --scaler-params '{"bag_of_words": {"on": "body"}}'
+
+# reproducible figures -- see the note on PYTHONHASHSEED
+PYTHONHASHSEED=0 python run_benchmark.py --dataset insects --seeds 1,2,3
+\end{lstlisting}
+
+Kết quả ghi ra \texttt{benchmark\_out/<dataset>/}: \texttt{report.md} (bảng +
+bản ghi môi trường), \texttt{results.json} (toàn bộ quỹ đạo cửa sổ và
+checkpoint), và các đồ thị PNG.
+
+Dùng bằng mã, khi cần điều khiển chi tiết hơn dòng lệnh cho phép:
+
+\begin{lstlisting}[language=Python]
+from benchmark.experiments import BenchmarkConfig, Setting, run_setting
+
+setting = Setting("DBSTREAM",
+                  params={"clustering_threshold": 1.0},
+                  scaler="impute|one_hot_categorical|standard",
+                  scaler_params={"standard": {"window_size": 10_000}})
+result = run_setting(setting, dataset,
+                     BenchmarkConfig(window_size=1000, n_checkpoints=25), seed=1)
+\end{lstlisting}
+
+\noindent
+\texttt{STRUCTURE.md} mô tả chức năng từng mô-đun và cách thêm dataset riêng;
+\texttt{AGENTS.md} ghi các nguyên tắc làm việc trong repo, trong đó có nguyên
+tắc không chỉnh sửa cây nguồn River.
+
+% =====================================================================
+\section{Hạn chế và hướng mở rộng}
+\label{sec:limits}
+% =====================================================================
+
+Ranh giới của framework nằm ở đâu cũng đáng nói rõ. Việc chọn siêu tham số và
+cấu hình dataset \emph{không} thuộc phạm vi này: framework phơi bày các núm điều
+khiển và các chẩn đoán để người dùng đưa ra lựa chọn đó, chứ không đưa hộ.
+Ví dụ ở Mục~\ref{sec:eps} minh hoạ đúng vai trò đó --- nó cho thấy $\varepsilon$
+gắn với thang đo sau tiền xử lý và cột $\max|\mathcal{M}|$ phát hiện ngay khi
+quan hệ đó bị phá vỡ; nó không đề xuất một giá trị $\varepsilon$.
+
+\begin{enumerate}
+  \item \textbf{Hai lỗi của River vẫn còn nguyên.} Chúng được ghi lại chứ không
+        được vá (Mục~\ref{sec:riverbugs}). Hệ quả thực tế: dùng
+        \texttt{standard\_safe} thay cho \texttt{standard} khi bật cửa sổ trượt
+        (Mục~\ref{sec:bug1}), và ghim \texttt{PYTHONHASHSEED} cho mọi con số
+        định công bố (Mục~\ref{sec:bug2}).
+
+  \item \textbf{Kích thước cửa sổ so với tự tương quan của luồng.} Kết quả ở
+        Mục~\ref{sec:degenerate} cho thấy $m=1000$ quá nhỏ so với độ dài khối
+        cùng lớp của KDDCup99. Hai hướng khắc phục: tăng $m$ cho tới khi
+        $\rho_{\text{deg}}$ xuống dưới một ngưỡng chấp nhận được, hoặc báo cáo
+        chỉ số per-window chỉ trên tập cửa sổ \emph{không} thoái hoá. Hướng thứ
+        hai giữ được ý nghĩa time-aware nhưng làm giảm cỡ mẫu hiệu dụng.
+
+  \item \textbf{Đỉnh bộ nhớ là chặn dưới.} Vì phép đo chỉ chạy tại checkpoint
+        (Nhận xét~\ref{rem:memcost}), các đỉnh ngắn giữa hai checkpoint bị bỏ
+        sót. Với mô hình có tỉa, nên tăng số checkpoint.
+
+  \item \textbf{Khảo sát khả năng mở rộng.} Framework có sẵn hai phép quét ---
+        theo số mẫu và theo số chiều --- nhưng báo cáo này chưa trình bày kết
+        quả của chúng.
+
+  \item \textbf{Chỉ số nội.} Silhouette streaming chỉ chạy với thuật toán có
+        expose tâm cụm. Với DenStream ở cấu hình hiện tại (một cụm duy nhất) nó
+        không xác định.
+\end{enumerate}
+
+% =====================================================================
+\appendix
+\section{Bảng ký hiệu}
+% =====================================================================
+
+\begin{table}[htbp]
+\centering
+\small
+\begin{tabular}{@{}ll@{}}
+\toprule
+\textbf{Ký hiệu} & \textbf{Ý nghĩa} \\
+\midrule
+$\mathcal{S} = ((\xt_t,y_t))_{t=1}^{T}$ & luồng dữ liệu, không xáo trộn \\
+$d$ & số chiều đặc trưng \\
+$\tilde\xt_t$ & mẫu sau chuẩn hoá (không gian mà mô hình làm việc) \\
+$\hat y_t$ & nhãn cụm dự đoán tại bước $t$ \\
+$\theta_t$ & trạng thái mô hình sau khi học mẫu $t$ \\
+$m$ & kích thước cửa sổ đánh giá (mặc định $1000$) \\
+$K$ & số cửa sổ, $K=\lceil n/m \rceil$ \\
+$W_k$ & tập chỉ số của cửa sổ thứ $k$ \\
+$M^{\mathrm{cum}}_k,\ M^{\mathrm{win}}_k$ & giá trị luỹ kế / theo cửa sổ của độ đo $M$ \\
+$n_{ij},\ a_i,\ b_j$ & bảng liên hợp và các biên của nó \\
+$\mathcal{M}_t$ & tập micro-cluster tại bước $t$ \\
+$\rho_{\text{deg}}$ & tỉ lệ cửa sổ thoái hoá \\
+$\tilde p$ & trung vị tỉ lệ lớp áp đảo trong cửa sổ \\
+$\lambda,\ \varepsilon,\ \mu,\ \beta$ & tham số DenStream \\
+$\alpha$ & hệ số phai của bộ chuẩn hoá thích nghi \\
+$W$ & kích thước cửa sổ của scaler trượt \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{thebibliography}{9}
+\bibitem{clustream}
+C.~C. Aggarwal, J.~Han, J.~Wang, P.~S. Yu.
+\emph{A Framework for Clustering Evolving Data Streams}. VLDB, 2003.
+
+\bibitem{denstream}
+F.~Cao, M.~Ester, W.~Qian, A.~Zhou.
+\emph{Density-Based Clustering over an Evolving Data Stream with Noise}.
+SDM, 2006.
+
+\bibitem{dbstream}
+M.~Hahsler, M.~Bolaños.
+\emph{Clustering Data Streams Based on Shared Density between Micro-Clusters}.
+IEEE TKDE, 2016.
+
+\bibitem{hubert}
+L.~Hubert, P.~Arabie. \emph{Comparing Partitions}.
+Journal of Classification, 1985.
+
+\bibitem{vinh}
+N.~X. Vinh, J.~Epps, J.~Bailey.
+\emph{Information Theoretic Measures for Clusterings Comparison}. JMLR, 2010.
+
+\bibitem{river}
+J.~Montiel et al. \emph{River: Machine Learning for Streaming Data in Python}.
+JMLR, 2021.
+
+\bibitem{welford}
+B.~P. Welford. \emph{Note on a Method for Calculating Corrected Sums of Squares
+and Products}. Technometrics, 1962.
+\end{thebibliography}
+
+\end{document}

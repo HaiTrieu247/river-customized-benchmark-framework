@@ -11,7 +11,14 @@ class EfficiencyMetrics:
 
     total_runtime_s: float
     n_samples: int
+    #: Model (+ scaler) footprint from river's ``_raw_memory_usage``. This is the
+    #: comparable number across algorithms: it excludes the interpreter, the
+    #: dataset and the metric objects.
     peak_memory_bytes: int | None = None
+    #: Whole-process RSS, for context only. It includes everything the process
+    #: holds, so it is not a fair per-algorithm comparison — read it as an upper
+    #: bound on what a deployment would need.
+    peak_process_rss_bytes: int | None = None
     mean_micro_clusters: float | None = None
     max_micro_clusters: int | None = None
     final_macro_clusters: int | None = None
@@ -29,12 +36,21 @@ class EfficiencyMetrics:
     def peak_memory_mb(self) -> float | None:
         return self.peak_memory_bytes / (1024 * 1024) if self.peak_memory_bytes else None
 
+    @property
+    def peak_process_rss_mb(self) -> float | None:
+        return (
+            self.peak_process_rss_bytes / (1024 * 1024) if self.peak_process_rss_bytes else None
+        )
+
     def to_dict(self) -> dict:
         return {
             "total_runtime_s": round(self.total_runtime_s, 4),
             "throughput_sps": round(self.throughput_sps, 2),
             "ms_per_sample": round(self.ms_per_sample, 5),
             "peak_memory_mb": round(self.peak_memory_mb, 3) if self.peak_memory_mb else None,
+            "peak_process_rss_mb": (
+                round(self.peak_process_rss_mb, 1) if self.peak_process_rss_mb else None
+            ),
             "mean_micro_clusters": (
                 round(self.mean_micro_clusters, 2) if self.mean_micro_clusters is not None else None
             ),
