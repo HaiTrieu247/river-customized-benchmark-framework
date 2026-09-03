@@ -54,6 +54,5 @@ cup98LRN.txt
 
 *.log
 
-benchmark_out/
 # Benchmark run outputs
 benchmark_out/
