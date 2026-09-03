@@ -184,9 +184,9 @@ class ClustererAdapter:
 
     # -- introspection (best effort) ----------------------------------------
     def n_micro_clusters(self) -> int | None:
-        """Number of micro-clusters, if the model exposes them."""
+        """Number of micro-clusters (or active density grids in DStream), if exposed."""
         m = self.model
-        for attr in ("micro_clusters", "_micro_clusters"):
+        for attr in ("micro_clusters", "_micro_clusters", "_grids", "grids"):
             mc = getattr(m, attr, None)
             if mc is not None:
                 try:

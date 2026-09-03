@@ -68,10 +68,74 @@ class StreamingPurity(metrics.base.Metric):
         return True
 
 
+class StreamingSSQ(metrics.base.Metric):
+    """Sum of Squared Distance (SSQ) between samples and their cluster centers.
+
+    Lower values indicate tighter/more compact clusters (better cohesion).
+    """
+
+    def __init__(self, average: bool = True):
+        super().__init__()
+        self.average = average
+        self.total_ssq = 0.0
+        self.n_samples = 0.0
+
+    @property
+    def requires_labels(self):
+        return False
+
+    def update(self, x: dict, y_pred: int | None = None, centers: dict | None = None, sample_weight: float = 1.0):
+        if not centers:
+            return self
+        center = None
+        if y_pred is not None and isinstance(centers, dict) and y_pred in centers:
+            center = centers[y_pred]
+        else:
+            shortest = float("inf")
+            candidate_centers = centers.values() if isinstance(centers, dict) else centers
+            for c in candidate_centers:
+                if not isinstance(c, dict):
+                    continue
+                d2 = sum((x.get(f, 0.0) - c.get(f, 0.0)) ** 2 for f in set(x) | set(c))
+                if d2 < shortest:
+                    shortest = d2
+                    center = c
+        if not center:
+            return self
+        dist_sq = sum((x.get(f, 0.0) - center.get(f, 0.0)) ** 2 for f in set(x) | set(center))
+        self.total_ssq += dist_sq * sample_weight
+        self.n_samples += sample_weight
+        return self
+
+    def revert(self, x: dict, y_pred: int | None = None, centers: dict | None = None, sample_weight: float = 1.0):
+        if not centers or self.n_samples <= 0:
+            return self
+        center = None
+        if y_pred is not None and isinstance(centers, dict) and y_pred in centers:
+            center = centers[y_pred]
+        if center:
+            dist_sq = sum((x.get(f, 0.0) - center.get(f, 0.0)) ** 2 for f in set(x) | set(center))
+            self.total_ssq = max(0.0, self.total_ssq - dist_sq * sample_weight)
+            self.n_samples = max(0.0, self.n_samples - sample_weight)
+        return self
+
+    def get(self) -> float:
+        if self.n_samples == 0:
+            return 0.0
+        return (self.total_ssq / self.n_samples) if self.average else self.total_ssq
+
+    @property
+    def bigger_is_better(self):
+        return False
+
+    def works_with(self, model):
+        return True
+
+
 #: External metrics (need ground truth) exposed by name.
 EXTERNAL_METRICS = ("ari", "nmi", "ami", "purity")
 #: Internal metrics (no labels needed) exposed by name.
-INTERNAL_METRICS = ("silhouette",)
+INTERNAL_METRICS = ("silhouette", "ssq")
 
 
 def build_external_metrics() -> dict:
@@ -93,7 +157,10 @@ def build_internal_metrics() -> dict:
     model's centers; clusterers that do not expose centers simply never update
     it and it reports no value.
     """
-    return {"silhouette": metrics.Silhouette()}
+    return {
+        "silhouette": metrics.Silhouette(),
+        "ssq": StreamingSSQ(),
+    }
 
 
 # --- batch helpers (offline cross-checks) ----------------------------------
@@ -169,3 +236,36 @@ def calinski_harabasz(X, labels) -> float | None:
     if _n_clusters(labels) < 2:
         return None
     return float(calinski_harabasz_score(X, labels))
+
+def compute_ssq(X, centers: dict | list, labels: list | None = None) -> float:
+    """Compute Sum of Squared Distance (SSQ) over points and cluster centers.
+
+    Lower is better (tighter cluster cohesion).
+    """
+    if not centers:
+        return 0.0
+
+    total_ssq = 0.0
+    candidate_centers = list(centers.values()) if isinstance(centers, dict) else list(centers)
+
+    for i, x in enumerate(X):
+        x_dict = x if isinstance(x, dict) else {j: float(v) for j, v in enumerate(x)}
+        center = None
+        if labels is not None and i < len(labels) and isinstance(centers, dict) and labels[i] in centers:
+            center = centers[labels[i]]
+        else:
+            shortest = float("inf")
+            for c in candidate_centers:
+                if not isinstance(c, dict):
+                    continue
+                d2 = sum((x_dict.get(f, 0.0) - c.get(f, 0.0)) ** 2 for f in set(x_dict) | set(c))
+                if d2 < shortest:
+                    shortest = d2
+                    center = c
+
+        if center:
+            dist_sq = sum((x_dict.get(f, 0.0) - center.get(f, 0.0)) ** 2 for f in set(x_dict) | set(center))
+            total_ssq += dist_sq
+
+    return total_ssq
+

@@ -39,10 +39,37 @@ _KDD99_CONTINUOUS = [c for c in _KDD99_COLUMNS if c not in _KDD99_DROP]  # 34
 _KDD99_NOMINAL = ["protocol_type", "service", "flag"]
 
 
+# Attack type to 5 main clusters (MIT Lincoln Labs / Paper [7, 8])
+_KDD99_ATTACK_TO_MAIN = {
+    "normal": "normal",
+    # Denial of Service (DoS)
+    "back": "dos", "land": "dos", "neptune": "dos", "pod": "dos",
+    "smurf": "dos", "teardrop": "dos", "apache2": "dos", "udpstorm": "dos",
+    "processtable": "dos", "mailbomb": "dos",
+    # Probe
+    "satan": "probe", "ipsweep": "probe", "nmap": "probe", "portsweep": "probe",
+    "mscan": "probe", "saint": "probe",
+    # User to Root (U2R)
+    "buffer_overflow": "u2r", "loadmodule": "u2r", "perl": "u2r", "rootkit": "u2r",
+    "sqlattack": "u2r", "xterm": "u2r", "ps": "u2r",
+    # Remote to Local (R2L)
+    "guess_passwd": "r2l", "ftp_write": "r2l", "imap": "r2l", "phf": "r2l",
+    "multihop": "r2l", "warezmaster": "r2l", "warezclient": "r2l", "spy": "r2l",
+    "sendmail": "r2l", "named": "r2l", "snmpgetattack": "r2l", "snmpguess": "r2l",
+    "worm": "r2l", "xsnoop": "r2l", "httptunnel": "r2l",
+}
+
+
+def _map_attack_label(label: str) -> str:
+    cleaned = label.rstrip(".").lower()
+    return _KDD99_ATTACK_TO_MAIN.get(cleaned, cleaned)
+
+
 def load_kddcup99(
     n_samples: int | None = None,
     percent10: bool = True,
     include_nominal: bool = False,
+    map_to_5_classes: bool = True,
 ) -> IterableDataset:
     """Load KDDCup99 as a benchmark dataset.
 
@@ -55,17 +82,9 @@ def load_kddcup99(
     include_nominal:
         Also stream the 3 nominal columns (``protocol_type``, ``service``,
         ``flag``) as strings, giving 37 features instead of 34.
-
-        They are dropped by default because a clusterer cannot take a distance
-        between two strings — but dropping them throws away real information
-        (``service`` alone has 60+ levels and separates attack types well). With
-        a categorical encoder in the preprocessing chain they become usable::
-
-            Setting("DBSTREAM", scaler="one_hot_categorical|standard")
-
-        Use ``one_hot_categorical`` rather than plain ``one_hot``: the latter
-        encodes *every* key it is handed, so on this dataset it would turn each
-        distinct value of ``duration`` into its own indicator column.
+    map_to_5_classes:
+        Map specific attack names to the 5 main clusters (Normal, DoS, Probe,
+        U2R, R2L) as defined in MIT Lincoln Lab / KDD Cup benchmark [7, 8].
     """
 
     columns = _KDD99_CONTINUOUS + (_KDD99_NOMINAL if include_nominal else [])
@@ -85,9 +104,11 @@ def load_kddcup99(
             # `.iat` per cell instead costs 34 pandas lookups per record, which
             # dominates the wall clock and adds nothing to what is measured.
             cache["X"] = df[_KDD99_CONTINUOUS].to_numpy(dtype=float)[:limit]
-            cache["y"] = [
-                _as_text(v) for v in df["labels"].to_numpy()[:limit]
-            ]
+            raw_labels = [_as_text(v) for v in df["labels"].to_numpy()[:limit]]
+            if map_to_5_classes:
+                cache["y"] = [_map_attack_label(v) for v in raw_labels]
+            else:
+                cache["y"] = raw_labels
             cache["nominal"] = (
                 [
                     [_as_text(v) for v in df[col].to_numpy()[:limit]]

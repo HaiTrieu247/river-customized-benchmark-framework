@@ -15,7 +15,15 @@ from .real import (
     load_shuttle,
     load_sms_spam,
 )
-from .synthetic import SCENARIOS, StreamConfig, SyntheticStream, make_scenario
+from .synthetic import (
+    SCENARIOS,
+    StreamConfig,
+    SyntheticStream,
+    make_dstream_30k_nonconvex,
+    make_dstream_85k_dynamic,
+    make_scalability_dataset,
+    make_scenario,
+)
 
 __all__ = [
     "Dataset",
@@ -25,6 +33,9 @@ __all__ = [
     "SyntheticStream",
     "SCENARIOS",
     "make_scenario",
+    "make_dstream_30k_nonconvex",
+    "make_dstream_85k_dynamic",
+    "make_scalability_dataset",
     # real
     "load_kddcup99",
     "load_kddcup98",

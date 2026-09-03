@@ -86,6 +86,19 @@ def _clustream(**kw):
     return cluster.CluStream(**params), params
 
 
+def _dstream(**kw):
+    params = dict(
+        grid_width=0.1,
+        decaying_factor=0.998,
+        dense_threshold=3.0,
+        sparse_threshold=0.8,
+        beta=0.3,
+        n_grids=100,
+    )
+    params.update(kw)
+    return cluster.DStream(**params), params
+
+
 def _denstream(**kw):
     params = dict(
         decaying_factor=0.25, beta=0.5, mu=2.5, epsilon=0.5, n_samples_init=1000,
@@ -138,6 +151,10 @@ ALGORITHMS: dict[str, AlgorithmSpec] = {
     "CluStream": AlgorithmSpec(
         _clustream, default_preprocessor="standard",
         note="micro-clusters with cluster features; offline k-means on top",
+    ),
+    "DStream": AlgorithmSpec(
+        _dstream, default_preprocessor="standard",
+        note="density-and-grid based with time decay; arbitrary shaped clusters",
     ),
     "DenStream": AlgorithmSpec(
         _denstream, default_preprocessor="standard",

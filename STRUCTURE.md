@@ -5,7 +5,8 @@ What each module is for, and how to use it. The framework measures
 
 ```
 river-customized-benchmark-framework/
-├── run_benchmark.py            ← the only runner; everything is CLI-driven
+├── run_benchmark.py            ← main streaming cluster benchmark runner
+├── run_paper_benchmark.py      ← unified runner for scientific paper reproductions
 ├── AGENTS.md                   ← working rules (never modify river/, scope)
 ├── RIVER_BUGS.md               ← suspected river bugs + framework workarounds
 ├── STRUCTURE.md                ← this file
@@ -17,6 +18,7 @@ river-customized-benchmark-framework/
 │   ├── datasets/     → produce a re-iterable stream of (x, y)
 │   ├── evaluation/   → run the stream, measure quality and resources
 │   ├── experiments/  → run many settings / seeds on one stream
+│   │   └── papers/   → paper reproductions framework (BasePaperBenchmark)
 │   └── reports/      → tables, plots, environment record
 └── tests/            → 90 tests
 ```

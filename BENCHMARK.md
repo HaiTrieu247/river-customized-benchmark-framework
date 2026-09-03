@@ -134,6 +134,7 @@ xử lý cả ba thay vì giả định nhóm đầu:
 | Thuật toán | Gán mẫu vào cụm? | Đầu vào | Ghi chú |
 |---|---|---|---|
 | `CluStream` | ✅ | vector số | micro-cluster + cluster feature |
+| `DStream` | ✅ | vector số | gom cụm mật độ dựa trên lưới (grid density); cụm hình dạng bất kỳ |
 | `DenStream` | ✅ | vector số | mật độ + suy giảm thời gian |
 | `DBSTREAM` | ✅ | vector số | mật độ chia sẻ giữa micro-cluster |
 | `STREAMKMeans` | ✅ | vector số | k-means theo chunk |
