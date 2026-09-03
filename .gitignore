@@ -53,3 +53,7 @@ cup98LRN.txt
 *.txt.gz
 
 *.log
+
+benchmark_out/
+# Benchmark run outputs
+benchmark_out/
