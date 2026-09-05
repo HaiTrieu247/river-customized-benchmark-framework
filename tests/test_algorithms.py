@@ -31,7 +31,7 @@ def test_registry_covers_every_river_clusterer():
 
 def test_capability_filters_split_the_registry_correctly():
     assert set(algorithms_for()) == {
-        "CluStream", "DenStream", "DBSTREAM", "STREAMKMeans", "KMeans",
+        "CluStream", "DenStream", "DBSTREAM", "SOStream", "STREAMKMeans", "KMeans",
     }
     assert algorithms_for(partitions_samples=False) == ["ODAC"]
     assert algorithms_for(input_kind=TOKENS, partitions_samples=None) == ["TextClust"]
@@ -40,7 +40,9 @@ def test_capability_filters_split_the_registry_correctly():
     assert get_spec("DBSTREAM").input_kind == NUMERIC
 
 
-@pytest.mark.parametrize("name", ["CluStream", "DenStream", "DBSTREAM", "STREAMKMeans", "KMeans"])
+@pytest.mark.parametrize(
+    "name", ["CluStream", "DenStream", "DBSTREAM", "SOStream", "STREAMKMeans", "KMeans"]
+)
 def test_sample_partitioning_algorithms_produce_scored_runs(name):
     res = run_once(get_algorithm(name, scaler="standard"), _stream(),
                    n_checkpoints=3, window_size=500)

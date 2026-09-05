@@ -8,7 +8,9 @@ not comparable to anything measured elsewhere.
 
 from __future__ import annotations
 
+import pathlib
 import platform
+import subprocess
 import sys
 
 _LIBRARIES = ("river", "numpy", "scipy", "pandas", "scikit-learn", "matplotlib")
@@ -20,6 +22,38 @@ def _version(dist: str) -> str | None:
     try:
         return version(dist)
     except PackageNotFoundError:
+        return None
+
+
+def _git_head(repo: "pathlib.Path") -> str | None:
+    """Commit of the river tree the numbers were produced from.
+
+    Once local algorithms are added to the sibling checkout, "baseline river" is
+    no longer plain upstream, and a result is only interpretable next to the
+    commit it came from.
+    """
+    try:
+        head = subprocess.run(
+            ["git", "-C", str(repo), "rev-parse", "HEAD"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+        if head.returncode != 0:
+            return None
+        dirty = subprocess.run(
+            ["git", "-C", str(repo), "status", "--porcelain"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+        commit = head.stdout.strip()
+        if dirty.returncode == 0 and dirty.stdout.strip():
+            return f"{commit} (dirty)"
+        return commit
+    except (OSError, subprocess.SubprocessError):
         return None
 
 
@@ -59,6 +93,7 @@ def capture_environment() -> dict:
 
         env["river_version"] = getattr(river, "__version__", None)
         env["river_path"] = river.__file__
+        env["river_git_head"] = _git_head(pathlib.Path(river.__file__).parent.parent)
     except Exception:  # pragma: no cover
         pass
 
@@ -74,7 +109,7 @@ def format_environment(env: dict) -> str:
     for key in (
         "os", "platform", "machine", "processor", "cpu_count_physical",
         "cpu_count_logical", "ram_total_gb", "python", "python_implementation",
-        "python_hash_seed", "river_version", "river_path",
+        "python_hash_seed", "river_version", "river_git_head", "river_path",
     ):
         if env.get(key) is not None:
             rows.append([key, env[key]])

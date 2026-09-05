@@ -70,6 +70,11 @@ class AlgorithmSpec:
         caller does not choose one.
     note:
         One line for help text and reports.
+    provenance:
+        Where the implementation came from and how far it has been verified.
+        A benchmark table that mixes estimators shipped by River with ones
+        written for this project is only readable if each row says which it is,
+        so this string is printed in the report next to the parameters.
     """
 
     factory: Callable[..., Any]
@@ -77,6 +82,7 @@ class AlgorithmSpec:
     input_kind: str = NUMERIC
     default_preprocessor: str = "none"
     note: str = ""
+    provenance: str = "river upstream"
 
 
 # --- clusterer factories: name -> (model, resolved_params) -----------------
@@ -122,6 +128,15 @@ def _odac(**kw):
     return cluster.ODAC(**params), params
 
 
+def _sostream(**kw):
+    params = dict(
+        alpha=0.1, min_pts=2, merge_threshold=1.0, fading_factor=0.01,
+        fade_threshold=0.1, fading_interval=100,
+    )
+    params.update(kw)
+    return cluster.SOStream(**params), params
+
+
 def _textclust(**kw):
     # `real_time_fading` defaults to True upstream, which makes `learn_one`
     # require a wall-clock `t` on every call and raise a TypeError without it.
@@ -160,6 +175,14 @@ ALGORITHMS: dict[str, AlgorithmSpec] = {
         partitions_samples=False,
         default_preprocessor="none",
         note="hierarchical clustering OF VARIABLES; no per-sample assignment",
+    ),
+    "SOStream": AlgorithmSpec(
+        _sostream, default_preprocessor="standard",
+        note="competitive learning with a k-dist adaptive radius; merges online, no offline phase",
+        provenance=(
+            "added for this project from Isaksson et al. (2012); verified by branch tests "
+            "against the paper pseudocode, no reference implementation compared"
+        ),
     ),
     "TextClust": AlgorithmSpec(
         _textclust,
