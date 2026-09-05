@@ -243,11 +243,13 @@ def build_report(digest, dataset, config, seeds, env) -> str:
             " `PYTHONHASHSEED=0` for figures you intend to publish."
         )
 
+    provenance = {s.display(): get_spec(s.algorithm).provenance for s in config.settings}
     section(
         "Configuration",
         "\n".join(
             f"- **{r.algorithm}** — params: `{r.params}` | preprocessing: "
             f"`{r.scaler}` params: `{r.scaler_params or '{}'}`"
+            f" | provenance: {provenance.get(r.algorithm, 'unknown')}"
             for r in results
         ),
     )
