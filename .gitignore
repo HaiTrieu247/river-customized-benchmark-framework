@@ -56,3 +56,5 @@ cup98LRN.txt
 
 # Benchmark run outputs
 benchmark_out/
+
+*.ipynb

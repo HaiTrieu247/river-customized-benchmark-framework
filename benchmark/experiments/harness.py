@@ -63,6 +63,7 @@ def run_setting(
     dataset: Dataset,
     config: BenchmarkConfig,
     seed: int,
+    progress=None,
 ) -> RunResult:
     """Run a single setting once on ``dataset`` with the given seed."""
     from ..algorithms.registry import accepts_seed  # local import to avoid cycle
@@ -87,6 +88,7 @@ def run_setting(
         external_metrics=config.external_metrics,
         internal_metrics=config.internal_metrics,
         seed=seed,
+        progress=progress,
     )
 
 

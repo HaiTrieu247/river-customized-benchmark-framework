@@ -27,6 +27,8 @@ feature dict.
 
 from __future__ import annotations
 
+from collections.abc import Callable
+
 import collections
 import time
 from dataclasses import dataclass, field
@@ -235,6 +237,10 @@ def _summarize_all(windows, attr: str) -> dict:
     return {m: _summarize([getattr(w, attr).get(m) for w in windows]) for m in names}
 
 
+#: How often :func:`run_once` calls its ``progress`` callback, in samples.
+PROGRESS_EVERY = 512
+
+
 def run_once(
     adapter: ClustererAdapter,
     dataset: Dataset,
@@ -244,6 +250,7 @@ def run_once(
     external_metrics: tuple[str, ...] = ("ari", "nmi", "ami", "purity"),
     internal_metrics: tuple[str, ...] = (),
     seed: int | None = None,
+    progress: Callable[[int, int | None, int | None], None] | None = None,
 ) -> RunResult:
     """Run one algorithm/setting over one dataset and measure it.
 
@@ -270,6 +277,12 @@ def run_once(
         model's centers, so clusterers that expose none report no value.
     seed:
         Recorded on the result for reproducibility; the adapter is already built.
+    progress:
+        Optional ``(n_seen, length, n_micro_clusters)`` callback, invoked every
+        :data:`PROGRESS_EVERY` samples from outside the timed region, so a
+        caller can draw a progress bar without inflating the measured runtime.
+        ``length`` is ``None`` when the stream length is unknown, and
+        ``n_micro_clusters`` is ``None`` for a model that exposes none.
     """
     labeled = dataset.has_labels
     # An algorithm that does not partition samples has no per-sample label to
@@ -365,6 +378,12 @@ def run_once(
         y_pred = adapter.process_one(x)  # scale -> predict -> learn
         total_runtime += time.perf_counter() - t0
         n_seen += 1
+
+        # Outside the timed region on purpose: reporting progress must not be
+        # charged to the algorithm. The modulo keeps the per-sample cost to one
+        # integer operation; the callback itself throttles on wall-clock.
+        if progress is not None and n_seen % PROGRESS_EVERY == 0:
+            progress(n_seen, length, adapter.n_micro_clusters())
 
         # Samples with no ground truth (e.g. injected noise) are skipped by the
         # external metrics rather than counted as a class of their own.

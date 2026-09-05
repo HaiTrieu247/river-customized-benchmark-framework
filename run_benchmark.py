@@ -186,22 +186,103 @@ def seeds_for(setting: Setting, seeds: tuple[int, ...]) -> tuple[int, ...]:
     return seeds if accepts_seed(setting.algorithm) else seeds[:1]
 
 
-def run_all(settings, dataset, config, seeds) -> dict:
+_BAR_WIDTH = 24
+
+
+def _progress_enabled(enabled: bool) -> bool:
+    """Draw a bar only on a terminal, so redirected logs stay diffable."""
+    if not enabled:
+        return False
+    try:
+        return sys.stdout.isatty()
+    except (AttributeError, ValueError):
+        return False
+
+
+def _make_progress(prefix: str):
+    """Return a ``(n_seen, length)`` callback that redraws one line in place.
+
+    The clock starts on the first callback rather than here: a dataset that
+    downloads or unpickles on first iteration can take longer than the run
+    itself, and charging that to the algorithm made the rate and the ETA
+    meaningless. The rate shown is a smoothed recent rate for the same reason —
+    a cumulative average takes too long to forget a slow start.
+    """
+    state = {"t0": None, "prev_t": 0.0, "prev_n": 0, "last": 0.0, "rate": None, "width": 0}
+
+    def draw(n_seen: int, length: int | None, n_micro_clusters: int | None = None) -> None:
+        now = time.perf_counter()
+        if state["t0"] is None:
+            state.update(t0=now, prev_t=now, prev_n=n_seen)
+        else:
+            if now - state["last"] < 0.1:
+                return
+            dt, dn = now - state["prev_t"], n_seen - state["prev_n"]
+            if dt > 0 and dn > 0:
+                inst = dn / dt
+                state["rate"] = inst if state["rate"] is None else 0.7 * state["rate"] + 0.3 * inst
+            state["prev_t"], state["prev_n"] = now, n_seen
+        state["last"] = now
+
+        rate = state["rate"]
+        speed = f"{rate:7.0f} sps" if rate else "    ... sps"
+        clusters = f" MC={n_micro_clusters:>6,}" if n_micro_clusters is not None else ""
+        if length:
+            frac = min(n_seen / length, 1.0)
+            filled = int(round(frac * _BAR_WIDTH))
+            bar = "#" * filled + "." * (_BAR_WIDTH - filled)
+            eta = f"{(length - n_seen) / rate:5.0f}s" if rate else "   ..."
+            tail = f" [{bar}] {frac:5.1%} {n_seen:>8,}/{length:<8,} {speed}{clusters}  eta {eta}"
+        else:
+            tail = f" {n_seen:>8,} samples {speed}{clusters}"
+        line = prefix + tail
+        state["width"] = max(state["width"], len(line))
+        sys.stdout.write("\r" + line.ljust(state["width"]))
+        sys.stdout.flush()
+
+    def clear() -> None:
+        if state["width"]:
+            sys.stdout.write("\r" + " " * state["width"] + "\r")
+            sys.stdout.flush()
+
+    draw.clear = clear  # type: ignore[attr-defined]
+    return draw
+
+
+def _cluster_counts(efficiency) -> str:
+    """Micro-cluster mean/peak and final macro count, ``-`` where not exposed."""
+    mean_mc = efficiency.mean_micro_clusters
+    max_mc = efficiency.max_micro_clusters
+    macro = efficiency.final_macro_clusters
+    mean_text = f"{mean_mc:.0f}" if mean_mc is not None else "-"
+    max_text = str(max_mc) if max_mc is not None else "-"
+    macro_text = str(macro) if macro is not None else "-"
+    return f"MC={mean_text:>5}/{max_text:<5} K={macro_text:>4}"
+
+
+def run_all(settings, dataset, config, seeds, show_progress: bool = True) -> dict:
     digest: dict[str, dict] = {}
     total = sum(len(seeds_for(s, seeds)) for s in settings)
+    bars = _progress_enabled(show_progress)
     done = 0
     for setting in settings:
         runs = []
         for seed in seeds_for(setting, seeds):
             done += 1
-            print(f"  [{done}/{total}] {setting.display()} seed={seed} ...", end="", flush=True)
+            prefix = f"  [{done}/{total}] {setting.display()} seed={seed}"
+            print(prefix + " ...", end="", flush=True)
+            progress = _make_progress(prefix) if bars else None
             t0 = time.perf_counter()
-            result = run_setting(setting, dataset, config, seed=seed)
+            result = run_setting(setting, dataset, config, seed=seed, progress=progress)
             elapsed = time.perf_counter() - t0
+            if progress is not None:
+                progress.clear()
+                print(prefix + " ...", end="", flush=True)
             ari = result.quality.get("ari")
             score = f"ARI={ari:.4f}" if ari is not None else "no per-sample partition"
             print(
-                f" done {elapsed:7.1f}s | {result.efficiency.throughput_sps:8.0f} sps | {score}",
+                f" done {elapsed:7.1f}s | {result.efficiency.throughput_sps:8.0f} sps"
+                f" | {_cluster_counts(result.efficiency)} | {score}",
                 flush=True,
             )
             runs.append(result)
@@ -334,8 +415,17 @@ def emit_plots(results, out_dir) -> list[str]:
     save(plot_memory_vs_samples(results), "memory_vs_samples.png")
     save(plot_clusters_vs_samples(results), "clusters_vs_samples.png")
     save(plot_throughput_vs_samples(results), "throughput_vs_samples.png")
+
+    # One window curve per metric that was actually computed. Plotting only ARI
+    # while measuring four of them hid the metric a paper may have reported on:
+    # purity curves are what SOStream, D-Stream and MR-Stream are compared with.
+    for metric in results[0].quality:
+        if results[0].quality.get(metric) is None:
+            continue
+        if any(r.window_quality_curve(metric)[0] for r in results):
+            save(plot_window_quality_curve(results, metric=metric), f"{metric}_per_window.png")
+
     if results[0].quality.get("ari") is not None:
-        save(plot_window_quality_curve(results, metric="ari"), "ari_per_window.png")
         save(plot_quality_vs_throughput(results, metric="ari"), "ari_vs_throughput.png")
     return written
 
@@ -379,6 +469,9 @@ def build_parser() -> argparse.ArgumentParser:
     e.add_argument("--window", type=int, default=1000, help="evaluation window size")
     e.add_argument("--checkpoints", type=int, default=20, help="resource sampling points")
     e.add_argument("--metrics", default="ari,nmi,ami,purity", help="external metrics")
+    e.add_argument("--no-progress", dest="progress", action="store_false",
+                   help="do not draw the per-run progress bar (it is off already"
+                        " when stdout is not a terminal)")
     e.add_argument("--internal", action="store_true",
                    help="also compute river's streaming silhouette (slower)")
     e.add_argument("--out", default=None, help="output directory (default: benchmark_out/<dataset>)")
@@ -413,7 +506,7 @@ def main():
 
     n_runs = sum(len(seeds_for(s, seeds)) for s in settings)
     print(f"\nrunning {len(settings)} setting(s) / {n_runs} run(s)\n")
-    digest = run_all(settings, dataset, config, seeds)
+    digest = run_all(settings, dataset, config, seeds, show_progress=args.progress)
 
     report = build_report(digest, dataset, config, seeds, env)
     print("\n" + report)
