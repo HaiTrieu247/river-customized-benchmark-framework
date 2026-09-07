@@ -31,7 +31,8 @@ def test_registry_covers_every_river_clusterer():
 
 def test_capability_filters_split_the_registry_correctly():
     assert set(algorithms_for()) == {
-        "CluStream", "DenStream", "DBSTREAM", "SOStream", "STREAMKMeans", "KMeans",
+        "BIRCH", "CluStream", "DenStream", "DBSTREAM", "ImprovedBIRCH", "SOStream",
+        "STREAMKMeans", "KMeans",
     }
     assert algorithms_for(partitions_samples=False) == ["ODAC"]
     assert algorithms_for(input_kind=TOKENS, partitions_samples=None) == ["TextClust"]

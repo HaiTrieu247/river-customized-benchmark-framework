@@ -57,6 +57,7 @@ from benchmark.algorithms.registry import (
     get_spec,
 )
 from benchmark.datasets import (
+    BIRCH_BASE_WORKLOAD,
     INSECTS_VARIANTS,
     SCENARIOS,
     load_covtype,
@@ -129,6 +130,13 @@ DATASETS = {
     "shuttle": lambda a: load_shuttle(n_samples=a.n_samples),
     "electricity": lambda a: load_electricity(n_samples=a.n_samples),
     "sms_spam": lambda a: load_sms_spam(n_samples=a.n_samples),
+    # BIRCH SIGMOD'96 base workload (Table 3). The generator settings fix N at about
+    # 100,000, but the runner still truncates to --n-samples, so pass
+    # --n-samples 100000 to get the whole dataset the paper used.
+    **{
+        name: (lambda make: lambda a: make(seed=a.data_seed))(factory)
+        for name, factory in BIRCH_BASE_WORKLOAD.items()
+    },
 }
 
 

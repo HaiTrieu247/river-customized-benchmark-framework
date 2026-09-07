@@ -105,6 +105,33 @@ def _dstream(**kw):
     return cluster.DStream(**params), params
 
 
+def _birch(**kw):
+    params = dict(
+        threshold=0.0,
+        branching_factor=50,
+        leaf_capacity=50,
+        max_entries=500,
+        distance_measure="d2",
+        threshold_measure="diameter",
+    )
+    params.update(kw)
+    return cluster.BIRCH(**params), params
+
+
+def _improved_birch(**kw):
+    params = dict(
+        initial_threshold=0.5,
+        modifying_factor=2.0,
+        branching_factor=50,
+        leaf_capacity=50,
+        max_entries=500,
+        distance_measure="d2",
+        threshold_measure="diameter",
+    )
+    params.update(kw)
+    return cluster.ImprovedBIRCH(**params), params
+
+
 def _denstream(**kw):
     params = dict(
         decaying_factor=0.25, beta=0.5, mu=2.5, epsilon=0.5, n_samples_init=1000,
@@ -166,6 +193,35 @@ ALGORITHMS: dict[str, AlgorithmSpec] = {
     "CluStream": AlgorithmSpec(
         _clustream, default_preprocessor="standard",
         note="micro-clusters with cluster features; offline k-means on top",
+    ),
+    "BIRCH": AlgorithmSpec(
+        _birch, default_preprocessor="standard",
+        note=(
+            "CF-tree with a memory budget; threshold grows on rebuild. Phase 3 is OFF by "
+            "default so predict_one labels leaf entries. Setting n_macro_clusters turns it "
+            "on, and it then re-runs agglomerative clustering on every predict_one"
+        ),
+        provenance=(
+            "added for this project from Zhang et al. (1996); verified by branch tests "
+            "against the paper pseudocode, no reference implementation compared"
+        ),
+    ),
+    "ImprovedBIRCH": AlgorithmSpec(
+        _improved_birch, default_preprocessor="standard",
+        note=(
+            "BIRCH with one threshold per leaf entry instead of one per tree. A rejected "
+            "entry raises its own threshold by a fixed step before opening a new entry, so "
+            "modifying_factor sets the step and initial_threshold sets where every entry "
+            "starts. Ablation pair with BIRCH: same tree, same offline phase, threshold "
+            "policy is the only difference. initial_threshold=0 freezes the mechanism and "
+            "max_entries then stops being enforced"
+        ),
+        provenance=(
+            "added for this project from Ismael et al. (2014); verified by branch tests "
+            "against the paper pseudocode, no reference implementation compared. The paper "
+            "gives no formula for the modifying factor and no memory-budget policy, so both "
+            "were chosen here and are recorded in the estimator docstring"
+        ),
     ),
     "DStream": AlgorithmSpec(
         _dstream, default_preprocessor="standard",

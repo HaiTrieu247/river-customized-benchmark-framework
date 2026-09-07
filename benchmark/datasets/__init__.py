@@ -16,13 +16,21 @@ from .real import (
     load_sms_spam,
 )
 from .synthetic import (
+    BIRCH_BASE_WORKLOAD,
+    BIRCH_PAPER_REFERENCE,
     SCENARIOS,
+    BirchGeneratorConfig,
     StreamConfig,
     SyntheticStream,
     make_dstream_30k_nonconvex,
     make_dstream_85k_dynamic,
+    make_birch_dataset,
+    make_ds1,
+    make_ds2,
+    make_ds3,
     make_scalability_dataset,
     make_scenario,
+    weighted_average_diameter,
 )
 
 __all__ = [
@@ -36,6 +44,15 @@ __all__ = [
     "make_dstream_30k_nonconvex",
     "make_dstream_85k_dynamic",
     "make_scalability_dataset",
+    # BIRCH SIGMOD'96 base workload
+    "BirchGeneratorConfig",
+    "make_birch_dataset",
+    "make_ds1",
+    "make_ds2",
+    "make_ds3",
+    "BIRCH_BASE_WORKLOAD",
+    "BIRCH_PAPER_REFERENCE",
+    "weighted_average_diameter",
     # real
     "load_kddcup99",
     "load_kddcup98",
