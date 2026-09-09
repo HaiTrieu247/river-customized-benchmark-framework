@@ -168,6 +168,12 @@ def _odac(**kw):
     return cluster.ODAC(**params), params
 
 
+def _repstream(**kw):
+    params = dict(k=5, alpha=1.5, decay_rate=0.99, max_vertices=100, repository_fraction=0.5)
+    params.update(kw)
+    return cluster.RepStream(**params), params
+
+
 def _sostream(**kw):
     params = dict(
         alpha=0.1, min_pts=2, merge_threshold=1.0, fading_factor=0.01,
@@ -248,6 +254,24 @@ ALGORITHMS: dict[str, AlgorithmSpec] = {
         partitions_samples=False,
         default_preprocessor="none",
         note="hierarchical clustering OF VARIABLES; no per-sample assignment",
+    ),
+    "RepStream": AlgorithmSpec(
+        _repstream, default_preprocessor="standard",
+        note=(
+            "two mutual-kNN sparse graphs: one over the points in memory, one over the "
+            "representative points chosen from them. Clusters are the connected components "
+            "of the density-related links between representatives, so there is no offline "
+            "phase and no fixed radius: alpha scales each representative's own local "
+            "density. max_vertices is the memory budget; half of it is reserved for the "
+            "repository of representatives kept by usefulness rather than by age"
+        ),
+        provenance=(
+            "added for this project from Luhr & Lazarescu (2009); verified by branch tests "
+            "against the paper pseudocode, no reference implementation compared. Six places "
+            "where the pseudocode contradicts the paper's own prose were resolved in favour "
+            "of the prose, and Definition 7 needed one maintenance step the pseudocode "
+            "omits; all seven are recorded in the estimator docstring"
+        ),
     ),
     "SOStream": AlgorithmSpec(
         _sostream, default_preprocessor="standard",

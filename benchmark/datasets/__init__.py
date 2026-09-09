@@ -29,6 +29,8 @@ from .synthetic import (
     make_ds2,
     make_ds3,
     make_scalability_dataset,
+    make_repstream_ds1,
+    make_repstream_ds2,
     make_scenario,
     weighted_average_diameter,
 )
@@ -53,6 +55,9 @@ __all__ = [
     "BIRCH_BASE_WORKLOAD",
     "BIRCH_PAPER_REFERENCE",
     "weighted_average_diameter",
+    # RepStream DKE'09 synthetic sets
+    "make_repstream_ds1",
+    "make_repstream_ds2",
     # real
     "load_kddcup99",
     "load_kddcup98",

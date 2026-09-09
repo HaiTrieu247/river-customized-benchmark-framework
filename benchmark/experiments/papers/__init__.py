@@ -9,6 +9,7 @@ from .base import (
     register_paper,
 )
 from .dstream_vs_clustream import DStream2007Benchmark
+from .repstream import RepStream2009Benchmark
 
 __all__ = [
     "BasePaperBenchmark",
@@ -18,4 +19,5 @@ __all__ = [
     "list_papers",
     "list_paper_names",
     "DStream2007Benchmark",
+    "RepStream2009Benchmark",
 ]
