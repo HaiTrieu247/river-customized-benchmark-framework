@@ -56,6 +56,8 @@ class BenchmarkConfig:
     window_size: int = 1000
     external_metrics: tuple[str, ...] = ("ari", "nmi", "ami", "purity")
     internal_metrics: tuple[str, ...] = ()
+    #: Stream index at which scoring starts; the model still learns from 0.
+    score_from: int = 0
 
 
 def run_setting(
@@ -88,6 +90,7 @@ def run_setting(
         external_metrics=config.external_metrics,
         internal_metrics=config.internal_metrics,
         seed=seed,
+        score_from=config.score_from,
         progress=progress,
     )
 

@@ -6,7 +6,9 @@ from .aggregation import aggregate_runs
 from .clustering_quality import (
     EXTERNAL_METRICS,
     INTERNAL_METRICS,
+    StreamingMATRTrace,
     StreamingPurity,
+    StreamingSSQ,
     ami,
     ari,
     build_external_metrics,
@@ -30,6 +32,8 @@ __all__ = [
     "EXTERNAL_METRICS",
     "INTERNAL_METRICS",
     "StreamingPurity",
+    "StreamingSSQ",
+    "StreamingMATRTrace",
     "build_external_metrics",
     "build_internal_metrics",
     "ari",

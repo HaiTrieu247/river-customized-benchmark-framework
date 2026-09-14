@@ -61,3 +61,16 @@ benchmark_out/
 
 
 data
+
+# HPO pipeline: materialised permutations and run outputs. Large and fully
+# regenerable from the configs below plus the stage modules.
+hpo_pipeline/cache/
+hpo_pipeline/out/
+
+# ...but the frozen candidate set, the fold probe and the pool are part of the
+# protocol rather than output of it: they are generated once under a fixed seed
+# and then reused unchanged, so they belong in version control. The blanket
+# *.json rule above would otherwise swallow them.
+!hpo_pipeline/configs/pool.json
+!hpo_pipeline/configs/probe.json
+!hpo_pipeline/configs/search_space.json

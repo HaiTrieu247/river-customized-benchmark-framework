@@ -132,10 +132,99 @@ class StreamingSSQ(metrics.base.Metric):
         return True
 
 
+class StreamingMATRTrace(metrics.base.Metric):
+    """Trace criterion of Fan et al. (2020), accumulated from cluster features.
+
+    Maintains ``(n_k, LS_k, SS_k)`` per predicted cluster label and returns
+
+    ``-2 * sum_k ( SS_k - ||LS_k||^2 / n_k )``
+
+    which is the negated within-cluster sum of squares, so **bigger is better**.
+
+    Two properties distinguish it from :class:`StreamingSSQ`, and both are why it
+    exists. It needs only the predicted label, never the model's ``centers``, so
+    it is defined for every clusterer in the pool rather than only the ones that
+    expose centres; and it is not divided by the sample count.
+
+    The similarity measure is fixed to the raw squared distance and never
+    depends on the hyperparameter being tuned -- only the *partition* varies
+    with the configuration. Fan et al. require this: letting the criterion
+    depend on the tuned parameter makes it self-referential and voids the
+    theoretical guarantees.
+
+    Accumulating by label id over a whole stream is only meaningful while ids
+    are stable. Algorithms that merge clusters online (SOStream, DBSTREAM)
+    recycle ids, so one label can cover two different clusters at two points in
+    the stream and inflate the trace. Read the **per-window** value for those.
+    """
+
+    #: The trace needs the predicted label only, so the runner updates it even
+    #: when the model exposes no centres.
+    requires_centers = False
+
+    def __init__(self):
+        super().__init__()
+        self.n = collections.defaultdict(float)
+        self.ls = collections.defaultdict(lambda: collections.defaultdict(float))
+        self.ss = collections.defaultdict(float)
+
+    @property
+    def requires_labels(self):
+        return False
+
+    def update(self, x: dict, y_pred=None, centers: dict | None = None, sample_weight: float = 1.0):
+        if y_pred is None:
+            return self
+        self.n[y_pred] += sample_weight
+        row = self.ls[y_pred]
+        sq = 0.0
+        for feature, value in x.items():
+            value = float(value)
+            row[feature] += value * sample_weight
+            sq += value * value
+        self.ss[y_pred] += sq * sample_weight
+        return self
+
+    def revert(self, x: dict, y_pred=None, centers: dict | None = None, sample_weight: float = 1.0):
+        if y_pred is None or y_pred not in self.n:
+            return self
+        self.n[y_pred] -= sample_weight
+        row = self.ls[y_pred]
+        sq = 0.0
+        for feature, value in x.items():
+            value = float(value)
+            row[feature] -= value * sample_weight
+            sq += value * value
+        self.ss[y_pred] -= sq * sample_weight
+        return self
+
+    def get(self) -> float:
+        total = 0.0
+        for label, n_k in self.n.items():
+            if n_k <= 0:
+                continue
+            ls_norm_sq = sum(v * v for v in self.ls[label].values())
+            total += self.ss[label] - ls_norm_sq / n_k
+        return -2.0 * total
+
+    @property
+    def bigger_is_better(self):
+        return True
+
+    def works_with(self, model):
+        return True
+
+
 #: External metrics (need ground truth) exposed by name.
-EXTERNAL_METRICS = ("ari", "nmi", "ami", "purity")
+#:
+#: ``homogeneity`` and ``completeness`` are carried alongside ARI because ARI
+#: folds two different mistakes into one number: splitting a true class across
+#: several clusters, and merging several classes into one cluster. High
+#: homogeneity with low completeness means over-segmentation; the reverse means
+#: under-segmentation. The pair separates them, ARI alone cannot.
+EXTERNAL_METRICS = ("ari", "nmi", "ami", "purity", "homogeneity", "completeness")
 #: Internal metrics (no labels needed) exposed by name.
-INTERNAL_METRICS = ("silhouette", "ssq")
+INTERNAL_METRICS = ("silhouette", "ssq", "matr_trace")
 
 
 def build_external_metrics() -> dict:
@@ -145,6 +234,8 @@ def build_external_metrics() -> dict:
         "nmi": metrics.NormalizedMutualInfo(),
         "ami": metrics.AdjustedMutualInfo(),
         "purity": StreamingPurity(),
+        "homogeneity": metrics.Homogeneity(),
+        "completeness": metrics.Completeness(),
     }
 
 
@@ -156,10 +247,15 @@ def build_internal_metrics() -> dict:
     **lower is better** (``bigger_is_better is False``). The runner passes the
     model's centers; clusterers that do not expose centers simply never update
     it and it reports no value.
+
+    ``matr_trace`` is the exception to that: it accumulates cluster features from
+    the predicted label alone, so it is defined for every clusterer including the
+    ones with no centres. The runner updates it regardless of ``centers``.
     """
     return {
         "silhouette": metrics.Silhouette(),
         "ssq": StreamingSSQ(),
+        "matr_trace": StreamingMATRTrace(),
     }
 
 

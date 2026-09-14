@@ -1,0 +1,141 @@
+{
+  "algorithms": [
+    "CluStream",
+    "BIRCH",
+    "ImprovedBIRCH",
+    "DenStream",
+    "DBSTREAM",
+    "STREAMKMeans",
+    "KMeans",
+    "RepStream",
+    "SOStream"
+  ],
+  "dropped": [
+    {
+      "algorithm": "DStream",
+      "reason": "AttributeError: module 'river.cluster' has no attribute 'DStream'"
+    },
+    {
+      "algorithm": "ODAC",
+      "reason": "does not partition samples"
+    },
+    {
+      "algorithm": "TextClust",
+      "reason": "input_kind=tokens"
+    }
+  ],
+  "fold_checks": [
+    {
+      "group": "real",
+      "length": 494021,
+      "n_features": 34,
+      "n_keys_first_record": 34,
+      "name": "kdd99",
+      "status": "ok"
+    },
+    {
+      "group": "real",
+      "length": 581012,
+      "n_features": 10,
+      "n_keys_first_record": 10,
+      "name": "covtype",
+      "status": "ok"
+    },
+    {
+      "group": "real",
+      "length": 79986,
+      "n_features": 33,
+      "n_keys_first_record": 33,
+      "name": "insects_ir_bal",
+      "status": "ok"
+    },
+    {
+      "group": "real",
+      "length": 20400,
+      "n_features": 31,
+      "n_keys_first_record": 31,
+      "name": "keystroke",
+      "status": "ok"
+    },
+    {
+      "group": "real",
+      "length": 49097,
+      "n_features": 9,
+      "n_keys_first_record": 9,
+      "name": "shuttle",
+      "status": "ok"
+    },
+    {
+      "group": "synth",
+      "length": 50000,
+      "n_features": 10,
+      "n_keys_first_record": 10,
+      "name": "static_easy",
+      "status": "ok"
+    },
+    {
+      "group": "synth",
+      "length": 50000,
+      "n_features": 10,
+      "n_keys_first_record": 10,
+      "name": "static_overlap",
+      "status": "ok"
+    },
+    {
+      "group": "synth",
+      "length": 50000,
+      "n_features": 10,
+      "n_keys_first_record": 10,
+      "name": "unbalanced",
+      "status": "ok"
+    },
+    {
+      "group": "synth",
+      "length": 50000,
+      "n_features": 10,
+      "n_keys_first_record": 10,
+      "name": "noisy",
+      "status": "ok"
+    }
+  ],
+  "folds": [
+    {
+      "group": "real",
+      "name": "kdd99"
+    },
+    {
+      "group": "real",
+      "name": "covtype"
+    },
+    {
+      "group": "real",
+      "name": "insects_ir_bal"
+    },
+    {
+      "group": "real",
+      "name": "keystroke"
+    },
+    {
+      "group": "real",
+      "name": "shuttle"
+    },
+    {
+      "group": "synth",
+      "name": "static_easy"
+    },
+    {
+      "group": "synth",
+      "name": "static_overlap"
+    },
+    {
+      "group": "synth",
+      "name": "unbalanced"
+    },
+    {
+      "group": "synth",
+      "name": "noisy"
+    }
+  ],
+  "scaler": "none",
+  "shuffle": true
+}

@@ -165,6 +165,16 @@ class RunResult:
     #: evaluation window size actually used (part of the protocol, so recorded)
     window_size: int | None = None
     seed: int | None = None
+    #: First stream index that was scored. The model still learns from sample 0;
+    #: only the metrics start here. Recorded so a row describes itself.
+    score_from: int = 0
+    #: Size distribution of the *predicted* clusters: how many were produced,
+    #: what share of them held under 0.1% of the scored samples
+    #: (``dust_cluster_share``), and what share of samples fell in the biggest
+    #: one (``largest_cluster_share``). The two catch opposite degeneracies --
+    #: shattering into dust, and lumping everything together -- that a single
+    #: ARI value hides.
+    cluster_size_diagnostics: dict = field(default_factory=dict)
 
     def quality_curve(self, metric: str):
         """Cumulative metric vs stream position (the converging curve)."""
@@ -195,12 +205,14 @@ class RunResult:
             "parameters": self.params,
             "seed": self.seed,
             "window_size": self.window_size,
+            "score_from": self.score_from,
             "n_samples": self.n_samples,
             "n_features": self.n_features,
             "n_fallback_predictions": self.n_fallback_predictions,
             "partitions_samples": self.partitions_samples,
             "structure": self.structure,
             "window_label_diagnostics": self.window_label_diagnostics,
+            "cluster_size_diagnostics": self.cluster_size_diagnostics,
             "efficiency": self.efficiency.to_dict(),
             "quality": {
                 k: (round(v, 4) if v is not None else None) for k, v in self.quality.items()
@@ -250,6 +262,7 @@ def run_once(
     external_metrics: tuple[str, ...] = ("ari", "nmi", "ami", "purity"),
     internal_metrics: tuple[str, ...] = (),
     seed: int | None = None,
+    score_from: int = 0,
     progress: Callable[[int, int | None, int | None], None] | None = None,
 ) -> RunResult:
     """Run one algorithm/setting over one dataset and measure it.
@@ -277,6 +290,14 @@ def run_once(
         model's centers, so clusterers that expose none report no value.
     seed:
         Recorded on the result for reproducibility; the adapter is already built.
+    score_from:
+        Stream index at which *scoring* starts. The model still learns from
+        sample 0 -- it is an online model and there is no reason to throw the
+        head of the stream away -- but no metric is updated before this index,
+        and the evaluation windows are measured from it. This separates "what
+        the model has seen" from "what it is judged on", which is what tuning on
+        a prefix and scoring on the remainder requires. The stream order itself
+        is untouched.
     progress:
         Optional ``(n_seen, length, n_micro_clusters)`` callback, invoked every
         :data:`PROGRESS_EVERY` samples from outside the timed region, so a
@@ -318,8 +339,10 @@ def run_once(
     mc_samples: list[int] = []
 
     windows: list[WindowQuality] = []
-    win_start = 0
+    win_start = score_from
     win_labels: collections.Counter = collections.Counter()
+    #: Predicted cluster -> how many scored samples landed in it.
+    pred_sizes: collections.Counter = collections.Counter()
 
     checkpoints: list[Checkpoint] = []
     total_runtime = 0.0
@@ -368,7 +391,7 @@ def run_once(
             break
 
         # quality-window boundary: flush, then reset only the per-window metrics
-        if n_seen > 0 and n_seen % window_size == 0:
+        if n_seen > score_from and (n_seen - score_from) % window_size == 0:
             flush_window(win_start, n_seen - 1)
             win_start = n_seen
             win_ext, win_int = new_external(), new_internal()
@@ -385,23 +408,33 @@ def run_once(
         if progress is not None and n_seen % PROGRESS_EVERY == 0:
             progress(n_seen, length, adapter.n_micro_clusters())
 
+        # `n_seen` has already been incremented, so the sample just processed
+        # sits at index `n_seen - 1`.
+        scoring = n_seen > score_from
+        if scoring and y_pred is not None:
+            pred_sizes[y_pred] += 1
+
         # Samples with no ground truth (e.g. injected noise) are skipped by the
         # external metrics rather than counted as a class of their own.
-        if want_external and y is not None and y_pred is not None:
+        if scoring and want_external and y is not None and y_pred is not None:
             win_labels[y] += 1
             for metric in cum_ext.values():
                 metric.update(y, y_pred)
             for metric in win_ext.values():
                 metric.update(y, y_pred)
-        if want_internal:
+        if scoring and want_internal:
             centers = adapter.centers()
             # Score in the model's own (scaled) space, where its centers live.
             x_model = adapter.last_x_scaled if adapter.last_x_scaled is not None else x
-            if centers:
-                for metric in cum_int.values():
-                    metric.update(x_model, y_pred, centers)
-                for metric in win_int.values():
-                    metric.update(x_model, y_pred, centers)
+            # Most internal metrics compare the point against the model's
+            # centers and can do nothing without them. `matr_trace` needs only
+            # the predicted label, so gating every internal metric on `centers`
+            # would leave it empty for exactly the clusterers it exists to
+            # cover. Each metric declares which it is.
+            for metrics_group in (cum_int, win_int):
+                for metric in metrics_group.values():
+                    if centers or not getattr(metric, "requires_centers", True):
+                        metric.update(x_model, y_pred, centers)
 
         if checkpoint_every and n_seen % checkpoint_every == 0:
             eff_snapshot()
@@ -443,6 +476,21 @@ def run_once(
             "median_majority_class_share": round(shares[len(shares) // 2], 4),
         }
 
+    # Shape of the predicted partition. Two cheap degeneracies hide behind an
+    # ARI value: shattering the stream into clusters too small to mean anything,
+    # and dropping nearly everything into one cluster.
+    cluster_sizes: dict = {}
+    if adapter.partitions_samples and pred_sizes:
+        total_assigned = sum(pred_sizes.values())
+        dust_floor = 0.001 * total_assigned
+        n_dust = sum(1 for count in pred_sizes.values() if count < dust_floor)
+        cluster_sizes = {
+            "n_predicted_clusters": len(pred_sizes),
+            "n_dust_clusters": n_dust,
+            "dust_cluster_share": round(n_dust / len(pred_sizes), 4),
+            "largest_cluster_share": round(max(pred_sizes.values()) / total_assigned, 4),
+        }
+
     efficiency = EfficiencyMetrics(
         total_runtime_s=total_runtime,
         n_samples=n_seen,
@@ -471,6 +519,8 @@ def run_once(
         partitions_samples=adapter.partitions_samples,
         structure=adapter.structure(),
         window_label_diagnostics=diagnostics,
+        cluster_size_diagnostics=cluster_sizes,
         window_size=window_size,
         seed=seed,
+        score_from=score_from,
     )
