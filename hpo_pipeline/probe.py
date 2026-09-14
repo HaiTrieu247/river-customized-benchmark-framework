@@ -5,11 +5,18 @@ whichever feature dominates, and that differs by orders of magnitude between
 folds. ``s(D)`` is the only thing that makes a distance threshold comparable
 across datasets, which makes this stage load-bearing rather than optional.
 
-``s(D)`` is the median distance to the 4th nearest neighbour, measured on a
-prefix of the *shuffled* stream. After shuffling a prefix is a representative
-sample, so the statistic is both cheap and unbiased. A prefix rather than the
-whole stream is also what a real system has when it must pick parameters, so a
+``s(D)`` is the median pairwise distance, measured on a prefix of the
+*shuffled* stream. After shuffling a prefix is a representative sample, so the
+statistic is both cheap and unbiased. A prefix rather than the whole stream is
+also what a real system has when it must pick parameters, so a
 parameterisation built on it is one that can actually be deployed.
+
+It used to be the median distance to the 4th nearest neighbour. That unit
+collapses to 0 on a fold with many exact duplicates -- KDDCup99's prefix is 58%
+repeated rows, one row alone 2008 times -- and a zero unit turns every
+``epsilon = c * s`` into 0. The pairwise median only fails if half of all
+*pairs* coincide, and it does not depend on how large the prefix is, which a
+kNN distance does. The kNN statistics are still recorded as diagnostics.
 
 The stage also measures how far the raw-units decision goes: with one feature
 holding almost all the variance, every distance-based method is solving a
@@ -57,7 +64,10 @@ def probe(X, y, k_nn: int = K_NN, n_probe: int = N_PROBE, seed: int = 0) -> dict
         "d": int(Xp.shape[1]),
         "n_probe": int(len(Xp)),
         # The unit every distance threshold is expressed in.
-        "s": float(np.median(knn)),
+        "s": float(np.median(offdiag)),
+        "s_definition": "pairwise_median",
+        # kNN statistics: diagnostics of local density, no longer the unit.
+        "knn_median": float(np.median(knn)),
         "knn_q05": float(np.quantile(knn, 0.05)),
         "knn_q95": float(np.quantile(knn, 0.95)),
         "knn_spread": float(np.quantile(knn, 0.95) / max(np.quantile(knn, 0.05), 1e-12)),

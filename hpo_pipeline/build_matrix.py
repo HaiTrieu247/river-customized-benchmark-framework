@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 import time
@@ -39,6 +40,7 @@ from ._common import (
     INTERNAL_METRICS,
     MATRIX_JSONL,
     PROBE_JSON,
+    PYTHONHASHSEED,
     REPO_ROOT,
     SEEDS,
     SPACE_JSON,
@@ -155,9 +157,22 @@ def _row_for(algo, candidate, fold, seed, budget, probe_entry):
         "final_macro_clusters": eff["final_macro_clusters"],
         "n_fallback_predictions": result.n_fallback_predictions,
         "rho_deg": result.window_label_diagnostics.get("single_class_window_share"),
+        # Read inside the child, so the row states what the run actually had.
+        "pythonhashseed": os.environ.get("PYTHONHASHSEED"),
         "status": "ok",
         "error": None,
     }
+
+
+def child_env() -> dict:
+    """Environment for a run subprocess: the caller's, with the hash seed pinned.
+
+    Pinned here rather than left to whoever launches the batch, because each run
+    is its own process and would otherwise draw its own hash seed -- two runs of
+    the same (config, seed) could then disagree for a reason that is not in the
+    matrix at all.
+    """
+    return {**os.environ, "PYTHONHASHSEED": PYTHONHASHSEED}
 
 
 def _run_one_child() -> None:
@@ -213,6 +228,7 @@ def execute(job: dict, timeout: int) -> dict:
             text=True,
             timeout=timeout,
             cwd=str(REPO_ROOT),
+            env=child_env(),
         )
     except subprocess.TimeoutExpired:
         return _failed_row(job, "timeout", f"exceeded {timeout}s")

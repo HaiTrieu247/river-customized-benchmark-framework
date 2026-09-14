@@ -133,8 +133,9 @@ def run_checks(df, probes: dict) -> tuple[list[str], bool]:
         )
     lines.append(
         "\nCV(g*) < CV(abs*) means the conversion transfers scale and P2 has a basis. "
-        "If it fails here, either s(D) is the wrong statistic (try the pairwise "
-        "median) or the scale does not transfer at all.\n"
+        "If it fails here, either s(D) is the wrong statistic (it is the pairwise "
+        "median; the kNN median it replaced collapses to 0 on duplicate-heavy folds) "
+        "or the scale does not transfer at all.\n"
     )
 
     # 6 -- is the resolution axis wide enough?

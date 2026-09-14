@@ -238,7 +238,9 @@ def build_space(algos: list[str]) -> dict:
 def resolve(candidate: dict, probe_of_fold: dict) -> dict:
     """Dimensionless spec -> absolute params for ONE fold."""
     algo = candidate["algo"]
-    if candidate.get("is_default"):
+    # Defaults, and raw-unit candidates (a plain grid that is deliberately NOT
+    # scale-free), already carry their absolute params.
+    if candidate.get("is_default") or candidate.get("raw"):
         return dict(candidate["shape"])
 
     name, kind = GRAN[algo]

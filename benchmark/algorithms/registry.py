@@ -105,6 +105,17 @@ def _dstream(**kw):
     return cluster.DStream(**params), params
 
 
+def _hpstream(**kw):
+    # River's own constructor defaults, spelled out so the report shows them.
+    params = dict(
+        max_clusters=10, n_projected_dimensions=None, radius_threshold=None,
+        spread_radius_factor=2.0, decaying_factor=0.5, n_samples_init=2000,
+        stream_speed=200, normalization_interval=1000, seed=42,
+    )
+    params.update(kw)
+    return cluster.HPStream(**params), params
+
+
 def _birch(**kw):
     params = dict(
         threshold=0.0,
@@ -232,6 +243,18 @@ ALGORITHMS: dict[str, AlgorithmSpec] = {
     "DStream": AlgorithmSpec(
         _dstream, default_preprocessor="standard",
         note="density-and-grid based with time decay; arbitrary shaped clusters",
+    ),
+    "HPStream": AlgorithmSpec(
+        _hpstream, default_preprocessor="none",
+        note=(
+            "projected clustering: each fading cluster keeps its own subset of dimensions; "
+            "normalises the stream internally, offline k-means over the first "
+            "n_samples_init points"
+        ),
+        provenance=(
+            "added for this project from Aggarwal et al. (2004); verification state not "
+            "recorded in this registry"
+        ),
     ),
     "DenStream": AlgorithmSpec(
         _denstream, default_preprocessor="standard",

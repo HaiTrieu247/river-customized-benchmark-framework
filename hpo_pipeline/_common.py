@@ -86,6 +86,15 @@ CRITERIA = ("matr_trace_win", "silhouette", "ssq")
 SMALLER_IS_BETTER = {"silhouette", "ssq"}
 
 
+#: Hash seed pinned for every run subprocess. River's KMeans iterates a set of
+#: feature names, whose order follows the per-process hash seed, and that order
+#: decides which random draw initialises which coordinate (RIVER_BUGS.md BUG-2).
+#: Everything built on KMeans -- KMeans, STREAMKMeans, CluStream's offline phase
+#: -- is reproducible only under a fixed hash seed. The river tree stays
+#: untouched; the seed is pinned instead.
+PYTHONHASHSEED = "0"
+
+
 def shuffle_seed_for(seed: int) -> int:
     """Stream permutation paired with a model seed."""
     return 1000 + seed
