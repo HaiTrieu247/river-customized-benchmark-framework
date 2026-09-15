@@ -1,0 +1,222 @@
+(.venv) PS D:\WORK\CTY-ANH KHÔI\OnlineML\river-customized-benchmark-framework> python -u -m hpo_pipeline.hpo_compare --workers 12 --timeout 3600 2>&1 | Tee-Object hpo_pipeline\out\compare\run.log
+materialising permutations
+Downloading https://drive.google.com/uc?export=download&id=1mSKTSsxzYMjdV005AJqrcMGajuu7dUfW&confirm=t (20.44 MiB)
+tuning: 24 grid points x 5 folds
+  120 runs to do (0 already on disk or duplicate)
+  1/120  118s  CluStream shuttle seed=1 ok (110.6614s)  ok=1
+  2/120  120s  CluStream shuttle seed=1 ok (112.6668s)  ok=2
+  3/120  139s  CluStream keystroke seed=1 ok (131.4967s)  ok=3
+  4/120  145s  CluStream keystroke seed=1 ok (136.7678s)  ok=4
+  5/120  280s  CluStream shuttle seed=1 ok (131.6181s)  ok=5
+  6/120  288s  CluStream keystroke seed=1 ok (157.3771s)  ok=6
+  7/120  614s  CluStream insects_ir_bal seed=1 ok (596.1236s)  ok=7
+  8/120  640s  CluStream insects_ir_bal seed=1 ok (617.5289s)  ok=8
+  9/120  805s  CluStream shuttle seed=1 ok (151.838s)  ok=9
+  10/120  814s  CluStream keystroke seed=1 ok (184.3537s)  ok=10
+  11/120  839s  CluStream insects_ir_bal seed=1 ok (687.181s)  ok=11
+  12/120  854s  DenStream insects_ir_bal seed=1 ok (5.2934s)  ok=12
+  13/120  863s  DenStream keystroke seed=1 ok (2.5927s)  ok=13
+  14/120  864s  DenStream covtype seed=1 ok (15.7014s)  ok=14
+  15/120  869s  DenStream shuttle seed=1 ok (1.7039s)  ok=15
+  16/120  920s  DenStream covtype seed=1 ok (15.9359s)  ok=16
+  17/120  935s  DenStream insects_ir_bal seed=1 ok (5.443s)  ok=17
+  18/120  1099s  DenStream kdd99 seed=1 ok (215.6423s)  ok=18
+  19/120  1106s  DenStream shuttle seed=1 ok (1.6395s)  ok=19
+  20/120  1132s  CluStream insects_ir_bal seed=1 ok (792.9667s)  ok=20
+  21/120  1157s  DenStream kdd99 seed=1 ok (214.698s)  ok=21
+  22/120  1173s  DenStream insects_ir_bal seed=1 ok (5.3182s)  ok=22
+  23/120  1183s  DenStream covtype seed=1 ok (16.0514s)  ok=23
+  24/120  1190s  DenStream shuttle seed=1 ok (1.6734s)  ok=24
+  25/120  1231s  DenStream keystroke seed=1 ok (283.1142s)  ok=25
+  26/120  1281s  DenStream covtype seed=1 ok (15.8742s)  ok=26
+  27/120  1296s  DenStream insects_ir_bal seed=1 ok (5.2252s)  ok=27
+  28/120  1308s  DenStream keystroke seed=1 ok (125.6691s)  ok=28
+  29/120  1314s  DenStream shuttle seed=1 ok (1.7518s)  ok=29
+  30/120  1334s  DenStream keystroke seed=1 ok (30.8252s)  ok=30
+  31/120  1383s  DenStream kdd99 seed=1 ok (198.9709s)  ok=31
+  32/120  1475s  DenStream kdd99 seed=1 ok (206.8503s)  ok=32
+  33/120  1615s  CluStream keystroke seed=1 ok (132.8968s)  ok=33
+  34/120  1669s  CluStream covtype seed=1 ok (1608.1929s)  ok=34
+  35/120  1730s  CluStream shuttle seed=1 ok (109.3155s)  ok=35
+  36/120  1731s  CluStream covtype seed=1 ok (1659.8936s)  ok=36
+  37/120  1929s  CluStream covtype seed=1 ok (1828.8972s)  ok=37
+  38/120  1983s  CluStream insects_ir_bal seed=1 ok (584.2817s)  ok=38
+  39/120  2071s  CluStream keystroke seed=1 ok (135.4875s)  ok=39
+  40/120  2099s  CluStream shuttle seed=1 ok (110.4119s)  ok=40
+  41/120  2335s  CluStream insects_ir_bal seed=1 ok (588.5928s)  ok=41
+  42/120  2543s  CluStream covtype seed=1 ok (2114.7354s)  ok=42
+  43/120  2685s  CluStream keystroke seed=1 ok (134.4103s)  ok=43
+  44/120  2803s  CluStream shuttle seed=1 ok (111.5661s)  ok=44
+  45/120  2952s  CluStream insects_ir_bal seed=1 ok (599.6697s)  ok=45
+  46/120  2957s  CluStream covtype seed=1 ok (1570.0983s)  ok=46
+  47/120  3379s  CluStream covtype seed=1 ok (1594.0769s)  ok=47
+  48/120  3473s  CluStream kdd99 seed=1 ok (3373.0046s)  ok=48
+  49/120  3536s  CluStream keystroke seed=1 ok (149.5369s)  ok=49
+  50/120  3600s  CluStream kdd99 seed=1 timeout (-s)  ok=49 timeout=1
+  51/120  3600s  CluStream kdd99 seed=1 timeout (-s)  ok=49 timeout=2
+  52/120  3601s  CluStream shuttle seed=1 ok (121.6333s)  ok=50 timeout=2
+  53/120  3625s  CluStream insects_ir_bal seed=1 ok (649.65s)  ok=51 timeout=2
+  54/120  3745s  CluStream kdd99 seed=1 timeout (-s)  ok=51 timeout=3
+  55/120  3758s  CluStream shuttle seed=1 ok (125.3436s)  ok=52 timeout=3
+  56/120  3762s  CluStream keystroke seed=1 ok (152.1082s)  ok=53 timeout=3
+  57/120  3805s  CluStream covtype seed=1 ok (1647.1989s)  ok=54 timeout=3
+  58/120  3969s  CluStream keystroke seed=1 ok (155.5884s)  ok=55 timeout=3
+  59/120  4105s  CluStream shuttle seed=1 ok (127.953s)  ok=56 timeout=3
+  60/120  4280s  CluStream insects_ir_bal seed=1 ok (659.0997s)  ok=57 timeout=3
+  61/120  4464s  CluStream insects_ir_bal seed=1 ok (678.2058s)  ok=58 timeout=3
+  62/120  4723s  CluStream kdd99 seed=1 ok (3327.4633s)  ok=59 timeout=3
+  63/120  4734s  CluStream covtype seed=1 ok (1719.5277s)  ok=60 timeout=3
+  64/120  4877s  CluStream shuttle seed=1 ok (134.5977s)  ok=61 timeout=3
+  65/120  4897s  CluStream keystroke seed=1 ok (164.167s)  ok=62 timeout=3
+  66/120  5130s  CluStream kdd99 seed=1 ok (3377.7622s)  ok=63 timeout=3
+  67/120  5203s  CluStream insects_ir_bal seed=1 ok (709.0942s)  ok=64 timeout=3
+  68/120  5389s  CluStream keystroke seed=1 ok (173.8931s)  ok=65 timeout=3
+  69/120  5414s  CluStream covtype seed=1 ok (1745.0279s)  ok=66 timeout=3
+  70/120  5543s  CluStream shuttle seed=1 ok (143.3702s)  ok=67 timeout=3
+  71/120  5632s  DenStream covtype seed=1 ok (45.6915s)  ok=68 timeout=3
+  72/120  5641s  CluStream covtype seed=1 ok (1804.8766s)  ok=69 timeout=3
+  73/120  5646s  DenStream insects_ir_bal seed=1 ok (3.9787s)  ok=70 timeout=3
+  74/120  5656s  DenStream keystroke seed=1 ok (8.8469s)  ok=71 timeout=3
+  75/120  5656s  DenStream shuttle seed=1 ok (4.3408s)  ok=72 timeout=3
+  76/120  5671s  CluStream kdd99 seed=1 timeout (-s)  ok=72 timeout=4
+  77/120  5686s  DenStream kdd99 seed=1 ok (194.7139s)  ok=73 timeout=4
+  78/120  5702s  DenStream insects_ir_bal seed=1 ok (18.6025s)  ok=74 timeout=4
+  79/120  5724s  DenStream shuttle seed=1 ok (15.4312s)  ok=75 timeout=4
+  80/120  5746s  DenStream keystroke seed=1 ok (52.5374s)  ok=76 timeout=4
+  81/120  5840s  DenStream covtype seed=1 ok (136.5475s)  ok=77 timeout=4
+  82/120  5934s  CluStream insects_ir_bal seed=1 ok (764.4763s)  ok=78 timeout=4
+  83/120  6051s  DenStream kdd99 seed=1 ok (311.0224s)  ok=79 timeout=4
+  84/120  6083s  DenStream covtype seed=1 ok (281.2614s)  ok=80 timeout=4
+  85/120  6099s  DenStream keystroke seed=1 ok (155.2327s)  ok=81 timeout=4
+  86/120  6112s  DenStream shuttle seed=1 ok (53.4214s)  ok=82 timeout=4
+  87/120  6164s  DenStream insects_ir_bal seed=1 ok (303.9854s)  ok=83 timeout=4
+  88/120  6249s  DenStream kdd99 seed=1 ok (434.0159s)  ok=84 timeout=4
+  89/120  6262s  CluStream covtype seed=1 ok (1890.4556s)  ok=85 timeout=4
+  90/120  6376s  DenStream keystroke seed=1 ok (200.8753s)  ok=86 timeout=4
+  91/120  6403s  CluStream kdd99 seed=1 timeout (-s)  ok=86 timeout=5
+  92/120  6436s  DenStream shuttle seed=1 ok (176.3321s)  ok=87 timeout=5
+  93/120  6649s  DenStream kdd99 seed=1 ok (469.7788s)  ok=88 timeout=5
+  94/120  6740s  DenStream keystroke seed=1 ok (291.2159s)  ok=89 timeout=5
+  95/120  6997s  DenStream kdd99 seed=1 ok (630.0654s)  ok=90 timeout=5
+  96/120  7031s  CluStream covtype seed=1 ok (2017.9973s)  ok=91 timeout=5
+  97/120  7113s  DenStream shuttle seed=1 ok (447.973s)  ok=92 timeout=5
+  98/120  7123s  DenStream keystroke seed=1 ok (3.6407s)  ok=93 timeout=5
+  99/120  7136s  CluStream kdd99 seed=1 timeout (-s)  ok=93 timeout=6
+  100/120  7169s  DenStream insects_ir_bal seed=1 ok (1023.4268s)  ok=94 timeout=6
+  101/120  7345s  CluStream kdd99 seed=1 timeout (-s)  ok=94 timeout=7
+  102/120  7356s  DenStream covtype seed=1 ok (134.9428s)  ok=95 timeout=7
+  103/120  7363s  DenStream keystroke seed=1 ok (2.179s)  ok=96 timeout=7
+  104/120  7406s  DenStream shuttle seed=1 ok (35.6207s)  ok=97 timeout=7
+  105/120  7655s  DenStream shuttle seed=1 ok (515.3207s)  ok=98 timeout=7
+  106/120  7705s  CluStream kdd99 seed=1 timeout (-s)  ok=98 timeout=8
+  107/120  7705s  DenStream covtype seed=1 ok (1512.297s)  ok=99 timeout=8
+  108/120  7707s  DenStream covtype seed=1 ok (16.1881s)  ok=100 timeout=8
+  109/120  7713s  DenStream shuttle seed=1 ok (1.5823s)  ok=101 timeout=8
+  110/120  7713s  DenStream keystroke seed=1 ok (2.3822s)  ok=102 timeout=8
+  111/120  7719s  DenStream kdd99 seed=1 ok (862.6976s)  ok=103 timeout=8
+  112/120  7947s  DenStream insects_ir_bal seed=1 ok (1500.8123s)  ok=104 timeout=8
+  113/120  8136s  DenStream kdd99 seed=1 ok (887.0042s)  ok=105 timeout=8
+  114/120  8196s  DenStream insects_ir_bal seed=1 ok (1124.6789s)  ok=106 timeout=8
+  115/120  8222s  DenStream insects_ir_bal seed=1 ok (839.801s)  ok=107 timeout=8
+  116/120  8302s  DenStream insects_ir_bal seed=1 ok (567.0392s)  ok=108 timeout=8
+  117/120  8304s  DenStream kdd99 seed=1 ok (792.7735s)  ok=109 timeout=8
+  118/120  8477s  CluStream kdd99 seed=1 timeout (-s)  ok=109 timeout=9
+  119/120  9976s  DenStream covtype seed=1 timeout (-s)  ok=109 timeout=10
+  120/120  10597s  DenStream covtype seed=1 timeout (-s)  ok=109 timeout=11
+scoring: 47 picked (algo, config, fold) x seeds [2, 3]
+  94 runs to do (0 already on disk or duplicate)
+  1/94  132s  CluStream shuttle seed=2 ok (123.88s)  ok=1
+  2/94  132s  CluStream shuttle seed=3 ok (124.0545s)  ok=2
+  3/94  153s  DenStream kdd99 seed=3 ok (83.1661s)  ok=3
+  4/94  158s  CluStream keystroke seed=3 ok (149.2659s)  ok=4
+  5/94  158s  CluStream keystroke seed=2 ok (149.5945s)  ok=5
+  6/94  165s  DenStream keystroke seed=2 ok (1.9196s)  ok=6
+  7/94  169s  DenStream insects_ir_bal seed=2 ok (5.3887s)  ok=7
+  8/94  172s  DenStream keystroke seed=3 ok (2.0963s)  ok=8
+  9/94  173s  DenStream insects_ir_bal seed=3 ok (5.0651s)  ok=9
+  10/94  175s  DenStream shuttle seed=2 ok (1.6469s)  ok=10
+  11/94  178s  DenStream shuttle seed=3 ok (1.6673s)  ok=11
+  12/94  184s  DenStream covtype seed=2 ok (16.4809s)  ok=12
+  13/94  184s  DenStream covtype seed=3 ok (16.5386s)  ok=13
+  14/94  227s  DenStream kdd99 seed=2 ok (149.3709s)  ok=14
+  15/94  653s  CluStream insects_ir_bal seed=3 ok (635.2272s)  ok=15
+  16/94  678s  CluStream insects_ir_bal seed=2 ok (659.8738s)  ok=16
+  17/94  833s  CluStream keystroke seed=2 ok (168.3657s)  ok=17
+  18/94  857s  CluStream keystroke seed=3 ok (168.2412s)  ok=18
+  19/94  863s  CluStream insects_ir_bal seed=2 ok (662.1063s)  ok=19
+  20/94  874s  CluStream insects_ir_bal seed=3 ok (667.1767s)  ok=20
+  21/94  915s  DenStream covtype seed=2 ok (16.3122s)  ok=21
+  22/94  926s  DenStream covtype seed=3 ok (16.2346s)  ok=22
+  23/94  930s  DenStream insects_ir_bal seed=2 ok (5.2489s)  ok=23
+  24/94  941s  DenStream insects_ir_bal seed=3 ok (5.0261s)  ok=24
+  25/94  1010s  CluStream shuttle seed=2 ok (162.7414s)  ok=25
+  26/94  1034s  CluStream shuttle seed=3 ok (162.4546s)  ok=26
+  27/94  1086s  DenStream kdd99 seed=3 ok (78.3819s)  ok=27
+  28/94  1092s  DenStream shuttle seed=2 ok (1.5197s)  ok=28
+  29/94  1098s  DenStream shuttle seed=3 ok (1.5009s)  ok=29
+  30/94  1149s  DenStream kdd99 seed=2 ok (144.367s)  ok=30
+  31/94  1242s  DenStream keystroke seed=2 ok (221.3121s)  ok=31
+  32/94  1353s  DenStream keystroke seed=3 ok (307.3661s)  ok=32
+  33/94  1742s  CluStream covtype seed=3 ok (1680.6069s)  ok=33
+  34/94  1749s  CluStream covtype seed=2 ok (1688.2439s)  ok=34
+  35/94  2399s  CluStream insects_ir_bal seed=2 ok (638.4503s)  ok=35
+  36/94  2408s  CluStream insects_ir_bal seed=3 ok (640.4929s)  ok=36
+  37/94  2553s  CluStream keystroke seed=2 ok (146.0452s)  ok=37
+  38/94  2561s  CluStream keystroke seed=3 ok (145.7548s)  ok=38
+  39/94  2569s  CluStream covtype seed=2 ok (2237.8957s)  ok=39
+  40/94  2570s  CluStream covtype seed=3 ok (2237.2816s)  ok=40
+  41/94  2679s  CluStream shuttle seed=2 ok (119.2802s)  ok=41
+  42/94  2688s  CluStream shuttle seed=3 ok (119.8689s)  ok=42
+  43/94  2715s  DenStream kdd99 seed=3 ok (77.7885s)  ok=43
+  44/94  2730s  DenStream insects_ir_bal seed=2 ok (5.1615s)  ok=44
+  45/94  2730s  DenStream covtype seed=2 ok (16.205s)  ok=45
+  46/94  2739s  DenStream covtype seed=3 ok (16.2087s)  ok=46
+  47/94  2745s  DenStream insects_ir_bal seed=3 ok (5.0349s)  ok=47
+  48/94  2785s  DenStream kdd99 seed=2 ok (142.4298s)  ok=48
+  49/94  2838s  DenStream keystroke seed=2 ok (99.0535s)  ok=49
+  50/94  2925s  DenStream keystroke seed=3 ok (175.4067s)  ok=50
+  51/94  3020s  CluStream covtype seed=2 ok (1712.7047s)  ok=51
+  52/94  3126s  CluStream covtype seed=3 ok (1707.6081s)  ok=52
+  53/94  3532s  CluStream insects_ir_bal seed=2 ok (669.3023s)  ok=53
+  54/94  3546s  CluStream kdd99 seed=2 ok (3453.4358s)  ok=54
+  55/94  3549s  CluStream kdd99 seed=3 ok (3456.1005s)  ok=55
+  56/94  3620s  CluStream insects_ir_bal seed=3 ok (670.7707s)  ok=56
+  57/94  3672s  CluStream shuttle seed=2 ok (116.818s)  ok=57
+  58/94  3681s  CluStream keystroke seed=2 ok (141.8444s)  ok=58
+  59/94  3695s  CluStream keystroke seed=3 ok (143.0999s)  ok=59
+  60/94  3744s  CluStream shuttle seed=3 ok (117.3753s)  ok=60
+  61/94  3784s  CluStream kdd99 seed=2 timeout (-s)  ok=60 timeout=1
+  62/94  3793s  DenStream covtype seed=3 ok (65.9044s)  ok=61 timeout=1
+  63/94  3818s  DenStream covtype seed=2 ok (96.788s)  ok=62 timeout=1
+  64/94  3827s  CluStream kdd99 seed=3 timeout (-s)  ok=62 timeout=2
+  65/94  3990s  DenStream insects_ir_bal seed=2 ok (275.9135s)  ok=63 timeout=2
+  66/94  4001s  DenStream shuttle seed=2 ok (4.8371s)  ok=64 timeout=2
+  67/94  4012s  DenStream shuttle seed=3 ok (5.8513s)  ok=65 timeout=2
+  68/94  4030s  DenStream keystroke seed=3 ok (191.9718s)  ok=66 timeout=2
+  69/94  4042s  DenStream keystroke seed=2 ok (213.2297s)  ok=67 timeout=2
+  70/94  4089s  DenStream insects_ir_bal seed=3 ok (325.6019s)  ok=68 timeout=2
+  71/94  4239s  DenStream kdd99 seed=2 ok (367.0695s)  ok=69 timeout=2
+  72/94  4305s  DenStream kdd99 seed=3 ok (420.7739s)  ok=70 timeout=2
+  73/94  4606s  CluStream covtype seed=2 ok (1782.2279s)  ok=71 timeout=2
+  74/94  4645s  CluStream covtype seed=3 ok (1780.6545s)  ok=72 timeout=2
+  75/94  4698s  CluStream kdd99 seed=2 timeout (-s)  ok=72 timeout=3
+  76/94  4749s  CluStream kdd99 seed=3 timeout (-s)  ok=72 timeout=4
+  77/94  4754s  CluStream keystroke seed=2 ok (141.2903s)  ok=73 timeout=4
+  78/94  4794s  CluStream keystroke seed=3 ok (141.8671s)  ok=74 timeout=4
+  79/94  4800s  DenStream kdd99 seed=2 ok (45.7229s)  ok=75 timeout=4
+  80/94  4873s  CluStream insects_ir_bal seed=2 ok (618.3865s)  ok=76 timeout=4
+  81/94  4879s  DenStream kdd99 seed=3 ok (64.6723s)  ok=77 timeout=4
+  82/94  4897s  DenStream keystroke seed=2 ok (88.1593s)  ok=78 timeout=4
+  83/94  4937s  DenStream shuttle seed=2 ok (50.5849s)  ok=79 timeout=4
+  84/94  4955s  DenStream shuttle seed=3 ok (51.5353s)  ok=80 timeout=4
+  85/94  4965s  CluStream insects_ir_bal seed=3 ok (644.0515s)  ok=81 timeout=4
+  86/94  5024s  DenStream keystroke seed=3 ok (141.1318s)  ok=82 timeout=4
+  87/94  5135s  DenStream covtype seed=2 ok (327.6369s)  ok=83 timeout=4
+  88/94  5158s  DenStream covtype seed=3 ok (312.5263s)  ok=84 timeout=4
+  89/94  5584s  CluStream covtype seed=2 ok (1490.4644s)  ok=85 timeout=4
+  90/94  5623s  CluStream covtype seed=3 ok (1483.9258s)  ok=86 timeout=4
+  91/94  6113s  CluStream kdd99 seed=2 ok (3018.1248s)  ok=87 timeout=4
+  92/94  6186s  CluStream kdd99 seed=3 ok (2986.6149s)  ok=88 timeout=4
+  93/94  7036s  CluStream kdd99 seed=2 ok (2916.4357s)  ok=89 timeout=4
+  94/94  7044s  CluStream kdd99 seed=3 ok (2905.8541s)  ok=90 timeout=4
+wrote D:\WORK\CTY-ANH KH╘I\OnlineML\river-customized-benchmark-framework\hpo_pipeline\out\compare\report.md

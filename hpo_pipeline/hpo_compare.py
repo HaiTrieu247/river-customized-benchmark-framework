@@ -35,6 +35,13 @@ Run from the repo root::
     python -m hpo_pipeline.hpo_compare --report-only
     python -m hpo_pipeline.hpo_compare --m1-grid '{"DenStream": [0.05, 0.5, 5]}'
 
+    # re-run only what timed out, with a longer limit; check first with --dry-run
+    python -m hpo_pipeline.hpo_compare --phase tune --retry-failed --timeout 7200
+    python -m hpo_pipeline.hpo_compare --phase score --retry-failed --timeout 7200
+
+P2R readings (a label-free rule re-picks the ladder level on each held-out fold)
+are added to the report by default; ``--p2r`` chooses which, ``--p2r ""`` none.
+
 Folds must already have a Stage 2 probe (``configs/probe.json``). Missing
 permutations for the scoring seeds are materialised on the way.
 """
@@ -66,6 +73,7 @@ from ._common import (
     shuffle_seed_for,
 )
 from .build_matrix import execute
+from .rules import RULES, orient
 from .space import GRAN, granularity_value, resolve
 from .stream import materialise
 
@@ -93,6 +101,15 @@ PROTOCOLS = {
     # run has at least two groups.
     "m2_cross": ("ladder", "cross"),
 }
+
+#: P2R readings (rule:criterion) computed by default. `matr_trace_win` is defined
+#: for every algorithm and is the pipeline's primary criterion. `R_max` on
+#: `silhouette` is the contrast pre-registered in rules.py: silhouette is not
+#: monotone in the cluster count, so R_max should not degenerate there.
+P2R_DEFAULT = (
+    "R_max:matr_trace_win,R_parsimony:matr_trace_win,R_knee:matr_trace_win,R_max:silhouette"
+)
+P2R_CRITERIA = ("matr_trace_win", "silhouette", "ssq")
 
 #: Thresholds the verdicts use. Stated here so the report can quote them.
 MIN_SPREAD_TO_NOISE = 3.0
@@ -180,17 +197,64 @@ def _row_key(row: dict) -> tuple:
                 row.get("requested"), row.get("params_resolved"))
 
 
-def run_jobs(jobs: list[dict], workers: int, timeout: int) -> None:
-    """Run what is not on disk yet. A failed run counts as done: it is data."""
-    done = {_row_key(r) for r in read_jsonl(RUNS_JSONL)}
+def _job_key(job: dict) -> tuple:
+    return _key(job["algo"], job["candidate"]["config_id"], job["fold"], job["seed"],
+                job["requested"], job["params"])
+
+
+def describe(job: dict) -> str:
+    """Readable label for a run: the searched value and where it came from."""
+    algo, cand = job["algo"], job["candidate"]
+    axis, kind = GRAN[algo]
+    value = job["params"].get(axis)
+    shown = f"{value:.4g}" if isinstance(value, float) else str(value)
+    if cand["grid"] == "default":
+        where = "default"
+    elif cand["grid"] == "raw":
+        where = f"raw #{cand['granularity_level']}"
+    elif kind == "scaled":
+        where = f"ladder L{cand['granularity_level']} c={cand['g']:g}"
+    else:
+        where = f"ladder L{cand['granularity_level']}"
+    return f"{axis}={shown} [{where}]"
+
+
+def pending(jobs: list[dict], rows: list[dict], retry_failed: bool = False) -> list[dict]:
+    """Jobs with no usable row on disk, deduplicated.
+
+    A failed run counts as done by default: a timeout is a fact about that
+    configuration. ``retry_failed`` re-queues them, for when the limit rather
+    than the configuration was at fault. The retry is appended, and the newest
+    row for a key is the one every table reads.
+    """
+    latest = {}
+    for row in rows:
+        latest[_row_key(row)] = row.get("status")
+    done = {k for k, status in latest.items() if status == "ok" or not retry_failed}
     todo, seen = [], set()
-    for j in jobs:
-        key = _key(j["algo"], j["candidate"]["config_id"], j["fold"], j["seed"],
-                   j["requested"], j["params"])
+    for job in jobs:
+        key = _job_key(job)
         if key not in done and key not in seen:
             seen.add(key)
-            todo.append(j)
-    print(f"  {len(todo)} runs to do ({len(jobs) - len(todo)} already on disk or duplicate)")
+            todo.append(job)
+    return todo
+
+
+def run_jobs(jobs: list[dict], workers: int, timeout: int,
+             retry_failed: bool = False, dry_run: bool = False) -> None:
+    """Run what is not on disk yet (and, with ``retry_failed``, what failed)."""
+    rows = list(read_jsonl(RUNS_JSONL))
+    failed = {_row_key(r) for r in rows if r.get("status") != "ok"}
+    todo = pending(jobs, rows, retry_failed)
+    n_retry = sum(_job_key(j) in failed for j in todo)
+    print(f"  {len(todo)} runs to do ({n_retry} retries of failed runs; "
+          f"{len(jobs) - len(todo)} already on disk or duplicate)")
+    if dry_run:
+        for job in todo:
+            tag = " (retry)" if _job_key(job) in failed else ""
+            print(f"    would run: {job['algo']} {job['fold']} seed={job['seed']} "
+                  f"{describe(job)}{tag}")
+        return
     if not todo:
         return
 
@@ -208,12 +272,14 @@ def run_jobs(jobs: list[dict], workers: int, timeout: int) -> None:
         # head of the queue must not hold finished rows in memory, where an
         # interrupt would lose them and the log would show no progress.
         for i, future in enumerate(as_completed(futures), start=1):
+            job = futures[future]
             row = future.result()
             append_jsonl(RUNS_JSONL, row)
             counts[row["status"]] = counts.get(row["status"], 0) + 1
+            tag = " (retry)" if _job_key(job) in failed else ""
             print(
                 f"  {i}/{len(todo)}  {time.time() - started:.0f}s  "
-                f"{row['algo']} {row['dataset']} seed={row['seed']} "
+                f"{row['algo']} {row['dataset']} seed={row['seed']} {describe(job)}{tag} "
                 f"{row['status']} ({row.get('runtime_s', '-')}s)  "
                 + " ".join(f"{k}={v}" for k, v in sorted(counts.items()))
             )
@@ -309,7 +375,86 @@ def pick_lodo(tune: pd.DataFrame, folds: list[str], groups: dict | None = None,
     return picks
 
 
-def all_picks(tune, grids, defaults, algos, folds, groups) -> dict:
+def _curve(tune: pd.DataFrame, algo: str, fold: str, criterion: str, n_levels: int):
+    """A label-free criterion along the ladder on one fold, bigger-is-better.
+
+    None when any rung is missing or not finite. A timed-out rung, or River's
+    streaming silhouette returning inf, breaks the curve rather than shortening
+    it -- a rule read off a gappy curve would pick from the wrong positions.
+    """
+    sub = tune[(tune.algo == algo) & (tune.dataset == fold) & (tune.status == "ok")]
+    if criterion not in sub.columns or sub.empty:
+        return None
+    levels = sub.granularity_level.astype(int)
+    series = pd.Series(pd.to_numeric(sub[criterion], errors="coerce").to_numpy(),
+                       index=levels.to_numpy()).reindex(range(1, n_levels + 1))
+    values = series.to_numpy(dtype=float)
+    if not np.isfinite(values).all():
+        return None
+    return orient(values, criterion)
+
+
+def _ari_at(tune: pd.DataFrame, algo: str, fold: str, level: int) -> float:
+    sub = _ok(tune[(tune.algo == algo) & (tune.dataset == fold)])
+    hit = sub[sub.granularity_level.astype(int) == level][OBJ]
+    return float(hit.iloc[0]) if len(hit) else np.nan
+
+
+def _rule_quality(tune, algo, opt, rule, phi, criterion, n_levels) -> float:
+    """Mean ARI the rule reaches on the optimisation folds with this phi."""
+    vals = []
+    for fold in opt:
+        curve = _curve(tune, algo, fold, criterion, n_levels)
+        if curve is not None:
+            vals.append(_ari_at(tune, algo, fold, rule(curve, phi) + 1))
+    vals = [v for v in vals if np.isfinite(v)]
+    return float(np.mean(vals)) if vals else -np.inf
+
+
+def pick_p2r(tune: pd.DataFrame, folds: list[str], groups: dict | None,
+             rule_name: str, criterion: str, n_levels: int = N_GRANULARITY) -> dict:
+    """P2R: (algo, fold) -> ladder level re-picked on that fold by a rule.
+
+    Metric 2 transfers a *value* of c. P2R transfers a *rule*: the level is
+    chosen again on the held-out fold, from that fold's own label-free curve.
+    The rule's free parameter (phi, for R_parsimony) is the only thing fitted,
+    and it is fitted on the other folds of the same group using their labels --
+    so, like metric 2, nothing about the held-out fold's labels is read.
+
+    A fold whose curve is broken gets no pick rather than a guess.
+    """
+    rule, phis = RULES[rule_name]
+    picks = {}
+    for algo in sorted(set(tune.algo)):
+        for fold in folds:
+            curve = _curve(tune, algo, fold, criterion, n_levels)
+            if curve is None:
+                continue
+            opt = [f for f in folds
+                   if f != fold and (groups is None or groups[f] == groups[fold])]
+            # Ties keep the first phi, so the choice is deterministic.
+            phi = max(phis, key=lambda p: _rule_quality(tune, algo, opt, rule, p,
+                                                        criterion, n_levels))
+            picks[(algo, fold)] = rule(curve, phi) + 1
+    return picks
+
+
+def parse_p2r(spec: str) -> list[tuple[str, str]]:
+    """'R_max:matr_trace_win,R_knee:silhouette' -> [(rule, criterion), ...]."""
+    out = []
+    for item in (s.strip() for s in spec.split(",")):
+        if not item:
+            continue
+        rule, _, criterion = item.partition(":")
+        if rule not in RULES or criterion not in P2R_CRITERIA:
+            raise SystemExit(
+                f"bad --p2r entry {item!r}; rules: {sorted(RULES)}, criteria: {list(P2R_CRITERIA)}"
+            )
+        out.append((rule, criterion))
+    return out
+
+
+def all_picks(tune, grids, defaults, algos, folds, groups, p2r=()) -> dict:
     """protocol -> {(algo, fold): candidate}."""
     out = {}
     n_groups = len(set(groups.values()))
@@ -327,6 +472,12 @@ def all_picks(tune, grids, defaults, algos, folds, groups) -> dict:
         else:
             continue
         out[protocol] = {k: grids[grid][k[0]][lv - 1] for k, lv in levels.items()}
+    ladder = tune[tune.grid == "ladder"]
+    for rule_name, criterion in p2r:
+        levels = pick_p2r(ladder, folds, groups, rule_name, criterion)
+        out[f"p2r_{rule_name}_{criterion}"] = {
+            k: grids["ladder"][k[0]][lv - 1] for k, lv in levels.items()
+        }
     return out
 
 
@@ -473,6 +624,32 @@ def build_report(tune, scores, folds, probes, requested, grids) -> str:
             w(f"| {algo} | {_f(within)} | {_f(across)} | {_f(across - within)} |\n")
         w("\nAcross groups is the honest transfer estimate: nothing from the held-out "
           "fold's group is seen while tuning.\n")
+
+    p2r_names = sorted(p for p in set(scores.protocol) if p.startswith("p2r_"))
+    if p2r_names:
+        w("\n### P2R -- re-pick the ladder level on each fold with a label-free rule\n\n")
+        w("Metric 2 carries one value of c to the held-out fold. P2R carries a *rule*: "
+          "the level is chosen again on the held-out fold from its own label-free curve; "
+          "only the rule's phi (R_parsimony) is fitted, on the other folds of the group. "
+          "No label of the held-out fold is read, so P2R is as deployable as metric 2.\n\n")
+        w("| algo | reading | mean ARI | minus M1 | minus M2 | folds picked | picks |\n"
+          "|---|---|---|---|---|---|---|\n")
+        with np.errstate(all="ignore"):
+            for algo in algos:
+                m1 = np.array([cell(algo, f, "m1_grid") for f in folds])
+                m2 = np.array([cell(algo, f, "m2_pipeline") for f in folds])
+                for p in p2r_names:
+                    rows = of(algo, p)
+                    vals = np.array([cell(algo, f, p) for f in folds])
+                    picked = ", ".join(f"{r.dataset}:L{int(r.level)}" for r in rows.itertuples())
+                    w(f"| {algo} | {p[len('p2r_'):]} | {_f(float(np.nanmean(vals)))} | "
+                      f"{_f(float(np.nanmean(vals - m1)))} | {_f(float(np.nanmean(vals - m2)))} | "
+                      f"{len(rows)}/{len(folds)} | {picked or '-'} |\n")
+        w("\nA fold with no pick has a broken curve there (a failed rung, or an infinite "
+          "silhouette) and drops out of that reading's mean -- compare the counts before "
+          "comparing the means. Pre-registered expectation (rules.py): R_max on "
+          "matr_trace_win picks the finest level and loses; R_max on silhouette does not "
+          "degenerate.\n")
 
     # -- checks
     w("\n## 3. Health of each grid\n")
@@ -639,7 +816,28 @@ def main() -> None:
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--timeout", type=int, default=1800)
     parser.add_argument("--report-only", action="store_true")
+    parser.add_argument(
+        "--phase",
+        choices=("all", "tune", "score"),
+        default="all",
+        help="tune: only the grid runs (no report); score: only the re-runs of picked "
+        "configs, then the report; all: both",
+    )
+    parser.add_argument(
+        "--retry-failed",
+        action="store_true",
+        help="re-queue runs whose latest row is not ok (e.g. timeouts caused by too low "
+        "a --timeout); the retry supersedes the failed row",
+    )
+    parser.add_argument("--dry-run", action="store_true",
+                        help="list the runs that would execute, run nothing, write nothing")
+    parser.add_argument(
+        "--p2r",
+        default=P2R_DEFAULT,
+        help="comma list of rule:criterion P2R readings; empty string disables",
+    )
     args = parser.parse_args()
+    p2r = parse_p2r(args.p2r)
 
     # The hash seed every run needs (RIVER_BUGS.md BUG-2) is pinned by
     # build_matrix.execute for each subprocess, so nothing to set here.
@@ -671,31 +869,42 @@ def main() -> None:
     candidates = {(c["algo"], c["config_id"]): c for c in [*tuning, *defaults.values()]}
     grid_of = {key: c["grid"] for key, c in candidates.items()}
 
-    if not args.report_only:
+    running = not args.report_only
+    if running and not args.dry_run:
         print("materialising permutations")
         for fold in folds:
             for seed in (TUNE_SEED, *FINAL_SEEDS):
                 materialise(fold, shuffle_seed_for(seed))
 
+    if running and args.phase in ("all", "tune"):
         print(f"tuning: {len(tuning)} grid points x {len(folds)} folds")
         run_jobs(
             [_job(c["algo"], c, f, TUNE_SEED, args.n_samples, probes) for c in tuning for f in folds],
             args.workers,
             args.timeout,
+            retry_failed=args.retry_failed,
+            dry_run=args.dry_run,
         )
+    if running and args.phase == "tune":
+        print("tuning phase finished; run again with --phase score to re-run the picks "
+              "and write the report")
+        return
 
     df = load_runs(requested, grid_of, candidates, probes)
     tune = df[(df.seed == TUNE_SEED) & (df.grid != "default")
               & df.algo.isin(algos) & df.dataset.isin(folds)]
-    picks = all_picks(tune, grids, defaults, algos, folds, groups)
+    picks = all_picks(tune, grids, defaults, algos, folds, groups, p2r)
 
-    if not args.report_only:
+    if running:
         wanted = {
             (algo, cand["config_id"], fold): cand
             for chosen in picks.values()
             for (algo, fold), cand in chosen.items()
         }
         print(f"scoring: {len(wanted)} picked (algo, config, fold) x seeds {list(FINAL_SEEDS)}")
+        if args.dry_run:
+            print("  (picks come from the tuning rows on disk now; a tuning retry that "
+                  "has not run yet can still change them)")
         run_jobs(
             [
                 _job(algo, cand, fold, seed, args.n_samples, probes)
@@ -704,7 +913,11 @@ def main() -> None:
             ],
             args.workers,
             args.timeout,
+            retry_failed=args.retry_failed,
+            dry_run=args.dry_run,
         )
+        if args.dry_run:
+            return
         df = load_runs(requested, grid_of, candidates, probes)
 
     scores = score_table(df, picks, probes)

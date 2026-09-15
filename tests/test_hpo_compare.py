@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import pandas as pd
+import pytest
 
 from hpo_pipeline import hpo_compare
 from hpo_pipeline.space import GRAN, resolve
@@ -68,6 +69,72 @@ def test_group_lodo_keeps_a_synthetic_majority_from_outvoting_real_folds():
     assert hpo_compare.pick_lodo(tune, folds, groups)[("A", "r1")] == 1   # within group
     cross = hpo_compare.pick_lodo(tune, folds, groups, cross=True)
     assert cross[("A", "r1")] == 2 and cross[("A", "s1")] == 1            # other group only
+
+
+def _p2r_tune(rows):
+    return pd.DataFrame(
+        [
+            {"algo": "A", "dataset": d, "granularity_level": lv, "ari": ari,
+             "runtime_s": 1.0, "status": st, "matr_trace_win": crit}
+            for d, lv, ari, crit, st in rows
+        ]
+    )
+
+
+def test_p2r_picks_from_the_held_out_curve_never_its_labels():
+    # On f3 the criterion peaks at level 2 while ARI peaks at level 1.
+    rows = []
+    for d in ("f1", "f2"):
+        rows += [(d, 1, 0.2, 1.0, "ok"), (d, 2, 0.8, 2.0, "ok")]
+    rows += [("f3", 1, 0.9, 1.0, "ok"), ("f3", 2, 0.1, 2.0, "ok")]
+    picks = hpo_compare.pick_p2r(_p2r_tune(rows), ["f1", "f2", "f3"], None,
+                                 "R_max", "matr_trace_win", n_levels=2)
+    assert picks[("A", "f3")] == 2
+
+
+def test_p2r_skips_a_fold_whose_curve_is_broken():
+    rows = [("f1", 1, 0.2, 1.0, "ok"), ("f1", 2, 0.8, 2.0, "ok"),
+            ("f2", 1, 0.2, 1.0, "ok"), ("f2", 2, 0.8, 2.0, "ok"),
+            ("f3", 1, 0.2, 1.0, "ok"), ("f3", 2, 0.8, None, "timeout")]
+    picks = hpo_compare.pick_p2r(_p2r_tune(rows), ["f1", "f2", "f3"], None,
+                                 "R_max", "matr_trace_win", n_levels=2)
+    assert ("A", "f3") not in picks and ("A", "f1") in picks
+
+
+def test_parse_p2r_rejects_unknown_entries():
+    assert hpo_compare.parse_p2r("R_knee:ssq, R_max:silhouette") == [
+        ("R_knee", "ssq"), ("R_max", "silhouette")]
+    assert hpo_compare.parse_p2r("") == []
+    with pytest.raises(SystemExit):
+        hpo_compare.parse_p2r("R_best:ari")
+
+
+def _job(cid, status_row=None):
+    cand = {"config_id": cid, "grid": "ladder", "granularity_level": 3, "g": 0.7}
+    return {"algo": "DenStream", "candidate": cand, "fold": "kdd99", "seed": 1,
+            "requested": "full", "params": {"epsilon": 595.2}}
+
+
+def _row(cid, status):
+    return {"algo": "DenStream", "config_id": cid, "dataset": "kdd99", "seed": 1,
+            "requested": "full", "params_resolved": {"epsilon": 595.2}, "status": status}
+
+
+def test_pending_keeps_failed_runs_done_unless_retried():
+    jobs = [_job("ok1"), _job("to1"), _job("new")]
+    rows = [_row("ok1", "ok"), _row("to1", "timeout")]
+    assert [j["candidate"]["config_id"] for j in hpo_compare.pending(jobs, rows)] == ["new"]
+    retried = hpo_compare.pending(jobs, rows, retry_failed=True)
+    assert [j["candidate"]["config_id"] for j in retried] == ["to1", "new"]
+
+
+def test_pending_does_not_retry_a_key_whose_retry_already_succeeded():
+    rows = [_row("to1", "timeout"), _row("to1", "ok")]
+    assert hpo_compare.pending([_job("to1")], rows, retry_failed=True) == []
+
+
+def test_describe_names_the_value_and_its_origin():
+    assert hpo_compare.describe(_job("x")) == "epsilon=595.2 [ladder L3 c=0.7]"
 
 
 def test_defaults_are_river_constructor_not_registry_preset():
