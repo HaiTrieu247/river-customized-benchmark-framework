@@ -115,9 +115,14 @@ def set_out_dir(path) -> None:
 #   max_micro_clusters(q) Sec. 3: "significantly larger than the natural number
 #                         of clusters". Sec. 6.4 defines the micro-ratio q/k and
 #                         shows SSQ stabilising at a ratio of about 10; the
-#                         scalability runs fix q = 10k. Raw: River's default 100
-#                         and its doublings. Ladder: ratio {5, 10, 20}, the
-#                         paper's own sweep around its plateau.
+#                         scalability runs fix q = 10k. Raw: the paper's own
+#                         absolute q on KDD (10 x 5 clusters = 50), River's
+#                         default 100, and its double. Ladder: ratio {2, 5, 10}
+#                         -- the rising part of Fig. 9, just before the plateau,
+#                         and the plateau. Beyond 10 the paper reports no gain,
+#                         and River's micro-cluster maintenance is O(q^2) per
+#                         unabsorbed point: q = 1280 (ratio 20 at k = 64) timed
+#                         out at 600 s on a 2000-sample smoke test.
 #   micro_cluster_r_factor (t)  the maximal boundary factor. Table 2 sweeps
 #                         t in {1, 2, 4, 6, 8}: 14.9% of points fall outside at
 #                         t=1, 1.6% at t=2, 0.18% at t=4, then nothing changes.
@@ -164,8 +169,8 @@ GRIDS: dict[str, dict] = {
             "ladder": [2, 4, 8, 16, 32, 64],
         },
         "shape": {
-            "raw": {"max_micro_clusters": [100, 200, 400], "micro_cluster_r_factor": [1, 2, 4]},
-            "ladder": {"micro_ratio": [5, 10, 20], "micro_cluster_r_factor": [1, 2, 4]},
+            "raw": {"max_micro_clusters": [50, 100, 200], "micro_cluster_r_factor": [1, 2, 4]},
+            "ladder": {"micro_ratio": [2, 5, 10], "micro_cluster_r_factor": [1, 2, 4]},
         },
     },
     "DenStream": {
@@ -637,12 +642,21 @@ def pick_p2r(tune: pd.DataFrame, folds: list[str], groups: dict | None,
                 vals = [v for v in vals if np.isfinite(v)]
                 return float(np.mean(vals)) if vals else -np.inf
 
-            # Ties keep the first theta, so the choice is deterministic.
-            theta_star = max(thetas, key=shape_quality)
-            if not np.isfinite(shape_quality(theta_star)):
-                continue
-            curve = _curve(tune, algo, theta_star, fold, criterion, levels)
-            if curve is None:
+            # Shape points in LODO order; ties keep the first, so the choice is
+            # deterministic. The held-out fold's labels are never read, but a
+            # rule can only be applied to a *complete* curve there: a shape
+            # point whose curve on the held-out fold has a failed rung (a
+            # timeout is label-free information) yields to the next best one.
+            ranked = sorted(thetas, key=lambda th: -shape_quality(th))
+            theta_star, curve = None, None
+            for theta in ranked:
+                if not np.isfinite(shape_quality(theta)):
+                    break
+                curve = _curve(tune, algo, theta, fold, criterion, levels)
+                if curve is not None:
+                    theta_star = theta
+                    break
+            if theta_star is None:
                 continue
             phi = max(phis, key=lambda p: _rule_quality(tune, algo, theta_star, opt, rule, p,
                                                         criterion, levels))
@@ -760,6 +774,13 @@ def _f(x, digits=3) -> str:
     return "-" if x is None or not np.isfinite(x) else f"{x:.{digits}f}"
 
 
+def _nanmean(values) -> float:
+    """Mean over the finite entries; NaN (and no warning) when there are none."""
+    v = np.asarray(values, dtype=float)
+    v = v[np.isfinite(v)]
+    return float(v.mean()) if len(v) else np.nan
+
+
 def _cv(values) -> float:
     v = np.asarray(values, dtype=float)
     return float(v.std() / abs(v.mean())) if len(v) > 1 and v.mean() else np.nan
@@ -808,7 +829,7 @@ def build_report(tune, scores, folds, probes, requested, grids, grids_spec, reje
 
     def mean_of(algo, protocol):
         vals = [cell(algo, f, protocol) for f in folds]
-        return float(np.nanmean(vals)) if np.isfinite(vals).any() else np.nan
+        return _nanmean(vals) if np.isfinite(vals).any() else np.nan
 
     def of(algo, protocol):
         return scores[(scores.algo == algo) & (scores.protocol == protocol)]
@@ -868,10 +889,10 @@ def build_report(tune, scores, folds, probes, requested, grids, grids_spec, reje
         sfo = np.array([cell(algo, f, "sf_oracle") for f in folds])
         both = np.isfinite(a2) & np.isfinite(a3)
         with np.errstate(all="ignore"):
-            w(f"| {algo} | {_f(float(np.nanmean(a2 - a1)))} | {_f(float(np.nanmean(a3 - a1)))} | "
-              f"{_f(float(np.nanmean(a3 - a2)))} | {int((a3[both] >= a2[both]).sum())}/{int(both.sum())} | "
-              f"{_f(float(np.nanmean(sfo - a1)))} | {_f(float(np.nanmean(a3 - sfo)))} | "
-              f"{_f(float(np.nanmean(a2 - a1)))} |\n")
+            w(f"| {algo} | {_f(_nanmean(a2 - a1))} | {_f(_nanmean(a3 - a1))} | "
+              f"{_f(_nanmean(a3 - a2))} | {int((a3[both] >= a2[both]).sum())}/{int(both.sum())} | "
+              f"{_f(_nanmean(sfo - a1))} | {_f(_nanmean(a3 - sfo))} | "
+              f"{_f(_nanmean(a2 - a1))} |\n")
     w("\nHow to read it. Arm 1 sees the scored fold's labels; arms 2 and 3 do not, so "
       "matching arm 1 is already a win for them. *Arm 3 - arm 2* is the effect of the "
       "substitutes alone: same selection rule, same budget, only the units differ. "
@@ -908,8 +929,8 @@ def build_report(tune, scores, folds, probes, requested, grids, grids_spec, reje
                     vals = np.array([cell(algo, f, p) for f in folds])
                     shown = ", ".join(f"{r.dataset}:t{int(r.theta)}L{int(r.level)}"
                                       for r in rows.itertuples())
-                    w(f"| {algo} | {p[len('p2r_'):]} | {_f(float(np.nanmean(vals)))} | "
-                      f"{_f(float(np.nanmean(vals - a1)))} | {_f(float(np.nanmean(vals - a3)))} | "
+                    w(f"| {algo} | {p[len('p2r_'):]} | {_f(_nanmean(vals))} | "
+                      f"{_f(_nanmean(vals - a1))} | {_f(_nanmean(vals - a3))} | "
                       f"{len(rows)}/{len(folds)} | {shown or '-'} |\n")
         w("\nA fold with no pick has a broken curve there (a failed rung, or an infinite "
           "silhouette) and drops out of that reading's mean -- compare the counts before "
@@ -1018,8 +1039,8 @@ def build_report(tune, scores, folds, probes, requested, grids, grids_spec, reje
         a2 = np.array([cell(algo, f, "arm2_raw_lodo") for f in folds])
         a3 = np.array([cell(algo, f, "arm3_sf_lodo") for f in folds])
         with np.errstate(all="ignore"):
-            w(f"| {algo} | {_f(float(np.nanmean(a1 - d)))} | {_f(float(np.nanmean(a2 - d)))} | "
-              f"{_f(float(np.nanmean(a3 - d)))} | {int(np.nansum(a3 < d))}/{len(folds)} |\n")
+            w(f"| {algo} | {_f(_nanmean(a1 - d))} | {_f(_nanmean(a2 - d))} | "
+              f"{_f(_nanmean(a3 - d))} | {int(np.nansum(a3 < d))}/{len(folds)} |\n")
 
     w("\n### 3g. Do the arms crown the same algorithm?\n\n")
     if len(algos) < 2:

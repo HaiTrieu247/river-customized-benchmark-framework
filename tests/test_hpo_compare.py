@@ -62,16 +62,14 @@ def test_denstream_rejects_beta_mu_at_or_below_one():
     assert len(rejected) == 3 * 7
 
 
-def test_clustream_ladder_never_needs_rejection_but_raw_may():
+def test_clustream_ladder_never_needs_rejection_but_raw_does():
     spec = hpo_compare.GRIDS["CluStream"]
     _, rejected_ladder = hpo_compare.build_grid("CluStream", "ladder", spec)
     assert rejected_ladder == []
-    narrow = hpo_compare.merge_grids(
-        hpo_compare.GRIDS, {"CluStream": {"shape": {"raw": {"max_micro_clusters": [50],
-                                                            "micro_cluster_r_factor": [2]}}}}
-    )["CluStream"]
-    _, rejected_raw = hpo_compare.build_grid("CluStream", "raw", narrow)
-    assert [r["value"] for r in rejected_raw] == [64]
+    # q = 50 cannot host k = 64 macro-clusters: one rejection per r-factor.
+    _, rejected_raw = hpo_compare.build_grid("CluStream", "raw", spec)
+    assert [(r["value"], r["point"]["max_micro_clusters"]) for r in rejected_raw] == [(64, 50)] * 3
+    assert all(r["violates"] == ["max_micro_clusters >= n_macro_clusters"] for r in rejected_raw)
 
 
 def test_micro_ratio_resolves_to_a_multiple_of_k():
@@ -204,6 +202,20 @@ def test_p2r_transfers_the_shape_and_re_picks_the_level_on_the_held_out_curve():
     tune = _tune([("A", d, cid, lv, th, ari, "ok", crit) for d, cid, lv, th, ari, crit in rows])
     picks = hpo_compare.pick_p2r(tune, ["f1", "f2", "f3"], None, "R_max", "matr_trace_win", 2)
     assert picks[("A", "f3")] == (1, 2)
+
+
+def test_p2r_falls_back_to_the_best_shape_with_a_complete_held_out_curve():
+    # theta=1 wins on the optimisation folds but its curve is broken on f3
+    # (a timed-out rung); theta=2 is complete there and must be used instead.
+    rows = []
+    for d in ("f1", "f2"):
+        rows += [(d, "a1", 1, 1, 0.9, 1.0, "ok"), (d, "a2", 2, 1, 0.9, 2.0, "ok"),
+                 (d, "b1", 1, 2, 0.5, 1.0, "ok"), (d, "b2", 2, 2, 0.5, 2.0, "ok")]
+    rows += [("f3", "a1", 1, 1, 0.9, 1.0, "ok"), ("f3", "a2", 2, 1, None, None, "timeout"),
+             ("f3", "b1", 1, 2, 0.3, 1.0, "ok"), ("f3", "b2", 2, 2, 0.3, 2.0, "ok")]
+    tune = _tune([("A", d, cid, lv, th, ari, st, crit) for d, cid, lv, th, ari, crit, st in rows])
+    picks = hpo_compare.pick_p2r(tune, ["f1", "f2", "f3"], None, "R_max", "matr_trace_win", 2)
+    assert picks[("A", "f3")] == (2, 2)
 
 
 def test_p2r_skips_a_fold_whose_curve_is_broken():
