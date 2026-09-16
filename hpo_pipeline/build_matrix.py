@@ -78,14 +78,21 @@ def done_keys(path=MATRIX_JSONL, retry_failed: bool = False) -> set:
     }
 
 
-def _row_for(algo, candidate, fold, seed, budget, probe_entry):
-    """Execute one run in-process and return its matrix row."""
+def _row_for(algo, candidate, fold, seed, budget, probe_entry, params=None):
+    """Execute one run in-process and return its matrix row.
+
+    ``params`` lets the caller hand over already-resolved parameters. The
+    comparison pilot needs this: its ladder carries substitutes such as a
+    micro-cluster *ratio* that ``space.resolve`` knows nothing about, and the
+    child must run exactly what the parent keyed the run on.
+    """
     from benchmark.experiments import BenchmarkConfig, Setting, run_setting
 
     from .space import resolve
     from .stream import shuffled_stream
 
-    params = resolve(candidate, probe_entry)
+    if params is None:
+        params = resolve(candidate, probe_entry)
     shuffle_seed = shuffle_seed_for(seed)
     dataset = shuffled_stream(fold, shuffle_seed)
 
@@ -195,6 +202,7 @@ def _run_one_child() -> None:
         job["seed"],
         job["budget"],
         probes[job["fold"]],
+        params=job.get("params"),
     )
     sys.stdout.write(json.dumps(row, default=str))
 
