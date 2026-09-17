@@ -1,4 +1,4 @@
-"""Pilot: four ways of choosing hyperparameters, on River's own stream clusterers.
+"""Pilot: four ways of choosing ONE hyperparameter set, on River's own clusterers.
 
 Before the pipeline is scaled to the whole pool it is checked on the two
 stream clusterers River itself ships -- ``CluStream`` and ``DenStream`` -- where
@@ -10,34 +10,41 @@ times a few shape parameters. The value sets come from the two source papers;
 ``GRIDS`` below documents where every value comes from. Everything not in the
 grid stays at River's *constructor* default.
 
-The four arms differ in two things only: whether the values are given in raw
-units or as substitutes that are resolved per fold, and whether the choice may
-look at the labels of the fold being scored.
+Every arm ends with **one set per algorithm**, and that one set is then run
+unchanged on every dataset. The arms differ in the grid and in how the one set
+is chosen:
 
-    arm 1  raw grid,        tuned on the fold itself       (oracle: a ceiling)
-    arm 2  raw grid,        chosen by leave-one-dataset-out
-    arm 3  substituted grid, chosen by leave-one-dataset-out
-    P2R    substituted grid: the shape is carried over by LODO, the resolution
-           level is re-picked on the held-out fold by a label-free rule
+    arm 1  raw grid          the set with the best score over all datasets
+    arm 2  raw grid          leave-one-dataset-out: every round picks a set on
+                             the other datasets; the final set is the one most
+                             rounds picked (ties: arm 1's ordering)
+    arm 3  substituted grid  as arm 2. The set is dimensionless (``c``, a
+                             micro-ratio) and resolves per dataset through s(D)
+    P2R    substituted grid  the shape is chosen as in arm 3 and the rule's phi
+                             on all datasets; the resolution level is then read
+                             off each dataset's own label-free curve. The
+                             product is a *policy*, not one epsilon.
+    sf-all substituted grid  arm 1 on the substituted grid, to separate "better
+                             grid" from "cost of the LODO choice"
 
-Substitutes are the pipeline's direction: ``epsilon = c * s(D)`` with ``s(D)``
-the fold's own distance scale (Stage 2), and CluStream's micro-cluster budget
-as a *micro-ratio* ``q = ratio * k`` (Aggarwal et al. 2003, Sec. 6.4) instead
-of an absolute count. The same runs also give the remaining cell of the 2 x 2,
-which is what makes the arms readable:
+``--aggregate`` sets how scores are pooled across datasets when a set is
+chosen: ``mean`` ARI, or ``rank`` (mean per-dataset rank, so one easy dataset
+cannot outvote the others).
 
-                    tuned on the fold      tuned on the other folds
-    raw grid        arm 1                  arm 2
-    substituted     sf oracle              arm 3  (+ P2R)
+Scoring the final set on the datasets it was chosen on is in-sample. Arms 2, 3
+and P2R therefore also report their **LODO estimate**: in every round the set
+chosen without a dataset is scored on that dataset. That estimate, not the
+in-sample score, is what the procedure is worth on a dataset it never saw.
 
-Tuning runs every grid point under seed 1. Every chosen configuration then runs
-again under seeds 2 and 3, each with its own permutation -- re-running under
-the tuning seed would only repeat the tuning score. River's default is scored
-the same way as the arms.
+Tuning runs every grid point under seed 1. Every chosen set then runs again
+under seeds 2 and 3, each with its own permutation -- re-running under the
+tuning seed would only repeat the tuning score. River's default is scored the
+same way.
 
 Run from the repo root::
 
-    python -m hpo_pipeline.hpo_compare --n-samples 50000 --workers 12
+    python -m hpo_pipeline.hpo_compare --n-samples 50000 --workers 12 --timeout 7200
+    python -m hpo_pipeline.hpo_compare --n-samples 50000 --aggregate rank
     python -m hpo_pipeline.hpo_compare --n-samples 2000            # smoke test
     python -m hpo_pipeline.hpo_compare --report-only
     python -m hpo_pipeline.hpo_compare --grids '{"DenStream": {"levels": {"raw": [0.1, 1, 10]}}}'
@@ -46,8 +53,7 @@ Run from the repo root::
     python -m hpo_pipeline.hpo_compare --phase tune --retry-failed --timeout 7200
     python -m hpo_pipeline.hpo_compare --phase score --retry-failed --timeout 7200
 
-P2R readings are added to the report by default; ``--p2r`` chooses which,
-``--p2r ""`` none.
+P2R readings are added by default; ``--p2r`` chooses which, ``--p2r ""`` none.
 
 Folds must already have a Stage 2 probe (``configs/probe.json``). Missing
 permutations for the scoring seeds are materialised on the way.
@@ -204,25 +210,28 @@ CONSTRAINTS: dict[str, list[tuple[str, object]]] = {
     ],
 }
 
-#: Readings: name -> (grid, how the config is chosen).
-PROTOCOLS = {
-    "default": (None, None),
-    "arm1_raw_oracle": ("raw", "oracle"),
-    "arm2_raw_lodo": ("raw", "lodo"),
-    "sf_oracle": ("ladder", "oracle"),
-    "arm3_sf_lodo": ("ladder", "lodo"),
-    # Leave-one-GROUP-out: tuned on the other groups only. Read only when the
-    # run has at least two groups.
-    "arm3_sf_cross": ("ladder", "cross"),
-}
+#: Arms whose product is one set (or one policy) per algorithm, in report order.
+FINAL_ARMS = ("default", "arm1_raw_all", "arm2_raw_lodo", "arm3_sf_lodo", "sf_all")
+#: How pooled scores are formed when a set is chosen across datasets.
+AGGREGATES = ("mean", "rank")
+#: Suffix of the protocol holding a procedure's leave-one-dataset-out estimate.
+EST = "_est"
 ARM_LABEL = {
     "default": "default",
-    "arm1_raw_oracle": "arm 1",
+    "arm1_raw_all": "arm 1",
     "arm2_raw_lodo": "arm 2",
     "arm3_sf_lodo": "arm 3",
-    "sf_oracle": "sf oracle",
-    "arm3_sf_cross": "arm 3 cross-group",
+    "sf_all": "sf-all",
+    "ceiling_raw": "per-dataset ceiling (raw)",
+    "ceiling_sf": "per-dataset ceiling (substituted)",
 }
+
+
+def arm_label(protocol: str) -> str:
+    base = protocol[: -len(EST)] if protocol.endswith(EST) else protocol
+    label = ARM_LABEL.get(base, base[len("p2r_"):] if base.startswith("p2r_") else base)
+    return label + (" (LODO estimate)" if protocol.endswith(EST) else "")
+
 
 #: P2R readings (rule:criterion) computed by default. `matr_trace_win` is defined
 #: for every algorithm and is the pipeline's primary criterion. `R_max` on
@@ -521,12 +530,53 @@ def _first(frame: pd.DataFrame, score: str, runtime: str) -> str:
     return str(ranked.iloc[0]["config_id"])
 
 
+def _aggregate(sub: pd.DataFrame, folds_used: list[str], how: str = "mean") -> pd.DataFrame:
+    """Pool one algorithm's tuning scores over ``folds_used``; bigger is better.
+
+    Only configs that ran on every one of those folds are eligible: a set that
+    cannot run on a dataset is not a set that can be shipped to it.
+
+    ``mean`` averages ARI. ``rank`` averages each config's rank within every
+    dataset (negated, so bigger is still better): a dataset where ARI runs to
+    0.5 then counts exactly as much as one where it tops out at 0.05.
+    """
+    if how not in AGGREGATES:
+        raise ValueError(f"aggregate must be one of {AGGREGATES}, got {how!r}")
+    sub = _ok(sub)
+    sub = sub[sub.dataset.isin(folds_used)]
+    n = sub.groupby("config_id").dataset.nunique()
+    sub = sub[sub.config_id.isin(n[n == len(folds_used)].index)]
+    if sub.empty:
+        return pd.DataFrame(columns=["config_id", "score", "runtime", "granularity_level"])
+    if how == "rank":
+        score = -sub.groupby("dataset")[OBJ].rank(ascending=False, method="average")
+    else:
+        score = sub[OBJ]
+    sub = sub.assign(_score=score)
+    return (
+        sub.groupby("config_id")
+        .agg(score=("_score", "mean"), runtime=("runtime_s", "mean"),
+             granularity_level=("granularity_level", "first"))
+        .reset_index()
+    )
+
+
 def pick_oracle(tune: pd.DataFrame) -> dict:
-    """(algo, fold) -> config chosen on that fold's own labels."""
+    """(algo, fold) -> config chosen on that fold's own labels. A ceiling only."""
     return {
         (algo, fold): _first(grp, OBJ, "runtime_s")
         for (algo, fold), grp in _ok(tune).groupby(["algo", "dataset"])
     }
+
+
+def pick_all(tune: pd.DataFrame, folds: list[str], how: str = "mean") -> dict:
+    """algo -> the one config with the best pooled score over all ``folds``."""
+    picks = {}
+    for algo in sorted(set(tune.algo)):
+        agg = _aggregate(tune[tune.algo == algo], folds, how)
+        if not agg.empty:
+            picks[algo] = _first(agg, "score", "runtime")
+    return picks
 
 
 def _opt_folds(fold: str, folds: list[str], groups: dict | None, cross: bool) -> list[str]:
@@ -538,36 +588,53 @@ def _opt_folds(fold: str, folds: list[str], groups: dict | None, cross: bool) ->
 
 
 def pick_lodo(tune: pd.DataFrame, folds: list[str], groups: dict | None = None,
-              cross: bool = False) -> dict:
-    """(algo, fold) -> config chosen on OTHER folds.
+              cross: bool = False, how: str = "mean") -> dict:
+    """(algo, held-out fold) -> config chosen on the OTHER folds.
+
+    These per-round picks are what the LODO *estimate* scores; the shipped set
+    is their consensus (``consensus``).
 
     ``groups`` (fold -> group) keeps the optimisation set inside the held-out
     fold's own group, so folds cut from one generator cannot outvote the real
-    ones. ``cross=True`` instead takes it from the other groups only -- the
-    honest transfer number. Without ``groups`` every other fold is used.
-
-    A config is eligible only if it ran on every optimisation fold; the
-    held-out fold is never consulted, so a pick that then fails there is a real
-    failure.
+    ones. ``cross=True`` instead takes it from the other groups only. Without
+    ``groups`` every other fold is used. The held-out fold is never consulted,
+    so a pick that then fails there is a real failure.
     """
-    ok = _ok(tune)
     picks = {}
     for algo in sorted(set(tune.algo)):
-        sub = ok[ok.algo == algo]
+        sub = tune[tune.algo == algo]
         for fold in folds:
             opt = _opt_folds(fold, folds, groups, cross)
             if not opt:
                 continue
-            agg = (
-                sub[sub.dataset.isin(opt)]
-                .groupby("config_id")
-                .agg(score=(OBJ, "mean"), runtime=("runtime_s", "mean"),
-                     n=("dataset", "nunique"), granularity_level=("granularity_level", "first"))
-            )
-            agg = agg[agg.n == len(opt)]
+            agg = _aggregate(sub, opt, how)
             if not agg.empty:
-                picks[(algo, fold)] = _first(agg.reset_index(), "score", "runtime")
+                picks[(algo, fold)] = _first(agg, "score", "runtime")
     return picks
+
+
+def consensus(tune: pd.DataFrame, lodo: dict, folds: list[str], how: str = "mean") -> dict:
+    """algo -> (config, votes, rounds): the set most LODO rounds picked.
+
+    Ties go to the tied config with the best pooled score over all folds, so
+    the result is deterministic and never a config no round chose.
+    """
+    out = {}
+    for algo in sorted({a for a, _ in lodo}):
+        votes: dict[str, int] = {}
+        for (a, _), cid in sorted(lodo.items()):
+            if a == algo:
+                votes[cid] = votes.get(cid, 0) + 1
+        top = max(votes.values())
+        tied = sorted(c for c, v in votes.items() if v == top)
+        cid = tied[0]
+        if len(tied) > 1:
+            agg = _aggregate(tune[tune.algo == algo], folds, how)
+            agg = agg[agg.config_id.isin(tied)]
+            if not agg.empty:
+                cid = _first(agg, "score", "runtime")
+        out[algo] = (cid, top, sum(votes.values()))
+    return out
 
 
 def _curve(tune: pd.DataFrame, algo: str, theta, fold: str, criterion: str, n_levels: int):
@@ -597,9 +664,22 @@ def _ari_at(tune: pd.DataFrame, algo: str, theta, fold: str, level: int) -> floa
     return float(hit.iloc[0]) if len(hit) else np.nan
 
 
-def _best_over_levels(tune: pd.DataFrame, algo: str, theta, fold: str) -> float:
-    sub = _ok(tune[(tune.algo == algo) & (tune.dataset == fold) & (tune.theta == theta)])
-    return float(sub[OBJ].max()) if len(sub) else np.nan
+def _shape_scores(tune: pd.DataFrame, algo: str, folds_used: list[str],
+                  how: str = "mean") -> dict:
+    """theta -> pooled best-over-levels score on ``folds_used`` (bigger is better).
+
+    A shape point is judged by the best level it reaches on each dataset, since
+    P2R re-picks the level anyway. Datasets where a shape point never ran are
+    skipped for that point, not counted as zero.
+    """
+    ok = _ok(tune[(tune.algo == algo) & tune.dataset.isin(folds_used)])
+    if ok.empty:
+        return {}
+    best = ok.groupby(["theta", "dataset"])[OBJ].max().unstack("dataset")
+    if how == "rank":
+        best = -best.rank(axis=0, ascending=False, method="average")
+    pooled = best.mean(axis=1, skipna=True)
+    return {int(t): float(v) for t, v in pooled.items() if np.isfinite(v)}
 
 
 def _rule_quality(tune, algo, theta, opt, rule, phi, criterion, n_levels) -> float:
@@ -614,44 +694,33 @@ def _rule_quality(tune, algo, theta, opt, rule, phi, criterion, n_levels) -> flo
 
 
 def pick_p2r(tune: pd.DataFrame, folds: list[str], groups: dict | None,
-             rule_name: str, criterion: str, n_levels: dict | int) -> dict:
-    """P2R: (algo, fold) -> (theta, level) re-picked on that fold by a rule.
+             rule_name: str, criterion: str, n_levels: dict | int,
+             how: str = "mean") -> dict:
+    """P2R's LODO rounds: (algo, held-out fold) -> (theta, level).
 
-    Arm 3 transfers a *value* on the ladder. P2R splits the configuration:
-    the shape point ``theta*`` is transferred by ordinary LODO (best-over-level
-    ARI on the optimisation folds), and the level is chosen again on the
-    held-out fold from that fold's own label-free curve at ``theta*``. The
-    rule's free parameter (phi, for R_parsimony) is fitted on the optimisation
-    folds too -- so, like arm 3, nothing about the held-out fold's labels is
-    read.
+    In each round the shape point ``theta*`` is chosen on the optimisation
+    folds (pooled best-over-level score), and the level is read off the
+    held-out fold's own label-free curve at ``theta*``. The rule's phi is
+    fitted on the optimisation folds too, so nothing about the held-out fold's
+    labels is read. These picks are what P2R's LODO estimate scores.
 
-    A fold whose curve is broken gets no pick rather than a guess.
+    The held-out labels are never read, but a rule can only be applied to a
+    *complete* curve: a shape point whose held-out curve has a failed rung (a
+    timeout is label-free information) yields to the next best one.
     """
     rule, phis = RULES[rule_name]
     picks = {}
     for algo in sorted(set(tune.algo)):
         levels = n_levels[algo] if isinstance(n_levels, dict) else n_levels
-        thetas = sorted(set(tune[tune.algo == algo].theta.dropna().astype(int)))
         for fold in folds:
             opt = _opt_folds(fold, folds, groups, cross=False)
             if not opt:
                 continue
-
-            def shape_quality(theta):
-                vals = [_best_over_levels(tune, algo, theta, d) for d in opt]
-                vals = [v for v in vals if np.isfinite(v)]
-                return float(np.mean(vals)) if vals else -np.inf
-
-            # Shape points in LODO order; ties keep the first, so the choice is
-            # deterministic. The held-out fold's labels are never read, but a
-            # rule can only be applied to a *complete* curve there: a shape
-            # point whose curve on the held-out fold has a failed rung (a
-            # timeout is label-free information) yields to the next best one.
-            ranked = sorted(thetas, key=lambda th: -shape_quality(th))
+            quality = _shape_scores(tune, algo, opt, how)
+            # Best first; ties keep the smaller theta, so the order is fixed.
+            ranked = sorted(quality, key=lambda th: (-quality[th], th))
             theta_star, curve = None, None
             for theta in ranked:
-                if not np.isfinite(shape_quality(theta)):
-                    break
                 curve = _curve(tune, algo, theta, fold, criterion, levels)
                 if curve is not None:
                     theta_star = theta
@@ -662,6 +731,42 @@ def pick_p2r(tune: pd.DataFrame, folds: list[str], groups: dict | None,
                                                         criterion, levels))
             picks[(algo, fold)] = (theta_star, rule(curve, phi) + 1)
     return picks
+
+
+def p2r_policy(tune: pd.DataFrame, folds: list[str], rule_name: str, criterion: str,
+               n_levels: dict | int, est: dict, how: str = "mean") -> dict:
+    """algo -> the one P2R policy shipped: a fixed shape, a fixed phi, a rule.
+
+    ``theta`` is the shape most LODO rounds chose (ties: best pooled over all
+    folds); ``phi`` is fitted on all folds at that shape. The level is then
+    read off each dataset's own label-free curve -- that is the point of P2R,
+    so the resolved threshold differs per dataset while the policy does not.
+    A dataset whose curve is broken at ``theta`` gets no level.
+    """
+    rule, phis = RULES[rule_name]
+    out = {}
+    for algo in sorted(set(tune.algo)):
+        votes: dict[int, int] = {}
+        for (a, _), (theta, _) in sorted(est.items()):
+            if a == algo:
+                votes[theta] = votes.get(theta, 0) + 1
+        if not votes:
+            continue
+        levels_n = n_levels[algo] if isinstance(n_levels, dict) else n_levels
+        top = max(votes.values())
+        tied = sorted(t for t, v in votes.items() if v == top)
+        quality = _shape_scores(tune, algo, folds, how)
+        theta = max(tied, key=lambda t: (quality.get(t, -np.inf), -t))
+        phi = max(phis, key=lambda p: _rule_quality(tune, algo, theta, folds, rule, p,
+                                                    criterion, levels_n))
+        chosen = {}
+        for fold in folds:
+            curve = _curve(tune, algo, theta, fold, criterion, levels_n)
+            if curve is not None:
+                chosen[fold] = rule(curve, phi) + 1
+        out[algo] = {"theta": theta, "phi": phi, "votes": top,
+                     "rounds": sum(votes.values()), "levels": chosen}
+    return out
 
 
 def parse_p2r(spec: str) -> list[tuple[str, str]]:
@@ -679,37 +784,95 @@ def parse_p2r(spec: str) -> list[tuple[str, str]]:
     return out
 
 
-def all_picks(tune, grids, defaults, algos, folds, groups, p2r=()) -> dict:
-    """protocol -> {(algo, fold): candidate}."""
+def all_picks(tune, grids, defaults, algos, folds, groups, p2r=(),
+              aggregate: str = "mean") -> tuple[dict, dict]:
+    """Every arm's picks, plus the one set each arm ships.
+
+    Returns ``(picks, finals)``:
+
+    * ``picks``: protocol -> {(algo, fold): candidate}. For a final arm the
+      candidate is the same set on every fold (for P2R, the same shape with the
+      level its rule read on that fold). ``<arm>_est`` protocols hold the LODO
+      rounds; ``ceiling_*`` the per-dataset oracles, kept as reference.
+    * ``finals``: protocol -> {algo: {"config": candidate, ...}} -- what the
+      arm hands over, with how it was reached.
+    """
     by_id = {(c["algo"], c["config_id"]): c
              for kind in grids for cands in grids[kind].values() for c in cands}
     by_cell = {(c["algo"], c["theta"], c["granularity_level"]): c
                for a in algos for c in grids["ladder"][a]}
-    out = {}
-    n_groups = len(set(groups.values()))
-    for protocol, (grid, how) in PROTOCOLS.items():
-        if grid is None:
-            out[protocol] = {(a, f): defaults[a] for a in algos for f in folds}
-            continue
-        sub = tune[tune.grid == grid]
-        if how == "oracle":
-            picks = pick_oracle(sub)
-        elif how == "lodo":
-            picks = pick_lodo(sub, folds, groups)
-        elif n_groups >= 2:
-            picks = pick_lodo(sub, folds, groups, cross=True)
-        else:
-            continue
-        out[protocol] = {k: by_id[(k[0], cid)] for k, cid in picks.items()}
-    ladder = tune[tune.grid == "ladder"]
+    raw, ladder = tune[tune.grid == "raw"], tune[tune.grid == "ladder"]
+    picks: dict[str, dict] = {}
+    finals: dict[str, dict] = {}
+
+    def ship(protocol, chosen: dict, extra: dict | None = None):
+        picks[protocol] = {(a, f): by_id[(a, cid)] for a, cid in chosen.items() for f in folds}
+        finals[protocol] = {a: {"config": by_id[(a, cid)], **((extra or {}).get(a, {}))}
+                            for a, cid in chosen.items()}
+
+    picks["default"] = {(a, f): defaults[a] for a in algos for f in folds}
+    finals["default"] = {a: {"config": defaults[a]} for a in algos}
+
+    ship("arm1_raw_all", pick_all(raw, folds, aggregate))
+    ship("sf_all", pick_all(ladder, folds, aggregate))
+
+    for protocol, sub in (("ceiling_raw", raw), ("ceiling_sf", ladder)):
+        picks[protocol] = {k: by_id[(k[0], cid)] for k, cid in pick_oracle(sub).items()}
+
+    for protocol, sub in (("arm2_raw_lodo", raw), ("arm3_sf_lodo", ladder)):
+        est = pick_lodo(sub, folds, groups, how=aggregate)
+        picks[protocol + EST] = {k: by_id[(k[0], cid)] for k, cid in est.items()}
+        agreed = consensus(sub, est, folds, aggregate)
+        ship(protocol, {a: v[0] for a, v in agreed.items()},
+             {a: {"votes": v[1], "rounds": v[2]} for a, v in agreed.items()})
+
+    if len(set(groups.values())) >= 2:
+        cross = pick_lodo(ladder, folds, groups, cross=True, how=aggregate)
+        picks["arm3_sf_cross" + EST] = {k: by_id[(k[0], cid)] for k, cid in cross.items()}
+
     n_levels = {a: len(set(c["granularity_level"] for c in grids["ladder"][a])) for a in algos}
     for rule_name, criterion in p2r:
-        picks = pick_p2r(ladder, folds, groups, rule_name, criterion, n_levels)
-        out[f"p2r_{rule_name}_{criterion}"] = {
-            k: by_cell[(k[0], theta, level)] for k, (theta, level) in picks.items()
+        protocol = f"p2r_{rule_name}_{criterion}"
+        est = pick_p2r(ladder, folds, groups, rule_name, criterion, n_levels, aggregate)
+        picks[protocol + EST] = {
+            k: by_cell[(k[0], theta, level)] for k, (theta, level) in est.items()
             if (k[0], theta, level) in by_cell
         }
-    return out
+        policy = p2r_policy(ladder, folds, rule_name, criterion, n_levels, est, aggregate)
+        picks[protocol] = {
+            (a, f): by_cell[(a, pol["theta"], level)]
+            for a, pol in policy.items() for f, level in pol["levels"].items()
+            if (a, pol["theta"], level) in by_cell
+        }
+        finals[protocol] = {
+            a: {"config": by_cell[(a, pol["theta"], 1)], "rule": rule_name,
+                "criterion": criterion, **pol}
+            for a, pol in policy.items() if (a, pol["theta"], 1) in by_cell
+        }
+    return picks, finals
+
+
+def spec_label(cand: dict, grids_spec: dict, tuned: list[str], *, level: bool = True) -> str:
+    """The set as a person would write it down, in the grid's own units.
+
+    A substituted set is written with its substitutes (``epsilon = 1.6 * s(D)``,
+    ``micro_ratio=5``) because that, not a per-dataset number, is what it is.
+    ``level=False`` leaves the resolution axis out (P2R reads it per dataset).
+    """
+    algo = cand["algo"]
+    axis, kind = GRAN[algo]
+    shape = cand["shape"]
+    if cand["grid"] == "default":
+        return ", ".join(f"{p}={_fmt_value(shape[p])}" for p in tuned if p in shape)
+    parts = []
+    if level:
+        if cand["grid"] == "ladder" and kind == "scaled":
+            parts.append(f"{axis} = {cand['g']:g} * s(D)")
+        else:
+            parts.append(f"{axis}={_fmt_value(cand['g'])}")
+    for key in sorted(grids_spec[algo]["shape"][cand["grid"]]):
+        parts.append(f"{key}={_fmt_value(shape[key])}")
+    return ", ".join(parts)
 
 
 # --- scoring ---------------------------------------------------------------
@@ -818,7 +981,7 @@ def _grid_section(algos, grids_spec, grids, rejected, tuned_of) -> str:
 
 
 def build_report(tune, scores, folds, probes, requested, grids, grids_spec, rejected,
-                 tuned_of) -> str:
+                 tuned_of, finals, aggregate) -> str:
     out = []
     w = out.append
     by = {(r.algo, r.dataset, r.protocol): r._asdict() for r in scores.itertuples(index=False)}
@@ -827,128 +990,169 @@ def build_report(tune, scores, folds, probes, requested, grids, grids_spec, reje
         row = by.get((algo, fold, protocol))
         return np.nan if row is None else row[col]
 
+    def vec(algo, protocol):
+        return np.array([cell(algo, f, protocol) for f in folds], dtype=float)
+
     def mean_of(algo, protocol):
-        vals = [cell(algo, f, protocol) for f in folds]
-        return _nanmean(vals) if np.isfinite(vals).any() else np.nan
+        return _nanmean(vec(algo, protocol))
+
+    def n_scored(algo, protocol):
+        return int(np.isfinite(vec(algo, protocol)).sum())
+
+    def mean_cell(algo, protocol):
+        # A mean over fewer datasets is not comparable with a full one; say so.
+        n = n_scored(algo, protocol)
+        text = _f(mean_of(algo, protocol))
+        return f"**{text}**" if n == len(folds) else f"{text} ({n}/{len(folds)})"
 
     def of(algo, protocol):
         return scores[(scores.algo == algo) & (scores.protocol == protocol)]
 
-    def picked(algo, fold, protocol):
-        row = by.get((algo, fold, protocol))
-        return "-" if row is None else row["picked"]
-
     algos = sorted(set(scores.algo))
-    w("# HPO pilot -- four ways of choosing hyperparameters\n\n")
-    w(f"Stream length: **{requested}** per fold. Objective: ARI over the whole stream. "
-      f"Tuning seed {TUNE_SEED}; every reported score is the mean over fresh runs "
-      f"under seeds {list(FINAL_SEEDS)} (their own permutations).\n\n")
-    w(f"Folds ({len(folds)}): {', '.join(folds)}\n\n")
-    w("| arm | values | chosen by | may read the scored fold's labels |\n|---|---|---|---|\n"
-      "| arm 1 | raw grid | argmax on the fold itself | yes (a ceiling) |\n"
-      "| arm 2 | raw grid | leave-one-dataset-out | no |\n"
-      "| arm 3 | substituted grid (`c * s(D)`, micro-ratio) | leave-one-dataset-out | no |\n"
-      "| P2R | substituted grid | shape by LODO, level re-picked on the fold by a label-free rule | no |\n"
-      "| sf oracle | substituted grid | argmax on the fold itself | yes (isolates grid design) |\n")
+    protocols = set(scores.protocol)
+    p2r_names = sorted(p for p in protocols if p.startswith("p2r_") and not p.endswith(EST))
+    ships = [p for p in FINAL_ARMS if p in protocols] + p2r_names
+    pool = "mean ARI" if aggregate == "mean" else "mean per-dataset rank"
+
+    w("# HPO pilot -- one hyperparameter set per arm\n\n")
+    w(f"Stream length: **{requested}** per dataset. Objective: ARI over the whole stream. "
+      f"Sets are chosen on tuning seed {TUNE_SEED}; every reported score is the mean over "
+      f"fresh runs under seeds {list(FINAL_SEEDS)} (their own permutations). Scores are "
+      f"pooled across datasets by **{pool}** (`--aggregate {aggregate}`).\n\n")
+    w(f"Datasets ({len(folds)}): {', '.join(folds)}\n\n")
+    w("Every arm ends with **one set per algorithm**, run unchanged on every dataset.\n\n"
+      "| arm | grid | how the one set is chosen |\n|---|---|---|\n"
+      f"| arm 1 | raw | best {pool} over all datasets |\n"
+      "| arm 2 | raw | leave-one-dataset-out; the set most rounds picked |\n"
+      "| arm 3 | substituted (`c * s(D)`, micro-ratio) | as arm 2; the set is dimensionless "
+      "and resolves per dataset |\n"
+      "| P2R | substituted | shape as arm 3, rule's phi on all datasets; the resolution level "
+      "is read off each dataset's own label-free curve |\n"
+      f"| sf-all | substituted | best {pool} over all datasets (arm 1 on the substituted grid) |\n\n"
+      "All arms use the labels of all datasets to choose, so their scores on those same "
+      "datasets (section 2) are **in-sample**. What a procedure is worth on a dataset it "
+      "never saw is its **LODO estimate** (section 3).\n")
     w(_grid_section(algos, grids_spec, grids, rejected, tuned_of))
 
-    # -- main table
-    w("\n## 1. Scores\n\n")
-    w("| algo | fold | default | **arm 1** | **arm 2** | **arm 3** | sf oracle | "
-      "arm 1 pick | arm 3 pick |\n|---|---|---|---|---|---|---|---|---|\n")
+    # -- the sets
+    w("\n## 1. The one set each arm ships\n\n")
+    for algo in algos:
+        w(f"### {algo}\n\n| arm | set | how it was reached |\n|---|---|---|\n")
+        for p in ships:
+            info = finals.get(p, {}).get(algo)
+            if info is None:
+                w(f"| {arm_label(p)} | - | no set: nothing eligible on every dataset |\n")
+                continue
+            cand = info["config"]
+            if p.startswith("p2r_"):
+                axis = GRAN[algo][0]
+                shape = spec_label(cand, grids_spec, tuned_of[algo], level=False)
+                levels = ", ".join(
+                    f"{f}: {_level_value(grids_spec, algo, lv)}"
+                    for f, lv in sorted(info["levels"].items())
+                ) or "-"
+                phi = "" if info["phi"] is None else f"phi={_fmt_value(info['phi'])}; "
+                how = (f"shape picked by {info['votes']}/{info['rounds']} rounds; "
+                       f"{phi}`{axis}` per dataset -> {levels}")
+                w(f"| {arm_label(p)} | {shape}; `{axis}` by {info['rule']} on "
+                  f"{info['criterion']} | {how} |\n")
+                continue
+            if p == "default":
+                how = "River constructor"
+            elif "votes" in info:
+                how = f"picked by {info['votes']}/{info['rounds']} LODO rounds"
+            else:
+                how = f"best {pool} over {len(folds)} datasets"
+            w(f"| {arm_label(p)} | {spec_label(cand, grids_spec, tuned_of[algo])} | {how} |\n")
+        w("\n")
+
+    # -- the sets on every dataset
+    w("\n## 2. The set on every dataset (in-sample)\n\n")
+    head = ["algo", "dataset"] + [arm_label(p) for p in ships]
+    w("| " + " | ".join(head) + " |\n|" + "---|" * len(head) + "\n")
     for algo in algos:
         for fold in folds:
-            w(f"| {algo} | {fold} | {_f(cell(algo, fold, 'default'))} | "
-              f"**{_f(cell(algo, fold, 'arm1_raw_oracle'))}** | "
-              f"**{_f(cell(algo, fold, 'arm2_raw_lodo'))}** | "
-              f"**{_f(cell(algo, fold, 'arm3_sf_lodo'))}** | "
-              f"{_f(cell(algo, fold, 'sf_oracle'))} | "
-              f"{picked(algo, fold, 'arm1_raw_oracle')} | "
-              f"{picked(algo, fold, 'arm3_sf_lodo')} |\n")
+            w(f"| {algo} | {fold} | " + " | ".join(_f(cell(algo, fold, p)) for p in ships) + " |\n")
         w(f"| **{algo}** | **mean** | "
-          + " | ".join(f"**{_f(mean_of(algo, p))}**"
-                       for p in ("default", "arm1_raw_oracle", "arm2_raw_lodo",
-                                 "arm3_sf_lodo", "sf_oracle"))
-          + " | | |\n")
-    failures = scores[scores.n_final_ok < len(FINAL_SEEDS)]
+          + " | ".join(mean_cell(algo, p) for p in ships) + " |\n")
+    w("\nThreshold each set resolves to, per dataset (substituted sets differ by dataset "
+      "by design):\n\n")
+    head = ["algo", "dataset"] + [arm_label(p) for p in ships if p != "default"]
+    w("| " + " | ".join(head) + " |\n|" + "---|" * len(head) + "\n")
+    for algo in algos:
+        for fold in folds:
+            w(f"| {algo} | {fold} | "
+              + " | ".join(_fmt_value(cell(algo, fold, p, "value")) if (algo, fold, p) in by
+                           else "-" for p in ships if p != "default") + " |\n")
+    finals_rows = scores[scores.protocol.isin(ships)]
+    failures = finals_rows[finals_rows.n_final_ok < len(FINAL_SEEDS)]
     if len(failures):
         w("\nRuns that did not complete (counted as failures, not dropped):\n\n")
         for r in failures.itertuples(index=False):
-            w(f"- {r.algo} / {r.dataset} / {ARM_LABEL.get(r.protocol, r.protocol)}: "
-              f"status `{r.final_status}`\n")
+            w(f"- {r.algo} / {r.dataset} / {arm_label(r.protocol)}: status `{r.final_status}`\n")
+    missing = [(a, p) for a in algos for p in p2r_names if n_scored(a, p) < len(folds)]
+    if missing:
+        w("\nA P2R policy scores no value on a dataset where its curve is broken (a failed "
+          "rung, or an infinite silhouette); compare the counts before the means: "
+          + ", ".join(f"{a} {arm_label(p)} {n_scored(a, p)}/{len(folds)}" for a, p in missing)
+          + ".\n")
 
-    # -- headline
-    w("\n## 2. The arms against each other\n\n")
-    w("| algo | arm 2 - arm 1 | arm 3 - arm 1 | arm 3 - arm 2 | folds arm 3 >= arm 2 | "
-      "grid design: sf oracle - arm 1 | LODO cost, substituted: arm 3 - sf oracle | "
-      "LODO cost, raw: arm 2 - arm 1 |\n|---|---|---|---|---|---|---|---|\n")
-    for algo in algos:
-        a1 = np.array([cell(algo, f, "arm1_raw_oracle") for f in folds])
-        a2 = np.array([cell(algo, f, "arm2_raw_lodo") for f in folds])
-        a3 = np.array([cell(algo, f, "arm3_sf_lodo") for f in folds])
-        sfo = np.array([cell(algo, f, "sf_oracle") for f in folds])
-        both = np.isfinite(a2) & np.isfinite(a3)
-        with np.errstate(all="ignore"):
-            w(f"| {algo} | {_f(_nanmean(a2 - a1))} | {_f(_nanmean(a3 - a1))} | "
-              f"{_f(_nanmean(a3 - a2))} | {int((a3[both] >= a2[both]).sum())}/{int(both.sum())} | "
-              f"{_f(_nanmean(sfo - a1))} | {_f(_nanmean(a3 - sfo))} | "
-              f"{_f(_nanmean(a2 - a1))} |\n")
-    w("\nHow to read it. Arm 1 sees the scored fold's labels; arms 2 and 3 do not, so "
-      "matching arm 1 is already a win for them. *Arm 3 - arm 2* is the effect of the "
-      "substitutes alone: same selection rule, same budget, only the units differ. "
-      "*Grid design* says whether the substituted grid finds better configs when both may "
-      "look at the fold. The two *LODO cost* columns say what not looking costs under each "
-      "grid: if it is much smaller with substitutes than in raw units, the substitutes are "
-      "what makes transfer work -- the pipeline's central claim.\n")
+    w("\nDifferences below are means over the datasets where both sides have a score.\n")
+    w("\n| algo | arm 3 - arm 2 | sf-all - arm 1 | arm 2 - arm 1 | arm 3 - sf-all |"
+      + "".join(f" {arm_label(p)} - arm 3 |" for p in p2r_names)
+      + "\n|" + "---|" * (5 + len(p2r_names)) + "\n")
+    with np.errstate(all="ignore"):
+        for algo in algos:
+            a1, a2, a3 = (vec(algo, p) for p in ("arm1_raw_all", "arm2_raw_lodo", "arm3_sf_lodo"))
+            sfa = vec(algo, "sf_all")
+            w(f"| {algo} | {_f(_nanmean(a3 - a2))} | {_f(_nanmean(sfa - a1))} | "
+              f"{_f(_nanmean(a2 - a1))} | {_f(_nanmean(a3 - sfa))} |"
+              + "".join(f" {_f(_nanmean(vec(algo, p) - a3))} |" for p in p2r_names) + "\n")
+    w("\n*Arm 3 - arm 2*: same selection, same budget, only the units differ -- the effect "
+      "of the substitutes. *sf-all - arm 1*: the same comparison when both simply take the "
+      "best set over all datasets. *Arm 2 - arm 1* and *arm 3 - sf-all*: what the LODO "
+      "consensus gives up against the plain best-over-all choice, per grid.\n")
 
-    if "arm3_sf_cross" in set(scores.protocol):
+    # -- LODO estimates
+    w("\n## 3. LODO estimate: the procedure on a dataset it never saw\n\n")
+    ests = [p for p in ("arm2_raw_lodo", "arm3_sf_lodo", *p2r_names) if p + EST in protocols]
+    if ests:
+        head = ["algo", "dataset"] + [arm_label(p) for p in ests]
+        w("In each round the set is chosen without the dataset in the row and scored on it.\n\n")
+        w("| " + " | ".join(head) + " |\n|" + "---|" * len(head) + "\n")
+        for algo in algos:
+            for fold in folds:
+                w(f"| {algo} | {fold} | "
+                  + " | ".join(_f(cell(algo, fold, p + EST)) for p in ests) + " |\n")
+            w(f"| **{algo}** | **mean** | "
+              + " | ".join(mean_cell(algo, p + EST) for p in ests) + " |\n")
+        w("\n| algo | arm | in-sample mean | LODO estimate | optimism |\n|---|---|---|---|---|\n")
+        for algo in algos:
+            for p in ests:
+                ins, est = mean_of(algo, p), mean_of(algo, p + EST)
+                w(f"| {algo} | {arm_label(p)} | {_f(ins)} | {_f(est)} | {_f(ins - est)} |\n")
+        w("\n*Optimism* is how much the in-sample score flatters the procedure. The LODO "
+          "estimate of arm 3 minus that of arm 2 is the honest version of the substitutes' "
+          "effect.\n")
+    if "arm3_sf_cross" + EST in protocols:
         w("\n### Leave-one-group-out\n\n"
           "| algo | arm 3 within group | arm 3 across groups | gap |\n|---|---|---|---|\n")
         for algo in algos:
-            within, across = mean_of(algo, "arm3_sf_lodo"), mean_of(algo, "arm3_sf_cross")
+            within = mean_of(algo, "arm3_sf_lodo" + EST)
+            across = mean_of(algo, "arm3_sf_cross" + EST)
             w(f"| {algo} | {_f(within)} | {_f(across)} | {_f(across - within)} |\n")
-        w("\nAcross groups is the honest transfer estimate: nothing from the held-out "
-          "fold's group is seen while tuning.\n")
-
-    p2r_names = sorted(p for p in set(scores.protocol) if p.startswith("p2r_"))
-    if p2r_names:
-        w("\n### P2R -- re-pick the level on each fold with a label-free rule\n\n")
-        w("Arm 3 carries one substituted configuration to the held-out fold. P2R carries "
-          "the shape point (chosen by LODO on best-over-level ARI) and a *rule*: the level "
-          "is chosen again on the held-out fold from its own label-free curve at that "
-          "shape; only the rule's phi (R_parsimony) is fitted, on the other folds of the "
-          "group. No label of the held-out fold is read, so P2R is as deployable as arm 3.\n\n")
-        w("| algo | reading | mean ARI | minus arm 1 | minus arm 3 | folds picked | picks |\n"
-          "|---|---|---|---|---|---|---|\n")
-        with np.errstate(all="ignore"):
-            for algo in algos:
-                a1 = np.array([cell(algo, f, "arm1_raw_oracle") for f in folds])
-                a3 = np.array([cell(algo, f, "arm3_sf_lodo") for f in folds])
-                for p in p2r_names:
-                    rows = of(algo, p)
-                    vals = np.array([cell(algo, f, p) for f in folds])
-                    shown = ", ".join(f"{r.dataset}:t{int(r.theta)}L{int(r.level)}"
-                                      for r in rows.itertuples())
-                    w(f"| {algo} | {p[len('p2r_'):]} | {_f(_nanmean(vals))} | "
-                      f"{_f(_nanmean(vals - a1))} | {_f(_nanmean(vals - a3))} | "
-                      f"{len(rows)}/{len(folds)} | {shown or '-'} |\n")
-        w("\nA fold with no pick has a broken curve there (a failed rung, or an infinite "
-          "silhouette) and drops out of that reading's mean -- compare the counts before "
-          "comparing the means. Pre-registered expectation (rules.py): R_max on "
-          "matr_trace_win picks the finest level and loses; R_max on silhouette does not "
-          "degenerate.\n")
 
     # -- checks
-    w("\n## 3. Health of each grid\n")
+    w("\n## 4. Health\n")
     verdicts = {}
     ok_tune = _ok(tune)
 
-    w("\n### 3a. Does the grid separate configurations beyond seed noise?\n\n")
-    w("Spread = max - min ARI over the grid (tuning seed). Noise = std of the oracle "
-      "pick over all three seeds.\n\n"
+    w("\n### 4a. Does the grid separate configurations beyond seed noise?\n\n")
+    w("Spread = max - min ARI over the grid on one dataset (tuning seed). Noise = std over "
+      "three seeds of that dataset's best config.\n\n"
       "| algo | grid | median spread | median noise | ratio | verdict |\n|---|---|---|---|---|---|\n")
     for algo in algos:
-        for grid, protocol in (("raw", "arm1_raw_oracle"), ("ladder", "sf_oracle")):
+        for grid, protocol in (("raw", "ceiling_raw"), ("ladder", "ceiling_sf")):
             sub = ok_tune[(ok_tune.algo == algo) & (ok_tune.grid == grid)]
             spread = sub.groupby("dataset")[OBJ].agg(lambda s: s.max() - s.min())
             med_s = float(spread.median()) if len(spread) else np.nan
@@ -960,95 +1164,103 @@ def build_report(tune, scores, folds, probes, requested, grids, grids_spec, reje
             else:
                 ratio = med_s / med_n if med_n > 0 else np.inf
             good = bool(np.isfinite(med_s) and med_s > 0 and ratio >= MIN_SPREAD_TO_NOISE)
-            verdicts[f"3a {algo} {grid}"] = good
+            verdicts[f"4a {algo} {grid}"] = good
             w(f"| {algo} | {grid} | {_f(med_s)} | {_f(med_n)} | {_f(ratio, 1)} | "
               f"{'PASS' if good else 'FAIL'} |\n")
-    w(f"\nPASS needs ratio >= {MIN_SPREAD_TO_NOISE}. A FAIL means picking on this grid is "
-      "mostly picking noise.\n")
+    w(f"\nPASS needs ratio >= {MIN_SPREAD_TO_NOISE}. A FAIL means choosing on this grid is "
+      "mostly choosing noise.\n")
 
-    w("\n### 3b. Does the oracle optimum sit at an end of the resolution axis?\n\n")
-    w("| algo | grid | endpoint picks | share | verdict |\n|---|---|---|---|---|\n")
+    w("\n### 4b. Does an optimum sit at an end of the resolution axis?\n\n")
+    w("| algo | grid | per-dataset optima at an end | share | verdict | shipped sets at an end |\n"
+      "|---|---|---|---|---|---|\n")
     for algo in algos:
-        for grid, protocol in (("raw", "arm1_raw_oracle"), ("ladder", "sf_oracle")):
+        for grid, ceiling, shipped in (("raw", "ceiling_raw", ("arm1_raw_all", "arm2_raw_lodo")),
+                                       ("ladder", "ceiling_sf", ("sf_all", "arm3_sf_lodo"))):
             n_levels = len(grids_spec[algo]["levels"][grid])
-            levels = of(algo, protocol).level.dropna()
+            levels = of(algo, ceiling).level.dropna()
             hits = int(levels.isin([1, n_levels]).sum())
             share = hits / len(levels) if len(levels) else np.nan
             good = bool(share < MAX_ENDPOINT_SHARE)
-            verdicts[f"3b {algo} {grid}"] = good
+            verdicts[f"4b {algo} {grid}"] = good
+            at_end = [arm_label(p) for p in shipped
+                      if p in finals and algo in finals[p]
+                      and finals[p][algo]["config"]["granularity_level"] in (1, n_levels)]
             w(f"| {algo} | {grid} | {hits}/{len(levels)} | {_f(share, 2)} | "
-              f"{'PASS' if good else 'FAIL'} |\n")
+              f"{'PASS' if good else 'FAIL'} | {', '.join(at_end) or 'none'} |\n")
     w(f"\nPASS needs share < {MAX_ENDPOINT_SHARE}. An optimum at an end means the true "
-      "optimum may lie outside the axis, so that grid's score is only a floor.\n")
+      "optimum may lie outside the axis.\n")
 
-    w("\n### 3c. Winner's curse: tuning score vs. fresh re-run\n\n")
-    w("| algo | arm 1: mean(tune - re-run) | max | sf oracle: mean | max |\n"
-      "|---|---|---|---|---|\n")
+    w("\n### 4c. Winner's curse: tuning score vs. fresh re-run of the shipped set\n\n")
+    w("| algo | arm | mean(tune - re-run) | max |\n|---|---|---|---|\n")
     for algo in algos:
-        g1 = of(algo, "arm1_raw_oracle").pipe(lambda d: d.tune_ari - d.final_ari)
-        g2 = of(algo, "sf_oracle").pipe(lambda d: d.tune_ari - d.final_ari)
-        w(f"| {algo} | {_f(float(g1.mean()))} | {_f(float(g1.max()))} | "
-          f"{_f(float(g2.mean()))} | {_f(float(g2.max()))} |\n")
-    w("\nLarge means the tuning score was partly a lucky permutation -- and grid search "
-      "reported without a re-run would publish exactly that number.\n")
+        for p in ("arm1_raw_all", "sf_all"):
+            gap = of(algo, p).pipe(lambda d: d.tune_ari - d.final_ari)
+            w(f"| {algo} | {arm_label(p)} | {_f(float(gap.mean()))} | {_f(float(gap.max()))} |\n")
+    w("\nLarge means the set won partly on a lucky permutation, and a grid search reported "
+      "without a re-run would publish exactly that number.\n")
 
-    w("\n### 3d. Does a single configuration transfer?\n\n")
-    w("| algo | distinct arm 2 picks | distinct arm 3 picks | arm 3 pick = sf-oracle pick | "
-      "arm 3 level = sf-oracle level |\n|---|---|---|---|---|\n")
+    w("\n### 4d. How much do the LODO rounds agree?\n\n")
+    w("| algo | arm | distinct sets over the rounds | votes for the shipped set |\n"
+      "|---|---|---|---|\n")
     for algo in algos:
-        a3 = of(algo, "arm3_sf_lodo").set_index("dataset")
-        sfo = of(algo, "sf_oracle").set_index("dataset")
-        common = a3.index.intersection(sfo.index)
-        same_cfg = int((a3.loc[common, "config_id"] == sfo.loc[common, "config_id"]).sum())
-        same_lvl = int((a3.loc[common, "level"] == sfo.loc[common, "level"]).sum())
-        w(f"| {algo} | {of(algo, 'arm2_raw_lodo').config_id.nunique()} | "
-          f"{a3.config_id.nunique()} | {same_cfg}/{len(common)} | {same_lvl}/{len(common)} |\n")
+        for p in ("arm2_raw_lodo", "arm3_sf_lodo", *p2r_names):
+            info = finals.get(p, {}).get(algo)
+            rounds = of(algo, p + EST)
+            if info is None or rounds.empty:
+                continue
+            distinct = (rounds.theta.nunique() if p.startswith("p2r_")
+                        else rounds.config_id.nunique())
+            what = "shapes" if p.startswith("p2r_") else "sets"
+            w(f"| {algo} | {arm_label(p)} | {distinct} {what} | "
+              f"{info['votes']}/{info['rounds']} |\n")
+    w("\nFew votes for the shipped set means no single set transfers; the consensus is "
+      "then a weak choice and the LODO estimate is the number to trust.\n")
 
     scaled = [a for a in algos if GRAN[a][1] == "scaled"]
     if scaled:
-        w("\n### 3e. Does s(D) make the threshold transferable?\n\n")
-        w("Best threshold per fold (sf oracle), spread across folds.\n\n"
-          "| algo | CV(c*) | CV(threshold*) | verdict |\n|---|---|---|---|\n")
+        w("\n### 4e. Does s(D) make the threshold transferable?\n\n")
+        w("Best threshold per dataset (substituted grid, per-dataset optimum), spread across "
+          "datasets.\n\n| algo | CV(c*) | CV(threshold*) | verdict |\n|---|---|---|---|\n")
         for algo in scaled:
-            # On a fold where every rung ties, the tie-break alone picks the
+            # On a dataset where every rung ties, the tie-break alone picks the
             # level; counting it would fake a perfectly stable optimum.
             sub = ok_tune[(ok_tune.algo == algo) & (ok_tune.grid == "ladder")]
             spread = sub.groupby("dataset")[OBJ].agg(lambda s: s.max() - s.min())
             separating = set(spread[spread > 0].index)
-            o = of(algo, "sf_oracle").dropna(subset=["g"])
+            o = of(algo, "ceiling_sf").dropna(subset=["g"])
             o = o[o.dataset.isin(separating)]
             if len(o) < 2:
-                verdicts[f"3e {algo}"] = False
-                w(f"| {algo} | - | - | FAIL -- fewer than 2 folds where the ladder "
+                verdicts[f"4e {algo}"] = False
+                w(f"| {algo} | - | - | FAIL -- fewer than 2 datasets where the ladder "
                   "separates configs |\n")
                 continue
             cv_c, cv_abs = _cv(o.g), _cv(o.value)
             good = bool(np.isfinite(cv_c) and cv_c < cv_abs)
-            verdicts[f"3e {algo}"] = good
+            verdicts[f"4e {algo}"] = good
             w(f"| {algo} | {_f(cv_c)} | {_f(cv_abs)} | {'PASS' if good else 'FAIL'} "
-              f"({len(o)} folds) |\n")
-        w("\nIf the optimum does not vary less on `c` than in raw units, LODO over `c` has "
-          "no more basis than LODO over the raw threshold.\n")
+              f"({len(o)} datasets) |\n")
+        w("\nIf the optimum does not vary less on `c` than in raw units, one `c` for every "
+          "dataset has no more basis than one raw threshold.\n")
 
-    w("\n### 3f. Does any arm beat River's default?\n\n")
-    w("| algo | arm 1 - default | arm 2 - default | arm 3 - default | folds where arm 3 < default |\n"
-      "|---|---|---|---|---|\n")
+    w("\n### 4f. Does any shipped set beat River's default?\n\n")
+    tuned_arms = [p for p in ships if p != "default"]
+    w("| algo | " + " | ".join(f"{arm_label(p)} - default" for p in tuned_arms)
+      + " |\n|---|" + "---|" * len(tuned_arms) + "\n")
     for algo in algos:
-        d = np.array([cell(algo, f, "default") for f in folds])
-        a1 = np.array([cell(algo, f, "arm1_raw_oracle") for f in folds])
-        a2 = np.array([cell(algo, f, "arm2_raw_lodo") for f in folds])
-        a3 = np.array([cell(algo, f, "arm3_sf_lodo") for f in folds])
+        d = vec(algo, "default")
         with np.errstate(all="ignore"):
-            w(f"| {algo} | {_f(_nanmean(a1 - d))} | {_f(_nanmean(a2 - d))} | "
-              f"{_f(_nanmean(a3 - d))} | {int(np.nansum(a3 < d))}/{len(folds)} |\n")
+            w(f"| {algo} | " + " | ".join(
+                f"{_f(_nanmean(vec(algo, p) - d))} ({int(np.nansum(vec(algo, p) < d))} "
+                f"datasets worse)" for p in tuned_arms) + " |\n")
 
-    w("\n### 3g. Do the arms crown the same algorithm?\n\n")
+    w("\n### 4g. Do the arms crown the same algorithm?\n\n")
     if len(algos) < 2:
         w("Needs two algorithms.\n")
     else:
-        w("| fold | default | arm 1 | arm 2 | arm 3 | all three agree |\n|---|---|---|---|---|---|\n")
+        arms = [p for p in ("arm1_raw_all", "arm2_raw_lodo", "arm3_sf_lodo") if p in protocols]
+        w("| dataset | default | " + " | ".join(arm_label(p) for p in arms)
+          + " | agree |\n|---|---|" + "---|" * len(arms) + "---|\n")
         agree = total = 0
-        arms = ("arm1_raw_oracle", "arm2_raw_lodo", "arm3_sf_lodo")
         for fold in folds:
             winners = {}
             for p in ("default", *arms):
@@ -1062,35 +1274,69 @@ def build_report(tune, scores, folds, probes, requested, grids, grids_spec, reje
                 agree += int(same)
             w(f"| {fold} | {winners['default'] or '-'} | " + " | ".join(n or "-" for n in named)
               + f" | {'yes' if same else 'no'} |\n")
-        w(f"\nAgreement: **{agree}/{total}**. Low agreement means the choice of HPO method "
-          "changes which algorithm wins, so a benchmark built on one of them is fragile.\n")
+        w(f"\nAgreement: **{agree}/{total}**. Low agreement means the tuning method changes "
+          "which algorithm wins, so a benchmark built on one of them is fragile.\n")
 
-    w("\n## 4. Read these numbers with\n\n")
+    w("\n## 5. Read these numbers with\n\n")
     dominated = [f for f in folds if probes[f].get("one_d_dominated")]
-    w(f"- **1-D dominated folds** (raw units, top-1 variance share > 0.9): "
+    w(f"- **1-D dominated datasets** (raw units, top-1 variance share > 0.9): "
       f"{', '.join(dominated) or 'none'}. Comparisons there describe one axis only.\n")
-    w("- Fold scales s(D): " + ", ".join(f"{f}={probes[f]['s']:.3g}" for f in folds)
-      + ". A raw threshold grid is fine-grained on one fold and coarse on another.\n")
+    w("- Dataset scales s(D): " + ", ".join(f"{f}={probes[f]['s']:.3g}" for f in folds)
+      + ". One raw threshold is fine-grained on one dataset and coarse on another.\n")
+    if aggregate == "mean":
+        w("- Pooling by mean ARI lets a dataset with large ARI (kdd99) decide the set for "
+          "all of them; `--aggregate rank` removes that.\n")
     by_group: dict[str, list[str]] = {}
     for f in folds:
         by_group.setdefault(FOLD_GROUPS.get(f, "other"), []).append(f)
-    w("- LODO (arms 2 and 3) tunes only on the held-out fold's own group -- "
-      + "; ".join(f"{g}: {', '.join(fs)}" for g, fs in by_group.items())
-      + ". Folds from one generator must not outvote the real ones.\n")
-    if "arm3_sf_cross" not in set(scores.protocol):
-        w("- Leave-one-group-out needs at least two groups; skipped for this run.\n")
+    w("- LODO rounds tune only on the held-out dataset's own group -- "
+      + "; ".join(f"{g}: {', '.join(fs)}" for g, fs in by_group.items()) + ".\n")
     w("- CluStream's resolution axis is a count and has no scale conversion; its substitute "
-      "is the micro-ratio only. For CluStream, arm 3 - arm 2 tests the micro-ratio and "
-      "nothing about s(D).\n")
-    w("- CluStream's offline phase is k-means and DenStream's is DBSCAN-like: an ARI "
-      "gap between the two partly compares the offline phases.\n")
-    w("- One tuning run per grid point, a handful of folds: a pilot check of direction, "
+      "is the micro-ratio only.\n")
+    w("- CluStream's offline phase is k-means and DenStream's is DBSCAN-like: an ARI gap "
+      "between the two partly compares the offline phases.\n")
+    w("- One tuning run per grid point and two scoring seeds: a pilot check of direction, "
       "not a statistical result.\n")
 
     w("\n## Verdict summary\n\n")
     for name, good in verdicts.items():
         w(f"- {name}: {'PASS' if good else 'FAIL'}\n")
     return "".join(out)
+
+
+def _level_value(grids_spec: dict, algo: str, level: int) -> str:
+    axis, kind = GRAN[algo]
+    value = grids_spec[algo]["levels"]["ladder"][level - 1]
+    return f"c={value:g}" if kind == "scaled" else f"{value:g}"
+
+
+def write_final_sets(path, finals, grids_spec, tuned_of, probes, folds) -> None:
+    """The shipped sets, machine-readable: the spec and what it resolves to per dataset."""
+    payload = {}
+    for protocol, per_algo in finals.items():
+        for algo, info in per_algo.items():
+            cand = info["config"]
+            entry = {
+                "arm": arm_label(protocol),
+                "set": spec_label(cand, grids_spec, tuned_of[algo],
+                                  level=not protocol.startswith("p2r_")),
+                "config_id": cand["config_id"],
+                "grid": cand["grid"],
+            }
+            for key in ("votes", "rounds", "rule", "criterion", "phi", "theta"):
+                if key in info:
+                    entry[key] = info[key]
+            if protocol.startswith("p2r_"):
+                entry["level_per_dataset"] = info["levels"]
+                entry["resolved"] = {}
+                for fold, level in info["levels"].items():
+                    cell = {**cand, "granularity_level": level,
+                            "g": grids_spec[algo]["levels"]["ladder"][level - 1]}
+                    entry["resolved"][fold] = resolve_candidate(cell, probes[fold])
+            else:
+                entry["resolved"] = {f: resolve_candidate(cand, probes[f]) for f in folds}
+            payload.setdefault(algo, {})[protocol] = entry
+    path.write_text(json.dumps(payload, indent=2, sort_keys=True, default=str), encoding="utf-8")
 
 
 # --- main ------------------------------------------------------------------
@@ -1127,6 +1373,13 @@ def main() -> None:
     )
     parser.add_argument("--dry-run", action="store_true",
                         help="list the runs that would execute, run nothing, write nothing")
+    parser.add_argument(
+        "--aggregate",
+        choices=AGGREGATES,
+        default="mean",
+        help="how scores are pooled across datasets when one set is chosen: mean ARI, or "
+        "mean per-dataset rank (one easy dataset cannot outvote the others)",
+    )
     parser.add_argument(
         "--p2r",
         default=P2R_DEFAULT,
@@ -1201,7 +1454,7 @@ def main() -> None:
     df = load_runs(requested, grid_of, candidates, probes)
     tune = df[(df.seed == TUNE_SEED) & (df.grid != "default")
               & df.algo.isin(algos) & df.dataset.isin(folds)]
-    picks = all_picks(tune, grids, defaults, algos, folds, groups, p2r)
+    picks, finals = all_picks(tune, grids, defaults, algos, folds, groups, p2r, args.aggregate)
 
     if running:
         wanted = {
@@ -1230,13 +1483,16 @@ def main() -> None:
 
     scores = score_table(df, picks, probes, tuned_of)
     OUT_DIR.mkdir(parents=True, exist_ok=True)
-    scores.to_csv(OUT_DIR / f"scores_{requested}.csv", index=False)
+    tag = f"{requested}" if args.aggregate == "mean" else f"{requested}_{args.aggregate}"
+    scores.to_csv(OUT_DIR / f"scores_{tag}.csv", index=False)
+    write_final_sets(OUT_DIR / f"final_sets_{tag}.json", finals, grids_spec, tuned_of,
+                     probes, folds)
     _ok(tune).pivot_table(
         index=["algo", "grid", "dataset", "theta"], columns="granularity_level", values=OBJ
     ).to_csv(OUT_DIR / f"tune_grid_{requested}.csv")
     report = build_report(tune, scores, folds, probes, requested, grids, grids_spec,
-                          rejected, tuned_of)
-    path = OUT_DIR / ("report.md" if requested == "full" else f"report_{requested}.md")
+                          rejected, tuned_of, finals, args.aggregate)
+    path = OUT_DIR / ("report.md" if tag == "full" else f"report_{tag}.md")
     path.write_text(report, encoding="utf-8")
     print(f"wrote {path}")
 

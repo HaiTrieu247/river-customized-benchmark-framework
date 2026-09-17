@@ -267,3 +267,107 @@ def test_pending_does_not_retry_a_key_whose_retry_already_succeeded():
 def test_describe_names_the_tuned_values_and_their_origin():
     assert hpo_compare.describe(_job("x")) == (
         "beta=0.75, epsilon=680.2, mu=2 [ladder L3 t1 c=0.8]")
+
+
+# --- one set per arm -----------------------------------------------------------
+def _pool_rows():
+    # kdd-like fold with large ARI prefers c1; the two others prefer c2 by a little.
+    return _tune([
+        ("A", "big", "c1", 1, 1, 0.90, "ok"), ("A", "big", "c2", 2, 1, 0.10, "ok"),
+        ("A", "s1", "c1", 1, 1, 0.00, "ok"), ("A", "s1", "c2", 2, 1, 0.05, "ok"),
+        ("A", "s2", "c1", 1, 1, 0.00, "ok"), ("A", "s2", "c2", 2, 1, 0.05, "ok"),
+    ])
+
+
+def test_pick_all_returns_one_set_per_algorithm():
+    tune = _pool_rows()
+    assert hpo_compare.pick_all(tune, ["big", "s1", "s2"]) == {"A": "c1"}
+
+
+def test_rank_pooling_stops_one_easy_dataset_outvoting_the_rest():
+    tune = _pool_rows()
+    assert hpo_compare.pick_all(tune, ["big", "s1", "s2"], how="rank") == {"A": "c2"}
+
+
+def test_pick_all_skips_configs_that_did_not_run_everywhere():
+    tune = _tune([
+        ("A", "f1", "c1", 1, 1, 0.3, "ok"), ("A", "f1", "c2", 2, 1, 0.9, "ok"),
+        ("A", "f2", "c1", 1, 1, 0.3, "ok"), ("A", "f2", "c2", 2, 1, 0.9, "timeout"),
+    ])
+    assert hpo_compare.pick_all(tune, ["f1", "f2"]) == {"A": "c1"}
+
+
+def test_aggregate_rejects_unknown_pooling():
+    with pytest.raises(ValueError):
+        hpo_compare._aggregate(_pool_rows(), ["big"], how="median")
+
+
+def test_consensus_ships_the_set_most_rounds_picked():
+    lodo = {("A", "f1"): "c2", ("A", "f2"): "c1", ("A", "f3"): "c2"}
+    tune = _tune([("A", f, c, lv, 1, 0.5, "ok")
+                  for f in ("f1", "f2", "f3") for c, lv in (("c1", 1), ("c2", 2))])
+    assert hpo_compare.consensus(tune, lodo, ["f1", "f2", "f3"]) == {"A": ("c2", 2, 3)}
+
+
+def test_consensus_breaks_a_tie_by_the_pooled_score():
+    lodo = {("A", "f1"): "c1", ("A", "f2"): "c2"}
+    tune = _tune([
+        ("A", "f1", "c1", 1, 1, 0.1, "ok"), ("A", "f1", "c2", 2, 1, 0.4, "ok"),
+        ("A", "f2", "c1", 1, 1, 0.1, "ok"), ("A", "f2", "c2", 2, 1, 0.4, "ok"),
+    ])
+    assert hpo_compare.consensus(tune, lodo, ["f1", "f2"])["A"] == ("c2", 1, 2)
+
+
+def test_p2r_policy_fixes_the_shape_and_reads_the_level_per_dataset():
+    # Every round prefers theta=1; the criterion peaks at level 2 on f1, level 1 on f2.
+    rows = []
+    for d, crit in (("f1", (1.0, 2.0)), ("f2", (2.0, 1.0)), ("f3", (1.0, 2.0))):
+        rows += [("A", d, f"{d}a1", 1, 1, 0.5, "ok", crit[0]),
+                 ("A", d, f"{d}a2", 2, 1, 0.5, "ok", crit[1]),
+                 ("A", d, f"{d}b1", 1, 2, 0.1, "ok", 1.0),
+                 ("A", d, f"{d}b2", 2, 2, 0.1, "ok", 2.0)]
+    tune = _tune(rows)
+    folds = ["f1", "f2", "f3"]
+    est = hpo_compare.pick_p2r(tune, folds, None, "R_max", "matr_trace_win", 2)
+    policy = hpo_compare.p2r_policy(tune, folds, "R_max", "matr_trace_win", 2, est)["A"]
+    assert policy["theta"] == 1
+    assert (policy["votes"], policy["rounds"]) == (3, 3)
+    assert policy["levels"] == {"f1": 2, "f2": 1, "f3": 2}
+
+
+def test_all_picks_ships_the_same_set_on_every_dataset():
+    spec = hpo_compare.GRIDS["DenStream"]
+    grids = {"raw": {"DenStream": hpo_compare.build_grid("DenStream", "raw", spec)[0]},
+             "ladder": {"DenStream": hpo_compare.build_grid("DenStream", "ladder", spec)[0]}}
+    folds = ["f1", "f2", "f3"]
+    rows = []
+    for kind in ("raw", "ladder"):
+        for i, c in enumerate(grids[kind]["DenStream"]):
+            for j, f in enumerate(folds):
+                rows.append({"algo": "DenStream", "dataset": f, "config_id": c["config_id"],
+                             "granularity_level": c["granularity_level"], "theta": c["theta"],
+                             "ari": ((i * 7 + j * 3) % 11) / 10, "runtime_s": 1.0,
+                             "status": "ok", "grid": kind,
+                             "matr_trace_win": float(c["granularity_level"] * (j + 1))})
+    tune = pd.DataFrame(rows)
+    defaults = {"DenStream": hpo_compare.default_candidate("DenStream")}
+    picks, finals = hpo_compare.all_picks(tune, grids, defaults, ["DenStream"], folds,
+                                          {f: "real" for f in folds},
+                                          [("R_knee", "matr_trace_win")])
+    for arm in ("arm1_raw_all", "arm2_raw_lodo", "arm3_sf_lodo", "sf_all"):
+        ids = {picks[arm][("DenStream", f)]["config_id"] for f in folds}
+        assert ids == {finals[arm]["DenStream"]["config"]["config_id"]}, arm
+    # the LODO rounds are kept separately and may differ per dataset
+    assert set(picks["arm2_raw_lodo_est"]) == {("DenStream", f) for f in folds}
+    # P2R ships one shape; only the level may change between datasets
+    shapes = {picks["p2r_R_knee_matr_trace_win"][("DenStream", f)]["theta"] for f in folds}
+    assert shapes == {finals["p2r_R_knee_matr_trace_win"]["DenStream"]["theta"]}
+
+
+def test_spec_label_writes_substitutes_not_per_dataset_numbers():
+    spec = hpo_compare.GRIDS["DenStream"]
+    cand = hpo_compare.build_grid("DenStream", "ladder", spec)[0][0]
+    label = hpo_compare.spec_label(cand, hpo_compare.GRIDS, ["beta", "epsilon", "mu"])
+    assert label.startswith(f"epsilon = {cand['g']:g} * s(D)")
+    assert "beta=" in label and "mu=" in label
+    assert "epsilon" not in hpo_compare.spec_label(cand, hpo_compare.GRIDS, [], level=False)
