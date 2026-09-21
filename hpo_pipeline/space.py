@@ -99,7 +99,14 @@ def _choice(values):
 SHAPE: dict[str, dict] = {
     "CluStream": {
         "max_micro_clusters": _li(25, 800),
-        "time_gap": _li(50, 5000),
+        # Sec. 6.4 / Table 2: the maximal boundary factor, the ONE parameter the
+        # CluStream paper tabulates a sensitivity for. Exception rate is 14.9% at
+        # t=1, 1.6% at t=2, 0.18% at t=4 and then flat -- the curve moves below 2
+        # and stops moving above it, so the values span that and nothing more.
+        # It replaces `time_gap`, which has no analogue in the paper at all (the
+        # paper triggers the offline phase on demand, not on a period) and is
+        # therefore pinned in FIXED rather than searched.
+        "micro_cluster_r_factor": _choice([1, 2, 4, 8]),
     },
     "KMeans": {
         "halflife": _lu(0.01, 0.9),
@@ -117,8 +124,19 @@ SHAPE: dict[str, dict] = {
         "max_entries": _li(100, 4000),
     },
     "DenStream": {
-        "mu": _lu(1.5, 12),
-        "beta": _u(0.2, 1.0),
+        # Sec. 6.1: "after the setting of epsilon, mu can be heuristically set by
+        # the average number of points in the epsilon neighborhood". Lower bound
+        # is 2.1 rather than 1.5 so that beta*mu > 1 holds at the pinned beta --
+        # see FIXED and `_accepts`.
+        "mu": _lu(2.1, 12),
+        # The stream speed v. Not decoration: Sec. 3 fixes the total stream
+        # weight at W = v / (1 - 2^-lambda) and Sec. 4.1 caps the p-micro-cluster
+        # count at W/(beta*mu), so v multiplies straight into what the outlier
+        # threshold means. The paper runs v=1000 with mu=10, River defaults to
+        # v=100 with mu=2, and the two are not comparable for that reason. The
+        # range brackets both. It replaces `beta`, whose Fig. 20 plateau is
+        # already published (see FIXED).
+        "stream_speed": _li(50, 2000),
         "decaying_factor": _lu(0.05, 1.0),
         "n_samples_init": _choice([200, 500, 1000, 2000]),
     },
@@ -143,6 +161,29 @@ SHAPE: dict[str, dict] = {
 }
 
 
+#: Parameters held at a STATED value across the whole space: not searched, but
+#: not left to River's constructor either. The distinction matters. Dropping a
+#: dimension from `SHAPE` silently hands it to River's default, and for two of
+#: these that default is a value the source paper argues against:
+#:
+#:   DenStream `beta` -- Fig. 20 finds quality "very good" over [0.2, 0.6] and
+#:     "deteriorates greatly" at 1. River's default is 0.75, outside the band the
+#:     paper verified. Pinned at 0.5, the midpoint of that band. The pin is what
+#:     forces `mu >= 2.1`: River computes the pruning period as
+#:     log(beta*mu / (beta*mu - 1)), which needs beta*mu > 1.
+#:
+#:   CluStream `time_gap` -- River's own invention; the paper runs the offline
+#:     phase when the analyst asks, not on a period. Pinned at River's 100 so the
+#:     value is on the record rather than inherited.
+#:
+#: A pinned value is part of `shape`, so it reaches `config_id` and the run row:
+#: changing one here changes every config_id and invalidates the matrix.
+FIXED: dict[str, dict] = {
+    "DenStream": {"beta": 0.5},
+    "CluStream": {"time_gap": 100},
+}
+
+
 def _accepts(algo: str, shape: dict) -> bool:
     """Inter-parameter constraints, checked against the whole resolution ladder.
 
@@ -152,6 +193,12 @@ def _accepts(algo: str, shape: dict) -> bool:
     """
     if algo == "CluStream":
         return shape["max_micro_clusters"] >= max(COUNTS)
+    if algo == "DenStream":
+        # River computes the pruning period T_p as log(beta*mu / (beta*mu - 1)),
+        # which is undefined at beta*mu <= 1. Enforced here rather than assumed
+        # from the `mu` lower bound, so that moving either `mu` or the pinned
+        # `beta` cannot quietly generate an unrunnable point.
+        return shape["beta"] * shape["mu"] > 1
     return True
 
 
@@ -159,9 +206,10 @@ def shape_points(algo: str, n: int = N_SHAPE, seed: int = SPACE_SEED) -> list[di
     """``n`` Sobol points over the shape dimensions, rejecting invalid ones."""
     from scipy.stats import qmc
 
+    fixed = FIXED.get(algo, {})
     dims = sorted(SHAPE[algo])
     if not dims:
-        return [{} for _ in range(n)]
+        return [dict(fixed) for _ in range(n)]
 
     engine = qmc.Sobol(d=len(dims), scramble=True, seed=seed)
     out: list[dict] = []
@@ -170,7 +218,9 @@ def shape_points(algo: str, n: int = N_SHAPE, seed: int = SPACE_SEED) -> list[di
     drawn = engine.random(max(n, 16))
     while True:
         for row in drawn:
-            point = {d: SHAPE[algo][d](u) for d, u in zip(dims, row)}
+            # The pinned values join the point BEFORE the constraint check, so a
+            # constraint may read them (DenStream's beta*mu is exactly that).
+            point = {**fixed, **{d: SHAPE[algo][d](u) for d, u in zip(dims, row)}}
             if _accepts(algo, point):
                 out.append(point)
                 if len(out) == n:

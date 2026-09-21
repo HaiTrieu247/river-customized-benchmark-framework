@@ -136,6 +136,61 @@ def test_tuned_params_name_absolute_parameters():
     assert hpo_compare.tuned_params("DenStream", hpo_compare.GRIDS) == ["beta", "epsilon", "mu"]
 
 
+# --- collapsing the tuning seeds ---------------------------------------------
+def _seeded(rows):
+    """rows: (algo, dataset, config_id, seed, ari, status)."""
+    return pd.DataFrame([
+        {"algo": a, "dataset": d, "config_id": c, "seed": sd, "ari": v,
+         "granularity_level": 1, "theta": 1, "runtime_s": 1.0, "status": st,
+         "grid": "ladder"}
+        for a, d, c, sd, v, st in rows
+    ])
+
+
+def test_seed_mean_gives_one_row_per_cell_with_the_averaged_objective():
+    out = hpo_compare.seed_mean(_seeded([
+        ("A", "f1", "c1", 1, 0.2, "ok"), ("A", "f1", "c1", 2, 0.4, "ok"),
+        ("A", "f1", "c1", 3, 0.6, "ok"),
+        ("A", "f1", "c2", 1, 0.9, "ok"),
+    ]))
+    assert len(out) == 2
+    c1 = out[out.config_id == "c1"].iloc[0]
+    assert c1.ari == pytest.approx(0.4)
+    assert c1.n_tune_seeds == 3
+    assert c1.status == "ok"
+
+
+def test_seed_mean_marks_a_cell_that_failed_on_any_seed():
+    """Four good draws and one timeout is not a slightly worse config."""
+    out = hpo_compare.seed_mean(_seeded([
+        ("A", "f1", "c1", 1, 0.9, "ok"), ("A", "f1", "c1", 2, 0.9, "ok"),
+        ("A", "f1", "c1", 3, None, "timeout"),
+    ]))
+    row = out.iloc[0]
+    assert row.status == "timeout"
+    assert hpo_compare._ok(out).empty
+
+
+def test_seed_mean_keeps_the_identifying_columns():
+    out = hpo_compare.seed_mean(_seeded([
+        ("A", "f1", "c1", 1, 0.2, "ok"), ("A", "f1", "c1", 2, 0.4, "ok"),
+    ]))
+    assert out.iloc[0].grid == "ladder"
+    assert out.iloc[0].theta == 1
+    assert "seed" not in out.columns
+
+
+def test_tuning_and_scoring_seeds_do_not_overlap():
+    """A set re-run under a seed it was chosen on would score its own luck.
+
+    The SIZE of either tuple is a budget decision and is free to move; the
+    disjointness is not, because it is what makes the reported score a fresh
+    draw rather than a repeat of the selection.
+    """
+    assert not set(hpo_compare.TUNE_SEEDS) & set(hpo_compare.FINAL_SEEDS)
+    assert len(hpo_compare.FINAL_SEEDS) >= 5
+
+
 # --- selection ---------------------------------------------------------------
 def test_oracle_picks_best_config_on_the_fold_itself():
     tune = _tune([

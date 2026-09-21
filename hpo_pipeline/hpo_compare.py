@@ -36,10 +36,13 @@ and P2R therefore also report their **LODO estimate**: in every round the set
 chosen without a dataset is scored on that dataset. That estimate, not the
 in-sample score, is what the procedure is worth on a dataset it never saw.
 
-Tuning runs every grid point under seed 1. Every chosen set then runs again
-under seeds 2 and 3, each with its own permutation -- re-running under the
-tuning seed would only repeat the tuning score. River's default is scored the
-same way.
+Tuning runs every grid point under every seed in ``TUNE_SEEDS`` and selects on
+their mean (one seed at present -- see that constant for what it costs on
+KDDCup99). Every chosen set then runs again under each seed in ``FINAL_SEEDS``,
+which is disjoint from the tuning seeds -- re-running under a tuning seed would
+only repeat the tuning score. Each seed carries its own stream permutation, so
+one seed moves both the model and the arrival order. River's default is scored
+the same way.
 
 Run from the repo root::
 
@@ -91,8 +94,42 @@ from .space import GRAN, resolve
 from .stream import materialise
 
 ALGOS = ("CluStream", "DenStream")
-TUNE_SEED = 1
-FINAL_SEEDS = (2, 3)
+#: Tuning seeds. Every grid point runs under all of them and the cell is their
+#: MEAN (`seed_mean`), so the number of them is a budget dial, not a structural
+#: choice: the selection code never sees a seed either way.
+#:
+#: Currently ONE, which is a deliberate cost decision and not a claim that one
+#: draw is enough. Measured on the runs already on disk, |ARI(seed 1) - mean of
+#: two fresh seeds| over the re-run configs is:
+#:
+#:     covtype   0.0004      keystroke  0.0061      CluStream, all folds  0.0013
+#:     shuttle   0.0030      insects    0.0033      kdd99 (DenStream)     0.1112
+#:
+#: Four of the five folds are far below the gaps between the arms, so one seed
+#: costs nothing there. **KDDCup99 is not.** Its per-config spread over three
+#: seeds reaches sd = 0.18 (one configuration scored 0.071 / 0.086 / 0.392), and
+#: the arm-to-arm differences this pilot reports on that fold are 0.05 - 0.08 --
+#: smaller than the seed noise. A kdd99 pick is therefore a single draw of a
+#: quantity that moves more than the effect, and any reading of the kdd99 column
+#: has to say so. Raising this tuple to (1, 2, 3, 4, 5) cuts that by sqrt(5) and
+#: costs 480 extra tuning runs; nothing else in the module changes.
+#:
+#: Disjoint from `FINAL_SEEDS` by construction, and that is the whole point of
+#: having two sets: a chosen set re-run under a seed it was chosen on would just
+#: repeat its own selection luck, which is the number the split exists to avoid.
+TUNE_SEEDS = (1,)
+#: Scoring seeds. Each pairs a model seed with its own stream permutation
+#: (`shuffle_seed_for`), so one seed moves both and the spread over them is the
+#: total run-to-run variance, not half of it.
+#:
+#: Five, not two. With two draws the sample standard deviation has one degree of
+#: freedom: it is itself so noisy that "beats the default by 0.03 +/- 0.02" can
+#: mean anything, and the noise floor that health check 4a divides by is
+#: estimated from almost nothing. Five gives four degrees of freedom -- still
+#: small, but enough that a gap of the size this pilot reports stops being
+#: indistinguishable from permutation luck. The cost is linear in this number
+#: and falls on the SCORING phase only; tuning stays at one run per grid point.
+FINAL_SEEDS = (2, 3, 4, 5, 6)
 OBJ = "ari"
 
 OUT_DIR = HPO_OUT / "compare"
@@ -517,6 +554,49 @@ def load_runs(requested, grid_of: dict, candidates: dict, probes: dict) -> pd.Da
 
 
 # --- selection (pure: no runs, no files) -----------------------------------
+def seed_mean(frame: pd.DataFrame) -> pd.DataFrame:
+    """Collapse the tuning seeds of one cell into a single averaged row.
+
+    Every selection helper below -- ``_curve``, ``_ari_at``, ``_shape_scores``,
+    the argmax in ``_first`` -- is written against ONE row per
+    (algo, config_id, dataset). Handing them several seeds per cell does not
+    average anything: ``_curve`` would reindex on duplicate levels and raise,
+    ``_ari_at`` would silently return whichever seed happened to land first, and
+    ``_shape_scores`` would take its top-k across seeds as well as across rungs.
+
+    So the averaging happens once, here, at the boundary between "runs on disk"
+    and "selection", and the rest of the module keeps its one-row invariant.
+    This mirrors ``views._mbar`` in the main pipeline.
+
+    A cell is ``ok`` only if *every* tuning seed of it is. A config that fails on
+    one seed out of five is not a config that scored slightly lower; it is one
+    that cannot be relied on, and letting the surviving seeds average it into
+    contention would hide exactly that.
+    """
+    if frame.empty:
+        return frame
+    key = ["algo", "config_id", "dataset"]
+    measured = [
+        c for c in frame.columns
+        if c not in key and c != "seed" and pd.api.types.is_numeric_dtype(frame[c])
+    ]
+    grouped = frame.groupby(key, dropna=False)
+    out = grouped[measured].mean().reset_index()
+
+    # Identity travels from the first row: these describe the cell, and are the
+    # same on every seed of it by construction.
+    identity = [c for c in frame.columns if c not in measured and c not in ("seed", "status")]
+    out = out.merge(frame.drop_duplicates(subset=key, keep="first")[identity],
+                    on=key, how="left")
+
+    status = grouped["status"].agg(
+        lambda col: "ok" if set(col) == {"ok"} else ",".join(sorted(set(col) - {"ok"}))
+    ).rename("status").reset_index()
+    out = out.merge(status, on=key, how="left")
+    out = out.merge(grouped.size().rename("n_tune_seeds").reset_index(), on=key, how="left")
+    return out
+
+
 def _ok(df: pd.DataFrame) -> pd.DataFrame:
     return df[(df.status == "ok") & df[OBJ].notna()]
 
@@ -664,18 +744,39 @@ def _ari_at(tune: pd.DataFrame, algo: str, theta, fold: str, level: int) -> floa
     return float(hit.iloc[0]) if len(hit) else np.nan
 
 
+#: How many of a shape point's levels its profile score averages. A plain max
+#: over the ladder is the maximum of 8 estimates, so it carries a winner's curse
+#: even once each estimate is a mean over `TUNE_SEEDS`: averaging the seeds
+#: shrinks each rung's error bar, it does not stop the argmax from preferring
+#: whichever rung's residual error points up. Health check 4c measures what that
+#: cost at one seed -- DenStream's mean(tune - re-run) was 0.015 with a max of
+#: 0.061, the same size as the gaps between the arms. Averaging the best two
+#: rungs keeps the profile (each shape point is still judged at the resolution
+#: that suits it) while halving what is left of the bias. Two rather than three
+#: because the ladder is only 8 rungs long and the peak is often narrow.
+PROFILE_TOP_K = 2
+
+
 def _shape_scores(tune: pd.DataFrame, algo: str, folds_used: list[str],
                   how: str = "mean") -> dict:
-    """theta -> pooled best-over-levels score on ``folds_used`` (bigger is better).
+    """theta -> pooled top-``PROFILE_TOP_K``-levels score (bigger is better).
 
-    A shape point is judged by the best level it reaches on each dataset, since
-    P2R re-picks the level anyway. Datasets where a shape point never ran are
+    A shape point is judged by the levels it reaches on each dataset, since P2R
+    re-picks the level anyway. Datasets where a shape point never ran are
     skipped for that point, not counted as zero.
+
+    The profile is the *mean of the best ``PROFILE_TOP_K`` rungs*, not the max;
+    see that constant for why. With fewer rungs available the mean is taken over
+    what there is, so a short curve is not silently penalised.
     """
     ok = _ok(tune[(tune.algo == algo) & tune.dataset.isin(folds_used)])
     if ok.empty:
         return {}
-    best = ok.groupby(["theta", "dataset"])[OBJ].max().unstack("dataset")
+    best = (
+        ok.groupby(["theta", "dataset"])[OBJ]
+        .apply(lambda s: s.nlargest(min(PROFILE_TOP_K, len(s))).mean())
+        .unstack("dataset")
+    )
     if how == "rank":
         best = -best.rank(axis=0, ascending=False, method="average")
     pooled = best.mean(axis=1, skipna=True)
@@ -898,8 +999,8 @@ def score_table(df, picks, probes, tuned_of: dict) -> pd.DataFrame:
             ]
             final = cells[cells.seed.isin(FINAL_SEEDS)]
             final_ok = _ok(final)
-            tune_cell = _ok(cells[cells.seed == TUNE_SEED])
-            every_seed = _ok(cells[cells.seed.isin((TUNE_SEED, *FINAL_SEEDS))])
+            tune_cell = _ok(cells[cells.seed.isin(TUNE_SEEDS)])
+            every_seed = _ok(cells[cells.seed.isin((*TUNE_SEEDS, *FINAL_SEEDS))])
             axis = GRAN[algo][0]
             params = resolve_candidate(cand, probes[fold])
             rows.append(
@@ -917,8 +1018,9 @@ def score_table(df, picks, probes, tuned_of: dict) -> pd.DataFrame:
                     "picked": _tuned_label(cand, params, tuned_of[algo]),
                     "tune_ari": float(tune_cell[OBJ].iloc[0]) if len(tune_cell) else np.nan,
                     "final_ari": float(final_ok[OBJ].mean()) if len(final_ok) else np.nan,
-                    # Two scoring seeds alone understate the noise; the tuning
-                    # run is a third draw of the same config and belongs in it.
+                    # The tuning run is one more draw of the same config on its
+                    # own permutation, so it belongs in the spread too -- it is
+                    # only the *score* that must not come from the tuning seed.
                     "seed_std": float(every_seed[OBJ].std()) if len(every_seed) > 1 else np.nan,
                     "n_final_ok": len(final_ok),
                     "final_status": ",".join(sorted(set(final.status))) or "missing",
@@ -1016,7 +1118,8 @@ def build_report(tune, scores, folds, probes, requested, grids, grids_spec, reje
 
     w("# HPO pilot -- one hyperparameter set per arm\n\n")
     w(f"Stream length: **{requested}** per dataset. Objective: ARI over the whole stream. "
-      f"Sets are chosen on tuning seed {TUNE_SEED}; every reported score is the mean over "
+      f"Sets are chosen on the mean over tuning seeds {list(TUNE_SEEDS)}; every reported "
+      f"score is the mean over "
       f"fresh runs under seeds {list(FINAL_SEEDS)} (their own permutations). Scores are "
       f"pooled across datasets by **{pool}** (`--aggregate {aggregate}`).\n\n")
     w(f"Datasets ({len(folds)}): {', '.join(folds)}\n\n")
@@ -1148,8 +1251,9 @@ def build_report(tune, scores, folds, probes, requested, grids, grids_spec, reje
     ok_tune = _ok(tune)
 
     w("\n### 4a. Does the grid separate configurations beyond seed noise?\n\n")
-    w("Spread = max - min ARI over the grid on one dataset (tuning seed). Noise = std over "
-      "three seeds of that dataset's best config.\n\n"
+    n_seeds = len(TUNE_SEEDS) + len(FINAL_SEEDS)
+    w("Spread = max - min ARI over the grid on one dataset (mean over the tuning seeds). "
+      f"Noise = std over all {n_seeds} seeds of that dataset's best config.\n\n"
       "| algo | grid | median spread | median noise | ratio | verdict |\n|---|---|---|---|---|---|\n")
     for algo in algos:
         for grid, protocol in (("raw", "ceiling_raw"), ("ladder", "ceiling_sf")):
@@ -1295,8 +1399,8 @@ def build_report(tune, scores, folds, probes, requested, grids, grids_spec, reje
       "is the micro-ratio only.\n")
     w("- CluStream's offline phase is k-means and DenStream's is DBSCAN-like: an ARI gap "
       "between the two partly compares the offline phases.\n")
-    w("- One tuning run per grid point and two scoring seeds: a pilot check of direction, "
-      "not a statistical result.\n")
+    w(f"- {len(TUNE_SEEDS)} tuning runs per grid point and {len(FINAL_SEEDS)} scoring seeds "
+      "on a handful of datasets: a pilot check of direction, not a statistical result.\n")
 
     w("\n## Verdict summary\n\n")
     for name, good in verdicts.items():
@@ -1433,14 +1537,15 @@ def main() -> None:
     if running and not args.dry_run:
         print("materialising permutations")
         for fold in folds:
-            for seed in (TUNE_SEED, *FINAL_SEEDS):
+            for seed in (*TUNE_SEEDS, *FINAL_SEEDS):
                 materialise(fold, shuffle_seed_for(seed))
 
     if running and args.phase in ("all", "tune"):
-        print(f"tuning: {len(tuning)} grid points x {len(folds)} folds")
+        print(f"tuning: {len(tuning)} grid points x {len(folds)} folds "
+              f"x {len(TUNE_SEEDS)} seed(s) {list(TUNE_SEEDS)}")
         run_jobs(
-            [_job(c["algo"], c, f, TUNE_SEED, args.n_samples, probes, tuned_of[c["algo"]])
-             for c in tuning for f in folds],
+            [_job(c["algo"], c, f, seed, args.n_samples, probes, tuned_of[c["algo"]])
+             for c in tuning for f in folds for seed in TUNE_SEEDS],
             args.workers,
             args.timeout,
             retry_failed=args.retry_failed,
@@ -1452,8 +1557,19 @@ def main() -> None:
         return
 
     df = load_runs(requested, grid_of, candidates, probes)
-    tune = df[(df.seed == TUNE_SEED) & (df.grid != "default")
-              & df.algo.isin(algos) & df.dataset.isin(folds)]
+    # One averaged row per cell before any selection touches it; see `seed_mean`.
+    tune = seed_mean(df[df.seed.isin(TUNE_SEEDS) & (df.grid != "default")
+                        & df.algo.isin(algos) & df.dataset.isin(folds)])
+    # An older runs.jsonl holds scoring rows at seeds that are now tuning seeds,
+    # and it holds them only for the configs that were picked last time. Those
+    # cells would then be averaged over more draws than their competitors and
+    # would look steadier for a reason that is not about the configuration. The
+    # count is on every row, so say it rather than let it pass.
+    if "n_tune_seeds" in tune.columns and tune.n_tune_seeds.nunique() > 1:
+        counts = tune.n_tune_seeds.value_counts().sort_index()
+        print("WARNING: tuning cells are averaged over different numbers of seeds "
+              f"({dict(counts)}); expected {len(TUNE_SEEDS)} everywhere. Run "
+              "`--phase tune` to fill the gaps before trusting the picks.")
     picks, finals = all_picks(tune, grids, defaults, algos, folds, groups, p2r, args.aggregate)
 
     if running:

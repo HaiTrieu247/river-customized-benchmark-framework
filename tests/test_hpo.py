@@ -160,6 +160,34 @@ def test_clustream_shape_points_cover_the_whole_ladder():
         assert point["max_micro_clusters"] >= max(space.COUNTS)
 
 
+def test_denstream_shape_points_carry_the_pinned_beta():
+    """A dropped dimension must be pinned, not handed to River's default.
+
+    River's DenStream defaults to beta=0.75, which sits outside the [0.2, 0.6]
+    band Fig. 20 verified. Removing beta from the search without pinning it would
+    have silently moved every run there.
+    """
+    for point in space.shape_points("DenStream"):
+        assert point["beta"] == space.FIXED["DenStream"]["beta"]
+        # River's pruning period is log(beta*mu / (beta*mu - 1)).
+        assert point["beta"] * point["mu"] > 1
+
+
+def test_clustream_shape_points_carry_the_pinned_time_gap():
+    for point in space.shape_points("CluStream"):
+        assert point["time_gap"] == space.FIXED["CluStream"]["time_gap"]
+
+
+def test_pinned_values_reach_the_resolved_parameters():
+    """A pin is only real if it survives into what the model is built with."""
+    candidate = next(
+        c for c in space.build_space(["DenStream"])["DenStream"] if not c["is_default"]
+    )
+    params = space.resolve(candidate, {"s": 1.0})
+    assert params["beta"] == space.FIXED["DenStream"]["beta"]
+    assert "stream_speed" in params
+
+
 def test_config_id_is_stable_across_folds_but_params_are_not():
     candidate = space.build_space(["DBSTREAM"])["DBSTREAM"][0]
     coarse = space.resolve(candidate, {"s": 1.0})

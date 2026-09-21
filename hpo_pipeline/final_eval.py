@@ -60,7 +60,11 @@ ARM_NAMES = {
 }
 FINAL_SETS = HPO_OUT / "compare" / "final_sets_50000.json"
 RESULTS_JSONL = HPO_OUT / "final_eval" / "runs.jsonl"
-SEEDS = (2, 3)
+#: Scoring seeds, matching `hpo_compare.FINAL_SEEDS` exactly. They must stay
+#: disjoint from `hpo_compare.TUNE_SEEDS`: the sets evaluated here were chosen on
+#: those seeds, so re-running one of them would score a set on the draw that
+#: picked it. Move one of the two tuples and this one moves with it.
+SEEDS = (2, 3, 4, 5, 6)
 WINDOW_SIZE = 1000
 N_CHECKPOINTS = 40
 EXTERNAL_METRICS = ("ari", "nmi", "ami", "purity", "homogeneity", "completeness")

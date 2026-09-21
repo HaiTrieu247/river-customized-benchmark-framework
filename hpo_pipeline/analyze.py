@@ -49,6 +49,7 @@ from ._common import (
     require,
 )
 from .rules import RULES
+from .space import GRAN
 from .views import _table, p0, p1, p1_holdout, p2, p2_rule, panel
 
 #: Studentised range values at alpha=0.05 for the Nemenyi test, by k.
@@ -124,6 +125,130 @@ def variance_decomposition(df) -> pd.DataFrame:
                 "ss_interaction_share": ss_gxt / total,
             }
         )
+    return pd.DataFrame(rows)
+
+
+#: Rungs averaged to score one shape point, matching `hpo_compare.PROFILE_TOP_K`.
+#: A shape point is judged at the resolution that suits it, because P2R re-picks
+#: the resolution anyway -- but by the best two rungs rather than the best one,
+#: so the score is not the maximum of eight noisy draws.
+PROFILE_TOP_K = 2
+
+#: |rho| at which a Spearman correlation over N_SHAPE=8 points is significant at
+#: p < 0.05, two-tailed. Printed with the table because 8 points is few enough
+#: that anything below it is indistinguishable from noise, and a reader who does
+#: not know that will over-read the smaller numbers.
+RHO_SIGNIFICANT_AT_8 = 0.738
+
+
+def _profile_by_theta(grp) -> pd.Series:
+    """theta -> mean ARI of its best `PROFILE_TOP_K` resolution levels."""
+    cell = grp.groupby(["theta", "granularity_level"])["ari"].mean()
+    return cell.groupby("theta").apply(
+        lambda s: s.nlargest(min(PROFILE_TOP_K, len(s))).mean()
+    )
+
+
+def shape_sensitivity(df) -> pd.DataFrame:
+    """Per shape PARAMETER, how strongly it orders the outcome.
+
+    `variance_decomposition` splits the variance three ways -- resolution, shape,
+    interaction -- but `theta` is a *bundle* of shape dimensions, so a large
+    `ss_theta_share` cannot say which dimension earned it. That is the question
+    that decides whether a dimension deserves a slot in `space.SHAPE` at all, and
+    it needs the bundle opened.
+
+    The shape points are a Sobol design, not a factorial: each dimension takes 8
+    distinct values and no value repeats, so there are no cells to average and an
+    ANOVA does not apply. What is available is the monotone association between a
+    dimension and the score, which is what Spearman measures and what "does this
+    knob order the outcomes" actually asks. With 8 points it is a coarse
+    instrument -- see `RHO_SIGNIFICANT_AT_8` -- so it is reported as evidence for
+    dropping a dimension, never as an effect size.
+
+    The resolution parameter is excluded by construction: it is swept over the
+    ladder, not drawn from the Sobol design, so it takes a different value at
+    every level and would correlate with nothing.
+    """
+    ok = df[(df.status == "ok") & df.feasible]
+    ok = ok[ok.granularity_level.notna() & ok.theta.notna()]
+    if ok.empty or "params_resolved" not in ok.columns:
+        return pd.DataFrame()
+
+    rows = []
+    for (algo, fold), grp in ok.groupby(["algo", "dataset"]):
+        profile = _profile_by_theta(grp)
+        if profile.size < 4:
+            continue
+        # One params dict per theta. Any row of that theta will do for the shape
+        # dimensions; the resolution parameter is the only one that moves within
+        # a theta, and it is dropped below.
+        params = {}
+        for theta, sub in grp.groupby("theta"):
+            entry = sub["params_resolved"].iloc[0]
+            if isinstance(entry, dict):
+                params[theta] = entry
+        if not params:
+            continue
+        table = pd.DataFrame(params).T.reindex(profile.index)
+        axis = GRAN[algo][0] if algo in GRAN else None
+        for dim in table.columns:
+            if dim == axis:
+                continue
+            values = pd.to_numeric(table[dim], errors="coerce")
+            # A pinned parameter (space.FIXED) is constant across theta and has
+            # no correlation to report. Saying so is the point: it separates
+            # "held fixed on purpose" from "searched and found not to matter".
+            if values.nunique(dropna=True) < 2:
+                rows.append({"algo": algo, "dataset": fold, "param": dim,
+                             "abs_rho": np.nan, "n_theta": int(values.notna().sum()),
+                             "status": "pinned"})
+                continue
+            rho = values.corr(profile, method="spearman")
+            rows.append({"algo": algo, "dataset": fold, "param": dim,
+                         "abs_rho": abs(float(rho)) if pd.notna(rho) else np.nan,
+                         "n_theta": int(values.notna().sum()), "status": "searched"})
+    return pd.DataFrame(rows)
+
+
+def profile_stability(df) -> pd.DataFrame:
+    """Does the ranking of shape points survive a change of resolution?
+
+    P2R transfers `theta*` from the optimisation folds and re-picks `g` on the
+    held-out fold. `_shape_scores` already guards the obvious failure by scoring
+    each shape point at its own best rungs rather than at a fixed one. What that
+    guard cannot fix is a *reordering*: if the shape points rank one way at a
+    coarse resolution and another way at a fine one, the profile taken on other
+    folds ranks them at the wrong resolution for this one, and the transfer is
+    unsound no matter how the profile is computed.
+
+    Measured as the mean pairwise Spearman correlation between the per-level
+    rankings of theta. 1.0 means the order never moves and the transfer is safe;
+    near 0 means the best shape is a property of the resolution, not of the
+    dataset. This is the companion to `ss_interaction_share`: that number says
+    how much variance the interaction holds, this one says whether the
+    interaction actually reorders the choice P2R has to make.
+    """
+    ok = df[(df.status == "ok") & df.feasible]
+    ok = ok[ok.granularity_level.notna() & ok.theta.notna()]
+    rows = []
+    for (algo, fold), grp in ok.groupby(["algo", "dataset"]):
+        table = grp.groupby(["granularity_level", "theta"])["ari"].mean().unstack("theta")
+        # A level with fewer than two comparable shape points cannot be ranked.
+        table = table.dropna(axis=0, thresh=2)
+        if table.shape[0] < 2 or table.shape[1] < 2:
+            continue
+        ranks = table.rank(axis=1)
+        taus = [
+            ranks.iloc[i].corr(ranks.iloc[j], method="spearman")
+            for i, j in itertools.combinations(range(len(ranks)), 2)
+        ]
+        taus = [t for t in taus if pd.notna(t)]
+        if not taus:
+            continue
+        rows.append({"algo": algo, "dataset": fold,
+                     "mean_rank_agreement": float(np.mean(taus)),
+                     "n_levels": int(table.shape[0]), "n_theta": int(table.shape[1])})
     return pd.DataFrame(rows)
 
 
@@ -267,6 +392,10 @@ def main() -> None:
     budget.to_csv(REPORT_DIR / "budget_curve.csv", index=False)
     variance = variance_decomposition(df)
     variance.to_csv(REPORT_DIR / "variance_decomposition.csv", index=False)
+    sensitivity = shape_sensitivity(df)
+    sensitivity.to_csv(REPORT_DIR / "shape_sensitivity.csv", index=False)
+    stability = profile_stability(df)
+    stability.to_csv(REPORT_DIR / "profile_stability.csv", index=False)
     hv = hypervolume(df)
     hv.to_csv(REPORT_DIR / "hypervolume.csv", index=False)
 
@@ -329,6 +458,45 @@ def main() -> None:
             "reading the P2R table.\n\n"
         )
 
+    lines.append("### 4a. Which shape parameter earned that share\n\n")
+    if not sensitivity.empty:
+        searched = sensitivity[sensitivity.status == "searched"]
+        if not searched.empty:
+            per_param = (
+                searched.groupby(["algo", "param"])["abs_rho"]
+                .agg(["mean", "max", "count"])
+                .round(3)
+            )
+            lines.append(_md(per_param.reset_index()) + "\n\n")
+        pinned = sorted(set(sensitivity[sensitivity.status == "pinned"].param))
+        if pinned:
+            lines.append(f"Held at a stated value (`space.FIXED`): {', '.join(pinned)}.\n\n")
+        lines.append(
+            "|rho| is the Spearman association between one shape dimension and the "
+            "shape point's profile score. Over N_SHAPE=8 points the two-tailed 5% "
+            f"level is |rho| = {RHO_SIGNIFICANT_AT_8}, so a mean below that is evidence "
+            "for dropping the dimension, not an effect size. A dimension that clears "
+            "it on no dataset is a slot that could carry a different parameter at no "
+            "extra cost.\n\n"
+        )
+    else:
+        lines.append("No rows: the matrix carries no `params_resolved` column.\n\n")
+
+    lines.append("### 4b. Does the shape ranking survive a change of resolution\n\n")
+    if not stability.empty:
+        lines.append(_md(stability.round(3)) + "\n\n")
+        lines.append(
+            "Mean pairwise Spearman between the per-level rankings of theta. P2R "
+            "transfers theta* from other datasets and re-picks g here, so it needs "
+            "the ranking of theta to be a property of the dataset rather than of the "
+            "resolution. At 1.0 the order never moves and the transfer is sound; near "
+            "0 the best shape is whatever the resolution happens to be, and theta* "
+            "carries nothing. Read together with `ss_interaction_share`: that says how "
+            "large the interaction is, this says whether it reorders the choice.\n\n"
+        )
+    else:
+        lines.append("No rows: not enough complete level x theta cells.\n\n")
+
     lines.append("## 5. Statistical tests\n\n")
     for name, result in stats.items():
         lines.append(
@@ -358,7 +526,7 @@ def main() -> None:
 
     (REPORT_DIR / "report.md").write_text("".join(lines), encoding="utf-8")
     print("".join(lines))
-    print(f"wrote {REPORT_DIR}/report.md and 5 CSVs")
+    print(f"wrote {REPORT_DIR}/report.md and 7 CSVs")
 
 
 if __name__ == "__main__":
