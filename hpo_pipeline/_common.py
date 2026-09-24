@@ -14,7 +14,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import sys
+import time
 from pathlib import Path
 
 #: This package. Every artifact below hangs off it.
@@ -68,7 +70,13 @@ N_SHAPE = 8
 SCALER = "none"
 SCALER_PARAMS: dict = {}
 
-EXTERNAL_METRICS = ("ari", "nmi", "ami", "purity", "homogeneity", "completeness")
+EXTERNAL_METRICS = (
+    "ari", "nmi", "ami", "purity", "purity_macro", "homogeneity", "completeness",
+)
+#: ``purity`` is sample-weighted (micro); ``purity_macro`` averages over clusters
+#: unweighted, which is the formula DenStream/RepStream/SOStream print. Both are
+#: carried so the tables can be read against those papers, and both only mean
+#: something next to the cluster count.
 INTERNAL_METRICS = ("silhouette", "ssq", "matr_trace")
 
 #: Feasibility thresholds. A configuration that trips one of these is not
@@ -100,6 +108,34 @@ def shuffle_seed_for(seed: int) -> int:
     return 1000 + seed
 
 
+def river_defaults(algo: str) -> dict:
+    """River's constructor defaults for one clusterer, read off the signature.
+
+    This is deliberately **not** `benchmark.algorithms.registry.ALGORITHMS[algo]
+    .factory()`. That returns this framework's preset, which for several
+    algorithms differs from what River ships -- DenStream's preset is
+    epsilon=0.5, mu=2.5, beta=0.5 against River's 0.02, 2, 0.75, and CluStream's
+    pins seed=42 while omitting micro_cluster_r_factor. Anything that means "what
+    a River user gets today" (P0, the headroom baseline, the `default` arm) has
+    to come from here; a preset there answers a different question.
+
+    ``seed`` is left out because the harness injects the run seed.
+    """
+    import inspect
+
+    from river import cluster
+
+    skip = (inspect.Parameter.VAR_KEYWORD, inspect.Parameter.VAR_POSITIONAL)
+    params = inspect.signature(getattr(cluster, algo).__init__).parameters
+    return {
+        name: p.default
+        for name, p in params.items()
+        if name not in ("self", "seed")
+        and p.kind not in skip
+        and p.default is not inspect.Parameter.empty
+    }
+
+
 # --- folds -----------------------------------------------------------------
 #: fold name -> group. `group` is what Stage 6 uses to build the
 #: leave-one-group-out reading, the honest number for transfer: the synthetic
@@ -119,6 +155,37 @@ FOLD_GROUPS: dict[str, str] = {
 
 FOLDS = tuple(FOLD_GROUPS)
 
+#: Folds deliberately kept OUT of `FOLD_GROUPS`, and therefore out of every
+#: tuning and LODO round: the out-of-sample check. A fold listed here is loadable
+#: by name but can never be selected on, which is the only property that makes
+#: the final comparison a test rather than a second reading of the training set.
+#:
+#: What each one is for, and what it cannot support:
+#:
+#:   `electricity` -- 2 classes, and Souza et al. (DMKD 2020) show its labels are
+#:     autocorrelated enough that "same as last" scores 85% where independence
+#:     would give 51%. A weak clustering target; a secondary check, never a
+#:     headline.
+#:   `dstream_30k_nonconvex` -- non-convex clusters, which every centroid method
+#:     here is expected to fail. 5,000 of its 30,000 points carry the label
+#:     `None` (injected noise) and the external metrics skip them, so its ARI is
+#:     computed on 5/6 of the stream.
+#:   `insects_abrupt_imbalanced`, `insects_gradual_imbalanced` -- the evidence
+#:     the pool was missing. Every fold in `FOLD_GROUPS` is either
+#:     one-dimensionally dominated (kdd99 at 99.8% of the variance, shuttle at
+#:     95.4%), has a label that is not a cluster structure (covtype's ceiling is
+#:     0.019), or is class-balanced. These two are multi-dimensional, real, and
+#:     class-imbalanced, which is the combination nothing else here covers. They
+#:     share their source data with `insects_ir_bal`, so they are out-of-sample
+#:     for the *tuning* but NOT independent of it -- say so wherever they are
+#:     averaged with the others.
+HOLDOUT_FOLDS: tuple[str, ...] = (
+    "electricity",
+    "dstream_30k_nonconvex",
+    "insects_abrupt_imbalanced",
+    "insects_gradual_imbalanced",
+)
+
 
 def load_fold(name: str):
     """Build one fold as its **raw** dataset, before shuffling.
@@ -128,10 +195,12 @@ def load_fold(name: str):
     """
     from benchmark.datasets import (
         load_covtype,
+        load_electricity,
         load_insects,
         load_kddcup99,
         load_keystroke,
         load_shuttle,
+        make_dstream_30k_nonconvex,
         make_scenario,
     )
 
@@ -147,7 +216,19 @@ def load_fold(name: str):
         return load_shuttle()
     if name in ("static_easy", "static_overlap", "unbalanced", "noisy"):
         return make_scenario(name, n_samples=SYNTH_N, seed=DATA_SEED)
-    raise KeyError(f"unknown fold {name!r}; available: {sorted(FOLD_GROUPS)}")
+    # Out-of-sample folds: loadable, never selectable (see HOLDOUT_FOLDS).
+    if name == "electricity":
+        return load_electricity()
+    if name == "dstream_30k_nonconvex":
+        return make_dstream_30k_nonconvex(seed=DATA_SEED)
+    if name == "insects_abrupt_imbalanced":
+        return load_insects(variant="abrupt_imbalanced")
+    if name == "insects_gradual_imbalanced":
+        return load_insects(variant="gradual_imbalanced")
+    raise KeyError(
+        f"unknown fold {name!r}; tuning folds: {sorted(FOLD_GROUPS)}; "
+        f"out-of-sample folds: {sorted(HOLDOUT_FOLDS)}"
+    )
 
 
 # --- identity --------------------------------------------------------------
@@ -172,6 +253,57 @@ def append_jsonl(path: Path, row: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "a", encoding="utf-8") as handle:
         handle.write(json.dumps(row, default=str) + "\n")
+
+
+class JsonlLock:
+    """Advisory lock guarding one append-only JSONL against a second writer.
+
+    `build_matrix` decides what to run by reading the whole file once, at
+    startup, and then appends as results land. Two invocations therefore both
+    see the same "already done" set, both queue the same jobs, and both append
+    them: the file ends up with duplicate rows for the same
+    (algo, config, fold, seed, budget) key, silently doubling the weight of
+    those cells in every mean downstream. Resuming an interrupted run is the
+    normal way to use the stage, so this is easy to hit by accident -- start a
+    resume before noticing the first run is still going.
+
+    Created with ``O_CREAT | O_EXCL`` so the check and the claim are one atomic
+    operation, and carrying the owning pid so a stale file can be identified.
+    A crashed run leaves the lock behind; ``--force`` is the deliberate way past
+    it, and it says what it is overriding.
+    """
+
+    def __init__(self, path: Path, force: bool = False):
+        self.path = Path(str(path) + ".lock")
+        self.force = force
+        self.acquired = False
+
+    def __enter__(self):
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            fd = os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except FileExistsError:
+            owner = self.path.read_text(encoding="utf-8").strip() or "unknown"
+            if not self.force:
+                raise SystemExit(
+                    f"{self.path} exists: another run holds this matrix ({owner}).\n"
+                    "Two writers resuming the same file duplicate rows and silently\n"
+                    "double-count those cells. If that process is gone, delete the lock\n"
+                    "or pass --force."
+                ) from None
+            print(f"WARNING: overriding lock held by {owner}")
+            self.path.write_text(f"pid={os.getpid()} (forced)\n", encoding="utf-8")
+            self.acquired = True
+            return self
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(f"pid={os.getpid()} started={time.strftime('%Y-%m-%dT%H:%M:%S')}\n")
+        self.acquired = True
+        return self
+
+    def __exit__(self, *exc):
+        if self.acquired:
+            self.path.unlink(missing_ok=True)
+        return False
 
 
 def read_jsonl(path: Path):

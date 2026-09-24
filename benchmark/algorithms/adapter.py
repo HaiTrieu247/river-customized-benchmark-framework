@@ -31,6 +31,24 @@ from dataclasses import dataclass, field
 from typing import Any
 
 
+#: Values a clusterer's ``predict_one`` returns that are NOT cluster ids.
+#:
+#: DenStream's ``_get_closest_cluster_key`` returns ``-1`` when
+#: ``p_micro_clusters`` is empty (``denstream.py:193``): there is no cluster to
+#: assign to, so it signals that rather than raising. The value then travels out
+#: of ``predict_one`` unchanged and, unless something intervenes, straight into
+#: ``AdjustedRand`` as though it were a cluster label. A whole stream of them
+#: looks like "one big cluster that scores 0" when what happened is "no
+#: clustering at all" -- and it is nearly free to compute, so it also tops the
+#: throughput table. See RIVER_BUGS.md BUG-6.
+#:
+#: Keyed by River class name so a workaround is scoped to the model that needs
+#: it, never applied globally.
+SENTINEL_LABELS: dict[str, tuple] = {
+    "DenStream": (-1,),
+}
+
+
 def build_river_path() -> str:
     """Return (and register on ``sys.path``) the sibling river source tree.
 
@@ -89,6 +107,18 @@ class ClustererAdapter:
     #: model was not initialised yet. Reported so a cold start cannot silently
     #: inflate or deflate the external metrics without anyone noticing.
     n_fallback_predictions: int = 0
+    #: How many times the model returned a *sentinel* instead of a cluster id
+    #: (RIVER_BUGS.md BUG-6). Always counted; only suppressed when
+    #: ``drop_sentinel_predictions`` is on. A run with a high count here did not
+    #: cluster badly -- it did not cluster.
+    n_sentinel_predictions: int = 0
+    #: Opt-in workaround for BUG-6. Off by default, so the measured behaviour is
+    #: River's own: the sentinel goes to the metrics as if it were a cluster id,
+    #: which is what a River user gets. Turning it on returns ``None`` instead,
+    #: and the runner then skips that sample for the external metrics. The two
+    #: are different measurements, so the choice has to be explicit and on the
+    #: record rather than a silent default.
+    drop_sentinel_predictions: bool = False
     #: The most recent point *after* preprocessing — the space the model works in.
     last_x_scaled: dict | None = None
 
@@ -130,11 +160,17 @@ class ClustererAdapter:
           ``predict_one`` raises ``NotImplementedError`` by design. There is
           nothing to score, so ``None`` is returned and the runner skips
           external quality for the whole run.
+        * **sentinel** — DenStream returns ``-1`` when it holds no
+          p-micro-clusters, i.e. when it has produced no clustering at all
+          (RIVER_BUGS.md BUG-6). It is always counted in
+          ``n_sentinel_predictions``; whether it is also suppressed depends on
+          ``drop_sentinel_predictions``, which defaults to off so that what is
+          measured stays River's own behaviour.
         """
         if not self.partitions_samples:
             return None
         try:
-            return self.model.predict_one(x)
+            label = self.model.predict_one(x)
         except NotImplementedError:
             # The registry said this model partitions samples but River says
             # otherwise; trust River and stop scoring it.
@@ -143,6 +179,11 @@ class ClustererAdapter:
         except (ValueError, ZeroDivisionError, KeyError):
             self.n_fallback_predictions += 1
             return 0
+        if label in SENTINEL_LABELS.get(type(self.model).__name__, ()):
+            self.n_sentinel_predictions += 1
+            if self.drop_sentinel_predictions:
+                return None
+        return label
 
     def learn_one(self, x: dict) -> None:
         if self._learn_takes_t:

@@ -53,13 +53,15 @@ def test_grid_is_the_full_factorial_minus_rejections():
             assert all(c["grid"] == kind for c in accepted)
 
 
-def test_denstream_rejects_beta_mu_at_or_below_one():
+def test_denstream_grid_satisfies_beta_mu_above_one_without_rejecting_anything():
+    """The constraint used to throw away 21 of 84 points; with beta pinned at
+    0.75 the smallest product on the ladder is 0.75*2 = 1.5, so the whole budget
+    is now spent on runs. See `test_the_constraint_still_guards_a_grid_override`
+    in test_hpo_compare_reading.py for the case where it does still fire."""
     accepted, rejected = hpo_compare.build_grid("DenStream", "raw", hpo_compare.GRIDS["DenStream"])
     for c in accepted:
         assert c["shape"]["beta"] * c["shape"]["mu"] > 1
-    assert rejected and all(r["violates"] == ["beta * mu > 1"] for r in rejected)
-    # (0.2, 2), (0.2, 5), (0.5, 2) at every one of the 7 levels
-    assert len(rejected) == 3 * 7
+    assert rejected == []
 
 
 def test_clustream_ladder_never_needs_rejection_but_raw_does():
@@ -93,8 +95,11 @@ def test_raw_grid_is_not_rescaled_but_ladder_is():
         assert hpo_compare.resolve_candidate(c, probe)["epsilon"] == pytest.approx(c["g"] * 10.0)
         assert "epsilon" not in c["shape"]
     # the untuned parameters are River's, not the registry preset's
-    assert all(c["shape"]["decaying_factor"] == 0.25 for c in ladder)
     assert all(c["shape"]["n_samples_init"] == 1000 for c in ladder)
+    assert all(c["shape"]["stream_speed"] == 100 for c in ladder)
+    # `decaying_factor` is now swept, and `beta` is pinned rather than inherited
+    assert {c["shape"]["decaying_factor"] for c in ladder} == {0.25, 1.0, 2.0}
+    assert all(c["shape"]["beta"] == 0.75 for c in ladder)
 
 
 def test_grids_never_share_a_config_id():
@@ -133,7 +138,8 @@ def test_merge_grids_overrides_one_leaf_only():
 def test_tuned_params_name_absolute_parameters():
     assert hpo_compare.tuned_params("CluStream", hpo_compare.GRIDS) == [
         "max_micro_clusters", "micro_cluster_r_factor", "n_macro_clusters"]
-    assert hpo_compare.tuned_params("DenStream", hpo_compare.GRIDS) == ["beta", "epsilon", "mu"]
+    assert hpo_compare.tuned_params("DenStream", hpo_compare.GRIDS) == [
+        "decaying_factor", "epsilon", "mu"]
 
 
 # --- collapsing the tuning seeds ---------------------------------------------
@@ -422,7 +428,8 @@ def test_all_picks_ships_the_same_set_on_every_dataset():
 def test_spec_label_writes_substitutes_not_per_dataset_numbers():
     spec = hpo_compare.GRIDS["DenStream"]
     cand = hpo_compare.build_grid("DenStream", "ladder", spec)[0][0]
-    label = hpo_compare.spec_label(cand, hpo_compare.GRIDS, ["beta", "epsilon", "mu"])
+    tuned = hpo_compare.tuned_params("DenStream", hpo_compare.GRIDS)
+    label = hpo_compare.spec_label(cand, hpo_compare.GRIDS, tuned)
     assert label.startswith(f"epsilon = {cand['g']:g} * s(D)")
-    assert "beta=" in label and "mu=" in label
+    assert "decaying_factor=" in label and "mu=" in label
     assert "epsilon" not in hpo_compare.spec_label(cand, hpo_compare.GRIDS, [], level=False)

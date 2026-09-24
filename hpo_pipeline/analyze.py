@@ -41,6 +41,7 @@ from ._common import (
     FOLD_GROUPS,
     FOLDS,
     MATRIX_JSONL,
+    MATRCV_JSONL,
     PREFIX_JSONL,
     REPORT_DIR,
     VIEWS_DIR,
@@ -50,7 +51,7 @@ from ._common import (
 )
 from .rules import RULES
 from .space import GRAN
-from .views import _table, p0, p1, p1_holdout, p2, p2_rule, panel
+from .views import _table, p0, p1, p1_holdout, p2, p2_rule, p4, panel
 
 #: Studentised range values at alpha=0.05 for the Nemenyi test, by k.
 _Q05 = {2: 1.960, 3: 2.343, 4: 2.569, 5: 2.728, 6: 2.850, 7: 2.949,
@@ -252,11 +253,67 @@ def profile_stability(df) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def pareto_front(points: np.ndarray) -> np.ndarray:
+    """The non-dominated rows of an (n, m) array, all objectives maximised.
+
+    ``a`` dominates ``b`` when it is at least as good on every objective and
+    strictly better on one.
+    """
+    if len(points) == 0:
+        return points
+    keep = np.ones(len(points), dtype=bool)
+    for i, p in enumerate(points):
+        if not keep[i]:
+            continue
+        dominated = np.all(points <= p, axis=1) & np.any(points < p, axis=1)
+        keep &= ~dominated
+        keep[i] = True
+    return points[keep]
+
+
+def _hv3(points: np.ndarray) -> float:
+    """Exact 3-D dominated hypervolume from the origin, all objectives maximised.
+
+    Slices along the third objective: sort descending, and as each point is
+    added accumulate the 2-D area of the running front times the depth of the
+    slab it spans. The 2-D area of a maximised front from the origin is the
+    staircase sum, which is what the inner loop computes.
+    """
+    if len(points) == 0:
+        return 0.0
+    pts = points[np.argsort(-points[:, 2])]
+    total, active = 0.0, []
+    for i, p in enumerate(pts):
+        active.append((p[0], p[1]))
+        depth = p[2] - (pts[i + 1][2] if i + 1 < len(pts) else 0.0)
+        if depth <= 0:
+            continue
+        # staircase area of the 2-D front over (o0, o1)
+        front = sorted(active, key=lambda q: (-q[0], -q[1]))
+        area, prev_y = 0.0, 0.0
+        for x, y in front:
+            if y > prev_y:
+                area += x * (y - prev_y)
+                prev_y = y
+        total += area * depth
+    return float(total)
+
+
 def hypervolume(df) -> pd.DataFrame:
     """2^3 objective summary: ARI up, runtime down, memory down.
 
     Computed per (algorithm, fold) over its whole candidate set, so it describes
     the ALGORITHM rather than how well it was tuned.
+
+    This is the volume dominated by the **whole Pareto front**, not by its best
+    single point. The previous implementation took a max over per-point box
+    volumes, which is a different quantity and not the one Franceschi et al.
+    Sec. 8.1 uses it for: under a max, adding a non-dominated configuration --
+    say one that is far cheaper at slightly lower ARI -- can never change the
+    number, so it measured nothing about how wide the front is, which is the
+    only reason to compute a hypervolume instead of reporting the best ARI.
+    Reported alongside the front size, since a hypervolume without it cannot be
+    told apart from a single good point.
     """
     ok = df[(df.status == "ok") & df.feasible]
     ref_time, ref_mem = 900.0, 2048.0
@@ -265,15 +322,17 @@ def hypervolume(df) -> pd.DataFrame:
         pts = grp[["ari", "runtime_s", "peak_memory_mb"]].dropna()
         if pts.empty:
             continue
-        best = 0.0
-        for _, p in pts.iterrows():
-            vol = (
-                max(p["ari"], 0.0)
-                * max(ref_time - p["runtime_s"], 0.0) / ref_time
-                * max(ref_mem - p["peak_memory_mb"], 0.0) / ref_mem
-            )
-            best = max(best, vol)
-        rows.append({"algo": algo, "dataset": fold, "hypervolume": best})
+        # Map to a maximisation problem in [0, 1]^3 with the origin as reference.
+        obj = np.column_stack([
+            np.clip(pts["ari"].to_numpy(dtype=float), 0.0, None),
+            np.clip(ref_time - pts["runtime_s"].to_numpy(dtype=float), 0.0, None) / ref_time,
+            np.clip(ref_mem - pts["peak_memory_mb"].to_numpy(dtype=float), 0.0, None) / ref_mem,
+        ])
+        front = pareto_front(obj)
+        rows.append({"algo": algo, "dataset": fold,
+                     "hypervolume": _hv3(front),
+                     "front_size": int(len(front)),
+                     "n_feasible": int(len(obj))})
     return pd.DataFrame(rows)
 
 
@@ -337,7 +396,7 @@ def main() -> None:
     parser.parse_args()
 
     require(MATRIX_JSONL, "Stage 4 (build_matrix.py)")
-    df = load_matrix()
+    df = load_matrix(MATRIX_JSONL)
     folds = [f for f in FOLDS if f in set(df.dataset)]
     REPORT_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -364,6 +423,28 @@ def main() -> None:
         for origin, grp in pf.groupby("origin"):
             series = grp.groupby(["algo", "dataset"])["ari_tail"].mean()
             gaps.append(_gap(ceiling, series, f"P1 - P3({origin:.0%})"))
+
+    # P4 -- the label-free protocol. Stage 7b writes the cell it chose; this
+    # scores that cell out of the same matrix. `P1 - P4` is the price of having
+    # no labels, which Franceschi et al. Sec. 10.1 names as unmeasured; leaving
+    # matrcv.jsonl unread here is why the pipeline had never produced it.
+    pan_for_p4 = panel(df)
+    matrcv_rows = list(read_jsonl(MATRCV_JSONL))
+    p4_series = pd.Series(dtype=float)
+    if matrcv_rows:
+        p4_series = p4(pan_for_p4, matrcv_rows)
+        protocols["P4"] = p4_series
+        gaps.append(_gap(ceiling, p4_series, "P1 - P4"))
+        # The parsimony sweep beside the headline, and plain argmax as the
+        # strawman Theorem 6 predicts will over-split.
+        for key, label in (("g_hat_argmax", "P1 - P4(argmax)"),
+                           ("g_hat_delta_0.01", "P1 - P4(delta=0.01)"),
+                           ("g_hat_delta_0.1", "P1 - P4(delta=0.1)")):
+            if any(key in row for row in matrcv_rows):
+                gaps.append(_gap(ceiling, p4(pan_for_p4, matrcv_rows, key), label))
+    else:
+        print(f"note: no {MATRCV_JSONL.name}; P4 is absent from gaps.csv. "
+              "Run `python -m hpo_pipeline.matr_cv` (Stage 7b) to produce it.")
     gaps_df = pd.DataFrame(gaps)
     gaps_df.to_csv(REPORT_DIR / "gaps.csv", index=False)
 

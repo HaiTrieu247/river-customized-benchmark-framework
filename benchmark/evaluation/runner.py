@@ -152,6 +152,10 @@ class RunResult:
     checkpoints: list[Checkpoint] = field(default_factory=list)
     #: predictions served by the cold-start fallback (model not yet initialised)
     n_fallback_predictions: int = 0
+    #: predictions that were a sentinel rather than a cluster id -- the model
+    #: held no clusters at all (RIVER_BUGS.md BUG-6). A run with this near
+    #: `n_samples` produced no clustering, and its speed is the speed of that.
+    n_sentinel_predictions: int = 0
     #: How trustworthy the per-window scores are on this stream: share of
     #: windows holding a single class, and the median majority-class share.
     #: See :attr:`WindowQuality.is_degenerate`.
@@ -209,6 +213,7 @@ class RunResult:
             "n_samples": self.n_samples,
             "n_features": self.n_features,
             "n_fallback_predictions": self.n_fallback_predictions,
+            "n_sentinel_predictions": self.n_sentinel_predictions,
             "partitions_samples": self.partitions_samples,
             "structure": self.structure,
             "window_label_diagnostics": self.window_label_diagnostics,
@@ -516,6 +521,7 @@ def run_once(
         windows=windows,
         checkpoints=checkpoints,
         n_fallback_predictions=adapter.n_fallback_predictions,
+        n_sentinel_predictions=adapter.n_sentinel_predictions,
         partitions_samples=adapter.partitions_samples,
         structure=adapter.structure(),
         window_label_diagnostics=diagnostics,

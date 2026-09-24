@@ -30,7 +30,8 @@ import os
 import subprocess
 import sys
 import time
-from concurrent.futures import ThreadPoolExecutor
+import contextlib
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from ._common import (
     BUDGET,
@@ -45,6 +46,7 @@ from ._common import (
     SEEDS,
     SPACE_JSON,
     WINDOW_SIZE,
+    JsonlLock,
     append_jsonl,
     read_json,
     read_jsonl,
@@ -163,6 +165,7 @@ def _row_for(algo, candidate, fold, seed, budget, probe_entry, params=None):
         "max_micro_clusters": eff["max_micro_clusters"],
         "final_macro_clusters": eff["final_macro_clusters"],
         "n_fallback_predictions": result.n_fallback_predictions,
+        "n_sentinel_predictions": result.n_sentinel_predictions,
         "rho_deg": result.window_label_diagnostics.get("single_class_window_share"),
         # Read inside the child, so the row states what the run actually had.
         "pythonhashseed": os.environ.get("PYTHONHASHSEED"),
@@ -273,6 +276,13 @@ def main() -> None:
         "configuration, was at fault)",
     )
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="append even though another run holds the matrix lock. Only correct when "
+        "that run is known to be dead: two live writers duplicate rows and double-count "
+        "those cells in every downstream mean",
+    )
     args = parser.parse_args()
 
     if args.run_one:
@@ -303,6 +313,15 @@ def main() -> None:
             + "\n  ".join(sorted(missing))
         )
 
+    # A dry run writes nothing, so it must neither take the lock nor be blocked
+    # by one; every other invocation appends and has to hold it.
+    guard = (contextlib.nullcontext() if args.dry_run
+             else JsonlLock(MATRIX_JSONL, force=args.force))
+    with guard:
+        _run(args, algos, folds, seeds, space, probes)
+
+
+def _run(args, algos, folds, seeds, space, probes) -> None:
     already = done_keys(retry_failed=args.retry_failed)
     jobs = []
     for algo in algos:
@@ -338,8 +357,15 @@ def main() -> None:
     def submit(job):
         return execute(job, args.timeout)
 
+    # `as_completed`, not `pool.map`. `map` yields in submission order, so a
+    # single slow run holds back every result queued behind it: the rows are not
+    # written and the progress line does not move until it finishes, which on a
+    # grid whose runtimes span three orders of magnitude looks exactly like a
+    # hang. Results are keyed, so the order they land in the file is irrelevant.
     with ThreadPoolExecutor(max_workers=max(1, args.workers)) as pool:
-        for row in pool.map(submit, jobs):
+        futures = [pool.submit(submit, job) for job in jobs]
+        for future in as_completed(futures):
+            row = future.result()
             append_jsonl(MATRIX_JSONL, row)
             counts[row["status"]] = counts.get(row["status"], 0) + 1
             done += 1

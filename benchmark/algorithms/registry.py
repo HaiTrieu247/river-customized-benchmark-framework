@@ -92,6 +92,45 @@ def _clustream(**kw):
     return cluster.CluStream(**params), params
 
 
+def _dcustream(**kw):
+    # Grid method on the unit cube: `bounds` is the per-dimension interval the
+    # grid spans, so the input has to be mapped into it -- hence minmax rather
+    # than standard, which would put roughly a third of the mass outside.
+    params = dict(n_intervals=10, bounds=(0.0, 1.0), decaying_factor=1.0, span=0)
+    params.update(kw)
+    return cluster.DCUStream(**params), params
+
+
+def _ddstream(**kw):
+    params = dict(
+        grid_width=0.1,
+        decaying_factor=0.998,
+        dense_threshold=3.0,
+        sparse_threshold=0.8,
+        boundary_margin=0.1,
+        n_grids=100,
+    )
+    params.update(kw)
+    return cluster.DDStream(**params), params
+
+
+def _mrstream(**kw):
+    # Also bounded: the cell tree is built over `bounds` in every dimension.
+    params = dict(
+        max_height=5,
+        bounds=(0.0, 1.0),
+        decaying_factor=0.998,
+        dense_threshold=3.0,
+        sparse_threshold=0.8,
+        n_cells=4,
+        epsilon=1.0,
+        mu=2,
+        beta=2.0,
+    )
+    params.update(kw)
+    return cluster.MRStream(**params), params
+
+
 def _dstream(**kw):
     params = dict(
         grid_width=0.1,
@@ -243,6 +282,41 @@ ALGORITHMS: dict[str, AlgorithmSpec] = {
     "DStream": AlgorithmSpec(
         _dstream, default_preprocessor="standard",
         note="density-and-grid based with time decay; arbitrary shaped clusters",
+    ),
+    "DCUStream": AlgorithmSpec(
+        _dcustream, default_preprocessor="minmax",
+        note=(
+            "grid method over a bounded box: `bounds` is the interval each dimension's "
+            "grid spans, so the stream must be mapped into it or every point outside "
+            "falls in the same edge cell"
+        ),
+        provenance=(
+            "present in the vendored river tree, not in upstream river 0.26.1; "
+            "registered 2026-09-22 so it is benchmarkable at all. Its defaults here are "
+            "River's constructor values and have NOT been checked against the source "
+            "paper -- treat them as a runnable placeholder"
+        ),
+    ),
+    "DDStream": AlgorithmSpec(
+        _ddstream, default_preprocessor="standard",
+        note="density-and-grid based with a boundary margin; arbitrary shaped clusters",
+        provenance=(
+            "present in the vendored river tree, not in upstream river 0.26.1; "
+            "registered 2026-09-22. Defaults mirror the DStream entry beside it and "
+            "have NOT been checked against the source paper"
+        ),
+    ),
+    "MRStream": AlgorithmSpec(
+        _mrstream, default_preprocessor="minmax",
+        note=(
+            "multi-resolution cell tree over a bounded box, so like DCUStream it needs "
+            "the stream mapped into `bounds`; `max_height` is its resolution axis"
+        ),
+        provenance=(
+            "present in the vendored river tree, not in upstream river 0.26.1; "
+            "registered 2026-09-22. Defaults are River's constructor values and have "
+            "NOT been checked against the source paper"
+        ),
     ),
     "HPStream": AlgorithmSpec(
         _hpstream, default_preprocessor="none",

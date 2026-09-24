@@ -68,6 +68,66 @@ class StreamingPurity(metrics.base.Metric):
         return True
 
 
+class StreamingMacroPurity(metrics.base.Metric):
+    """Purity averaged over clusters, unweighted -- the papers' definition.
+
+    ``mean_over_clusters(max_class_weight / cluster_weight)``, i.e. every cluster
+    counts once however many samples it holds. This is the formula the stream
+    clustering papers report, and it is **not** what :class:`StreamingPurity`
+    computes: that one is the sample-weighted (micro) version,
+    ``sum_over_clusters(max_class_weight) / n_samples``.
+
+    DenStream (Cao et al., SDM 2006, Sec. 5)::
+
+        pur = (sum_i |C_i^d| / |C_i|) / K
+
+    RepStream (Lühr & Lazarescu, DKE 2009, Eq. 18) defines the same quantity as
+    ``TCP(C) = mean_i CP(c_i)``; SOStream reports purity the same way.
+
+    Why both are carried: the micro version answers "what fraction of samples
+    sit in a cluster dominated by their own class", the macro version answers
+    "how pure is the average cluster". They diverge exactly when cluster sizes
+    are uneven -- a swarm of tiny single-class clusters pushes the macro value
+    to 1 while barely moving the micro one. So the macro number is the one that
+    compares against the numbers printed in those papers, and it is only
+    readable next to the cluster count; on its own it rewards fragmentation
+    harder than the micro version does.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.matrix = collections.defaultdict(lambda: collections.defaultdict(float))
+
+    @property
+    def requires_labels(self):
+        return True
+
+    def update(self, y_true, y_pred, sample_weight=1.0):
+        self.matrix[y_pred][y_true] += sample_weight
+        return self
+
+    def revert(self, y_true, y_pred, sample_weight=1.0):
+        self.matrix[y_pred][y_true] -= sample_weight
+        return self
+
+    def get(self):
+        shares = []
+        for cluster_classes in self.matrix.values():
+            total = sum(cluster_classes.values())
+            if total > 0:
+                shares.append(max(cluster_classes.values()) / total)
+        if not shares:
+            return 0.0
+        return sum(shares) / len(shares)
+
+    @property
+    def bigger_is_better(self):
+        return True
+
+    def works_with(self, model):
+        return True
+
+
 class StreamingSSQ(metrics.base.Metric):
     """Sum of Squared Distance (SSQ) between samples and their cluster centers.
 
@@ -222,7 +282,9 @@ class StreamingMATRTrace(metrics.base.Metric):
 #: several clusters, and merging several classes into one cluster. High
 #: homogeneity with low completeness means over-segmentation; the reverse means
 #: under-segmentation. The pair separates them, ARI alone cannot.
-EXTERNAL_METRICS = ("ari", "nmi", "ami", "purity", "homogeneity", "completeness")
+EXTERNAL_METRICS = (
+    "ari", "nmi", "ami", "purity", "purity_macro", "homogeneity", "completeness",
+)
 #: Internal metrics (no labels needed) exposed by name.
 INTERNAL_METRICS = ("silhouette", "ssq", "matr_trace")
 
@@ -234,6 +296,7 @@ def build_external_metrics() -> dict:
         "nmi": metrics.NormalizedMutualInfo(),
         "ami": metrics.AdjustedMutualInfo(),
         "purity": StreamingPurity(),
+        "purity_macro": StreamingMacroPurity(),
         "homogeneity": metrics.Homogeneity(),
         "completeness": metrics.Completeness(),
     }

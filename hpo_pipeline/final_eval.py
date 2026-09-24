@@ -1,7 +1,7 @@
 """Run the hyperparameter sets the pilot shipped, and collect everything to plot.
 
 ``hpo_compare`` ends with one set per (algorithm, arm), written to
-``out/compare/final_sets_<n>[_rank].json`` together with the absolute
+``out/compare/final_sets_<n>[_headroom|_rank].json`` together with the absolute
 parameters each set resolves to on every dataset. This module runs those sets
 again -- on the datasets and at the stream length the caller chooses -- and
 keeps the full run record (whole-stream quality, per-window quality, resource
@@ -57,8 +57,13 @@ ARM_NAMES = {
     "p2r_R_max_matr_trace_win": "P2R R_max",
     "p2r_R_parsimony_matr_trace_win": "P2R R_parsimony",
     "p2r_R_max_silhouette": "P2R R_max silhouette",
+    "irace_raw": "irace raw",
+    "irace_ladder": "irace ladder (s(D))",
+    "p2r_irace_R_knee_matr_trace_win": "irace P2R R_knee",
 }
-FINAL_SETS = HPO_OUT / "compare" / "final_sets_50000.json"
+#: `hpo_compare`'s default pooling is headroom, so its sets land in the
+#: ``_headroom`` file; the ``mean`` / ``rank`` files are the other two readings.
+FINAL_SETS = HPO_OUT / "compare" / "final_sets_50000_headroom.json"
 RESULTS_JSONL = HPO_OUT / "final_eval" / "runs.jsonl"
 #: Scoring seeds, matching `hpo_compare.FINAL_SEEDS` exactly. They must stay
 #: disjoint from `hpo_compare.TUNE_SEEDS`: the sets evaluated here were chosen on
@@ -67,7 +72,13 @@ RESULTS_JSONL = HPO_OUT / "final_eval" / "runs.jsonl"
 SEEDS = (2, 3, 4, 5, 6)
 WINDOW_SIZE = 1000
 N_CHECKPOINTS = 40
-EXTERNAL_METRICS = ("ari", "nmi", "ami", "purity", "homogeneity", "completeness")
+EXTERNAL_METRICS = (
+    "ari", "nmi", "ami", "purity", "purity_macro", "homogeneity", "completeness",
+)
+#: ``purity`` is sample-weighted (micro); ``purity_macro`` averages over clusters
+#: unweighted, which is the formula DenStream/RepStream/SOStream print. Both are
+#: carried so the tables can be read against those papers, and both only mean
+#: something next to the cluster count.
 
 
 def load_final_sets(path: Path | str = FINAL_SETS) -> dict:

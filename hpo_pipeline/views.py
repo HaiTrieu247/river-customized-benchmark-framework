@@ -188,6 +188,35 @@ def _best_over_g(pan, algo, theta, fold):
     return float(sub[OBJ].max()) if not sub.empty else np.nan
 
 
+def p4(pan, matrcv_rows, delta_key: str = "g_hat") -> pd.Series:
+    """P4a: the cell MATR + MATR-CV chose without ever seeing a label.
+
+    Stage 7b picks both axes label-free -- ``theta_star`` by MATR (Alg. 1) and
+    the resolution level by MATR-CV (Alg. 2) -- and writes them to
+    ``matrcv.jsonl``. This reads that file and scores the cell it names out of
+    the same matrix every other protocol is read from, so ``P1 - P4`` is a
+    comparison of two readings and not of two measurement paths.
+
+    Scoring with ARI is the point, not a contradiction: the tuner is blind, the
+    evaluator is not. Grading a label-free choice with a label-free criterion
+    would only show that the criterion agrees with itself. Fan et al. do the
+    same -- MATR tunes without labels, and the result is reported in NMI.
+
+    ``delta_key`` selects which column of the parsimony sweep to read
+    (``g_hat`` is the headline delta; ``g_hat_argmax`` is plain argmax, the
+    strawman Theorem 6 predicts will over-split).
+    """
+    out = {}
+    for row in matrcv_rows:
+        level = row.get(delta_key)
+        if level is None:
+            continue
+        out[(row["algo"], row["dataset"])] = _score(
+            pan, row["algo"], row["theta_star"], level, row["dataset"]
+        )
+    return pd.Series(out, dtype=float)
+
+
 def p2_rule(pan, folds, rule_name, criterion, groups=None):
     """P2R: transfer the shape by LODO, re-pick the resolution by rule R."""
     rule, phis = RULES[rule_name]

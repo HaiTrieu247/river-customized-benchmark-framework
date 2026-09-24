@@ -12,6 +12,9 @@ Windows 11.
 BUG-3, BUG-4, BUG-5, GAP-1 and GAP-2 were verified against the same tree at
 commit `88ca4633` (branch `main`), river `0.26.1`, Python 3.13.3, macOS 26.6.2.
 
+BUG-6, GAP-3 and GAP-4 were verified against the same tree, river `0.26.1`,
+Python 3.13.14, macOS 26.0.0, on 2026-09-22.
+
 ---
 
 ## BUG-1 — `StandardScaler(window_size=...)` can emit complex numbers
@@ -591,3 +594,203 @@ since alone it changes nothing — no dataset reaches these checks anyway.
 - BUG-3, BUG-4, BUG-5, GAP-1 and GAP-2 were found while surveying how river tests
   clusterers, ahead of implementing further distance-based algorithms. Each was
   reproduced on the tree recorded at the top of this file before being written up.
+
+---
+
+## BUG-6 — `DenStream.predict_one` returns `-1` when it has no clusters, and the caller cannot tell that apart from a cluster id
+
+**Severity:** high for any evaluation — it silently turns "produced no clustering" into "produced one cluster that scores zero", and makes the non-clustering run look like the fastest one on the board.
+**Status:** measured on unmodified river.
+**Location:** [`river/cluster/denstream.py:193`](../river/river/cluster/denstream.py) (`_get_closest_cluster_key`), reached from `predict_one` at `:388`.
+
+### Symptom
+
+```python
+>>> import random
+>>> from river import cluster
+>>> model = cluster.DenStream(epsilon=1e-4, mu=2, beta=0.75,
+...                           n_samples_init=10, stream_speed=10)
+>>> rng = random.Random(0)
+>>> out = []
+>>> for _ in range(200):
+...     x = {"x": rng.random() * 1000, "y": rng.random() * 1000}
+...     out.append(model.predict_one(x))
+...     model.learn_one(x)
+>>> -1 in out
+True
+```
+
+`-1` is in the same value space as a genuine cluster key, which is an `int`
+index into `self.clusters`. Nothing in the return type, and nothing in the
+docstring, says it means "no clustering exists".
+
+### Root cause
+
+`_get_closest_cluster_key(point, clusters)` starts with
+`min_distance = math.inf` and `key = -1` and returns `key` unchanged when
+`clusters` is empty. `predict_one` calls it with the dictionary built from the
+p-micro-clusters, which is empty whenever DenStream has not managed to promote
+anything — the normal state at a small `epsilon`, where `_initial_dbscan` finds
+no point with more than `mu` neighbours inside the radius and no
+o-micro-cluster ever reaches weight `beta * mu`.
+
+### What it costs a benchmark
+
+Measured on this pipeline's 50k pilot, DenStream at River's default `epsilon`
+on covtype, insects, keystroke and shuttle:
+
+| | value |
+|---|---|
+| `n_predicted_clusters` | 2 (the sentinel, plus at most one real key) |
+| `largest_cluster_share` | 1.000 |
+| `homogeneity` | 0.000 |
+| ARI | 0.000 |
+| throughput | 15,000 – 30,000 samples/s |
+
+Two readings go wrong at once.
+
+1. **Quality.** `0.000` is reported next to a *negative* ARI from a
+   configuration that did cluster, and reads as better. It is not better; it is
+   not a clustering. A run that assigns everything to one cluster and a run that
+   assigns nothing are different failures and only one of them is about the
+   hyperparameters.
+2. **Cost.** Emitting a constant is nearly free, so the degenerate run tops the
+   throughput and memory tables. "River's default DenStream is 200x faster than
+   the tuned one" is, on those folds, a statement about a model that produced
+   nothing.
+
+### Suggested upstream fix
+
+Return `None` from `predict_one` when `p_micro_clusters` is empty, and say so in
+the docstring — `None` is already how this codebase signals "no label for this
+sample" elsewhere. Failing that, raise, so the caller has to decide. Keeping a
+valid-looking `int` is the one option that cannot be handled by a caller who
+does not already know the internals.
+
+### Workaround here
+
+`benchmark/algorithms/adapter.py` declares `SENTINEL_LABELS = {"DenStream": (-1,)}`
+and the adapter **always counts** the occurrences in
+`n_sentinel_predictions`, which travels into every result row. Suppression is
+opt-in via `ClustererAdapter(drop_sentinel_predictions=True)` and is **off by
+default**, because the default has to keep measuring River's own behaviour —
+that is what a River user gets. Turning it on returns `None`, and the runner
+then leaves the sample out of the external metrics.
+
+Independently of the flag, `hpo_compare`'s report section 4i lists every shipped
+run that produced no partition, so the degenerate cells cannot be read as
+results.
+
+---
+
+## GAP-3 — `DenStream.predict_one` re-runs the whole offline DBSCAN on every call
+
+**Severity:** medium — it is not a wrong answer, but it makes the cost of
+DenStream a statement about River's implementation rather than about the
+algorithm, and it is the reason quality and speed cannot be traded off in it.
+**Status:** measured on unmodified river.
+**Location:** [`river/cluster/denstream.py:351-388`](../river/river/cluster/denstream.py) (`predict_one`), with `_query_neighbor` at `:252`.
+
+### Symptom
+
+`predict_one` does not look up a cached clustering. It re-labels every
+p-micro-cluster from scratch:
+
+```python
+labels = {pmc: None for pmc in self.p_micro_clusters.values()}
+for pmc in self.p_micro_clusters.values():
+    ...
+    seed_queue = self._query_neighbor(pmc)          # O(P) scan
+    while seed_queue:
+        ...
+        neighbor_neighbors = self._query_neighbor(seed_queue[0])   # O(P) again
+self.n_clusters, self.clusters = self._generate_clusters_for_labels(labels)
+```
+
+`_generate_clusters_for_labels` then `copy.copy`s and merges a micro-cluster per
+label. All of it happens again on the next sample.
+
+Compare CluStream, which rebuilds its offline phase once every `time_gap`
+samples (`clustream.py:209`), and says so in its docstring.
+
+### What it costs a benchmark
+
+In test-then-train evaluation `predict_one` is called once per sample, so the
+run is `O(N x P^a)`. Fitted on this pipeline's 50k pilot, over 5 datasets:
+
+| dataset | exponent a | r |
+|---|---|---|
+| kdd99 | 1.22 | 0.94 |
+| covtype | 1.51 | 0.99 |
+| insects | 1.43 | 0.97 |
+| keystroke | 1.54 | 0.99 |
+| shuttle | 1.30 | 0.98 |
+
+At equal micro-cluster count on covtype, DenStream runs 3.3x slower than
+CluStream at P≈15 and 15.6x slower at P≈60.
+
+The consequence for hyperparameter work is the one that matters: `epsilon` is
+the only knob that raises ARI, and lowering it multiplies `P`. With cost
+superlinear in `P` and no cache, every quality gain is bought at a
+superlinearly rising price, so an unconstrained argmax over ARI selects the
+slowest configuration on the curve by construction.
+
+### Suggested upstream fix
+
+Cache the labelling and invalidate it when `p_micro_clusters` changes, or adopt
+CluStream's approach and recompute on a period. The paper's own framing supports
+this: the offline phase runs "when a clustering request arrives", and in a
+test-then-train loop every sample is being treated as such a request.
+
+### Workaround here
+
+None in the model — it would change what is being measured. Instead the pipeline
+reports cost per micro-cluster rather than raw throughput, and `hpo_compare`
+adds a constrained ceiling (report section 3b-iii: best ARI subject to a
+throughput floor) so that a quality number bought with compute is visible as
+such.
+
+---
+
+## GAP-4 — `CluStream` documents a pyramidal time frame it does not implement
+
+**Severity:** medium — the docstring promises the paper's central contribution,
+and a benchmark that cites it is citing something absent.
+**Status:** verified by reading the whole class (368 lines).
+**Location:** [`river/cluster/clustream.py:15-17`](../river/river/cluster/clustream.py) (docstring).
+
+### Symptom
+
+The docstring states:
+
+> The micro-clusters are stored at snapshots in time following a pyramidal
+> pattern. This pattern allows to recall summary statistics from different time
+> horizons.
+
+Neither is implemented:
+
+* `"snapshot"` and `"pyramid"` occur **only** in that docstring — nowhere in the code.
+* `__init__` allocates one current `self.micro_clusters: dict`; there is no store of past states.
+* There is no horizon argument anywhere. `predict_one(self, x)` takes none, and no method accepts a time range.
+* The paper's `alpha` (snapshot base) and `l` (snapshots retained per order) do not exist as parameters.
+* `time_window` — the only time-related parameter — is used once, at `:151`, as a relevance-stamp threshold for deleting an old micro-cluster. That is the paper's `delta`, not the pyramidal frame.
+
+### What it costs a benchmark
+
+The online/offline split that lets an analyst ask for clusters over an arbitrary
+past horizon *is* the CluStream contribution (VLDB 2003, Sec. 3.1). River
+implements the online micro-cluster maintenance and an offline k-means over the
+**current** micro-clusters only. Benchmarking `river.cluster.CluStream` and
+describing it as CluStream therefore overstates what was measured, and any
+statement about horizon queries is untestable here.
+
+### Suggested upstream fix
+
+Cheapest correct action: delete the two sentences from the docstring and state
+that the implementation keeps the current micro-cluster set only. Implementing
+the frame is a larger change and would add `alpha` and `l` to the signature.
+
+### Workaround here
+
+Documentation only: the benchmark says that River's CluStream has no pyramidal
+time frame, and makes no horizon claims.

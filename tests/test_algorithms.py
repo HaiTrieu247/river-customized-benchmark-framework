@@ -30,9 +30,21 @@ def test_registry_covers_every_river_clusterer():
 
 
 def test_capability_filters_split_the_registry_correctly():
+    # The explicit list is a tripwire: adding a clusterer to the registry has to
+    # be a deliberate edit here too. It went stale once already -- DStream,
+    # HPStream and RepStream were registered without it being updated, and then
+    # DCUStream, DDStream and MRStream were added to river without being
+    # registered at all, so the list said nothing for either group.
     assert set(algorithms_for()) == {
-        "BIRCH", "CluStream", "DenStream", "DBSTREAM", "ImprovedBIRCH", "SOStream",
-        "STREAMKMeans", "KMeans",
+        "BIRCH", "CluStream", "DBSTREAM", "DCUStream", "DDStream", "DStream",
+        "DenStream", "HPStream", "ImprovedBIRCH", "KMeans", "MRStream", "RepStream",
+        "SOStream", "STREAMKMeans",
+    }
+    # ...and the property behind it, which cannot go stale: the default filter is
+    # exactly the numeric, sample-partitioning entries.
+    assert set(algorithms_for()) == {
+        name for name, spec in ALGORITHMS.items()
+        if spec.partitions_samples and spec.input_kind == NUMERIC
     }
     assert algorithms_for(partitions_samples=False) == ["ODAC"]
     assert algorithms_for(input_kind=TOKENS, partitions_samples=None) == ["TextClust"]
@@ -211,3 +223,29 @@ def test_hash_seed_sensitivity_is_recorded_rather_than_hidden():
     )
     # the environment record is what makes such a result interpretable
     assert "python_hash_seed" in capture_environment()
+
+
+@pytest.mark.parametrize("name", ["DCUStream", "DDStream", "MRStream"])
+def test_newly_registered_clusterers_produce_scored_runs(name):
+    """Registered 2026-09-22 after `discover_clusterers` found them unregistered.
+
+    Being importable is not the bar -- a registry entry is only worth anything if
+    the run it builds actually scores. Their defaults are River's constructor
+    values and are NOT verified against the source papers (see each spec's
+    `provenance`), so this asserts the run completes and partitions samples, not
+    that it clusters well.
+    """
+    res = run_once(get_algorithm(name), _stream(), n_checkpoints=3, window_size=500)
+    assert res.partitions_samples is True
+    assert res.quality["ari"] is not None
+    assert res.efficiency.throughput_sps > 0
+
+
+def test_bounded_grid_methods_declare_a_preprocessor_that_maps_into_their_box():
+    """DCUStream and MRStream build a grid over `bounds`, not over the data.
+
+    With `standard` (mean 0, sd 1) most of the stream lands outside a (0, 1) box
+    and collapses into the edge cells, which looks like the algorithm failing.
+    """
+    for name in ("DCUStream", "MRStream"):
+        assert get_spec(name).default_preprocessor == "minmax", name

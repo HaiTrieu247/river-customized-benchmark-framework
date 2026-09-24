@@ -47,6 +47,7 @@ from ._common import (
     config_id,
     read_json,
     require,
+    river_defaults,
     write_json,
 )
 
@@ -125,18 +126,28 @@ SHAPE: dict[str, dict] = {
     },
     "DenStream": {
         # Sec. 6.1: "after the setting of epsilon, mu can be heuristically set by
-        # the average number of points in the epsilon neighborhood". Lower bound
-        # is 2.1 rather than 1.5 so that beta*mu > 1 holds at the pinned beta --
-        # see FIXED and `_accepts`.
-        "mu": _lu(2.1, 12),
-        # The stream speed v. Not decoration: Sec. 3 fixes the total stream
-        # weight at W = v / (1 - 2^-lambda) and Sec. 4.1 caps the p-micro-cluster
-        # count at W/(beta*mu), so v multiplies straight into what the outlier
-        # threshold means. The paper runs v=1000 with mu=10, River defaults to
-        # v=100 with mu=2, and the two are not comparable for that reason. The
-        # range brackets both. It replaces `beta`, whose Fig. 20 plateau is
-        # already published (see FIXED).
-        "stream_speed": _li(50, 2000),
+        # the average number of points in the epsilon neighborhood". The lower
+        # bound is back to 1.5: with beta pinned at 0.75 (see FIXED) the
+        # constraint beta*mu > 1 binds at mu > 1.33, so 2.1 would now be cutting
+        # off usable space for no reason. River's own default is mu=2 and at
+        # least one fold's ceiling sits there.
+        "mu": _lu(1.5, 12),
+        # The fading rate lambda. Sec. 3 fixes the total stream weight at
+        # W = v / (1 - 2^-lambda) and Sec. 4.1 caps the p-micro-cluster count at
+        # W/(beta*mu), so lambda sets the memory budget; it also sets the pruning
+        # period T_p (Eq. 4.1). Fig. 19 sweeps it from 0.00625 to 4 and finds a
+        # plateau over [0.125, 1]; the range here covers that plateau and a
+        # little below it.
+        #
+        # `stream_speed` (v) used to sit on this axis beside it and has been
+        # removed, because the two are very nearly the same knob: the half-life
+        # in samples is v/lambda, so (v=200, lambda=0.5) and (v=100, lambda=0.25)
+        # buy the same effective memory. Spending two of four shape dimensions on
+        # one quantity is what the sensitivity table exists to catch. lambda is
+        # the survivor because the paper actually swept it (Fig. 19) and because
+        # v is a property of the arrival rate, not of the model -- in River it is
+        # only the divisor that advances `timestamp`. v stays at River's 100, on
+        # the record in FIXED.
         "decaying_factor": _lu(0.05, 1.0),
         "n_samples_init": _choice([200, 500, 1000, 2000]),
     },
@@ -166,11 +177,20 @@ SHAPE: dict[str, dict] = {
 #: dimension from `SHAPE` silently hands it to River's default, and for two of
 #: these that default is a value the source paper argues against:
 #:
-#:   DenStream `beta` -- Fig. 20 finds quality "very good" over [0.2, 0.6] and
-#:     "deteriorates greatly" at 1. River's default is 0.75, outside the band the
-#:     paper verified. Pinned at 0.5, the midpoint of that band. The pin is what
-#:     forces `mu >= 2.1`: River computes the pruning period as
-#:     log(beta*mu / (beta*mu - 1)), which needs beta*mu > 1.
+#:   DenStream `beta` -- pinned at 0.75, River's default, and the reason is not
+#:     that 0.75 is a good value in itself. beta reaches River only through the
+#:     product `mu * beta` (denstream.py:172, :220, :334), while `mu` also acts
+#:     alone (:243, :302), so beta is a sub-channel of mu and cannot buy anything
+#:     mu cannot. Measured on the 50k pilot: pinning it costs 0.0004 ARI of
+#:     per-dataset ceiling summed over five datasets. Fig. 20 sweeps beta at a
+#:     FIXED mu=10, so its "very good over [0.2, 0.6]" is a statement about the
+#:     product beta*mu, and the mu range above still sweeps that product over
+#:     roughly [1.1, 9]. 0.75 over 0.5 because it keeps the whole mu range
+#:     admissible under `beta*mu > 1` instead of amputating its lower end.
+#:
+#:   DenStream `stream_speed` -- pinned at River's 100. It was briefly on the
+#:     SHAPE axis; it is nearly redundant with `decaying_factor` (half-life in
+#:     samples is v/lambda) and it describes the stream, not the model.
 #:
 #:   CluStream `time_gap` -- River's own invention; the paper runs the offline
 #:     phase when the analyst asks, not on a period. Pinned at River's 100 so the
@@ -179,7 +199,7 @@ SHAPE: dict[str, dict] = {
 #: A pinned value is part of `shape`, so it reaches `config_id` and the run row:
 #: changing one here changes every config_id and invalidates the matrix.
 FIXED: dict[str, dict] = {
-    "DenStream": {"beta": 0.5},
+    "DenStream": {"beta": 0.75, "stream_speed": 100},
     "CluStream": {"time_gap": 100},
 }
 
@@ -240,8 +260,6 @@ def granularity_value(algo: str, level: int) -> float:
 
 def build_space(algos: list[str]) -> dict:
     """The full candidate set: 8 x 8 per algorithm, plus River's own default."""
-    from benchmark.algorithms.registry import ALGORITHMS
-
     space: dict[str, list[dict]] = {}
     for algo in algos:
         shapes = shape_points(algo)
@@ -267,7 +285,16 @@ def build_space(algos: list[str]) -> dict:
         # P0 is read from the same matrix under the same seeds and the same
         # measurement as everything else. Run it down a separate path and the
         # P1 - P0 gap would also contain differences in how it was measured.
-        _, defaults = ALGORITHMS[algo].factory()
+        #
+        # It is read off River's own constructor signature, NOT from
+        # `ALGORITHMS[algo].factory()`. The registry's factory returns this
+        # framework's *preset*, which is a different object: for DenStream the
+        # preset is epsilon=0.5, mu=2.5, beta=0.5 where River ships 0.02, 2,
+        # 0.75, and the CluStream preset pins seed=42 and omits
+        # micro_cluster_r_factor. P0 is defined as "what a River user gets
+        # today", so a preset there answers a different question and silently
+        # shifts every P1 - P0 gap.
+        defaults = river_defaults(algo)
         candidates.append(
             {
                 "algo": algo,
