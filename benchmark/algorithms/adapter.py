@@ -191,6 +191,19 @@ class ClustererAdapter:
         else:
             self.model.learn_one(x)
 
+    def learn_only(self, x: dict) -> None:
+        """Preprocess and learn ``x`` without predicting it first.
+
+        The step a warm start needs: a model that replays points it will never
+        be scored on has no reason to pay for a prediction on each of them, and
+        for DenStream that prediction is a full DBSCAN (RIVER_BUGS.md GAP-3).
+        The stream position advances exactly as it does in :meth:`process_one`.
+        """
+        xs = self._scale(x)
+        self.last_x_scaled = xs
+        self.learn_one(xs)
+        self._n_seen += 1
+
     def process_one(self, x: dict) -> int | None:
         """Full per-sample step used by the runner: preprocess -> predict -> learn.
 

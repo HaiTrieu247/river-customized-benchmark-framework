@@ -794,3 +794,125 @@ the frame is a larger change and would add `alpha` and `l` to the signature.
 
 Documentation only: the benchmark says that River's CluStream has no pyramidal
 time frame, and makes no horizon claims.
+
+---
+
+## BUG-7 — `DenStream.predict_one` rewrites the sums of a live p-micro-cluster whenever two of them share a DBSCAN label
+
+**Severity:** medium — it corrupts the model's own state from a method that is documented as a query, but only on the path that BUG-8 makes rare.
+**Status:** reproduced on unmodified river (2026-09-26).
+**Location:** [`river/cluster/denstream.py:274-276`](../river/river/cluster/denstream.py) (`_generate_clusters_for_labels`), with `DenStreamMicroCluster.merge` at `:503`.
+
+### Symptom
+
+Force two real p-micro-clusters under one label and call the grouping step
+that `predict_one` runs on every sample:
+
+```python
+>>> import random
+>>> from river import cluster
+>>> random.seed(1)
+>>> m = cluster.DenStream(decaying_factor=0.01, beta=0.75, mu=2, epsilon=0.8, n_samples_init=100)
+>>> for _ in range(800):
+...     m.learn_one({"a": random.gauss(0, 0.6), "b": random.gauss(0, 0.6)})
+>>> mcs = list(m.p_micro_clusters.items())
+>>> k0, k1 = mcs[0][0], mcs[1][0]
+>>> before = (m.p_micro_clusters[k0].N, dict(m.p_micro_clusters[k0].linear_sum))
+>>> labels = {mc: (0 if k in (k0, k1) else 1 + i) for i, (k, mc) in enumerate(mcs)}
+>>> _ = m._generate_clusters_for_labels(labels)
+>>> after = (m.p_micro_clusters[k0].N, dict(m.p_micro_clusters[k0].linear_sum))
+>>> before[0] == after[0], before[1] == after[1]
+(True, False)
+```
+
+Measured: `N` stays 145 while `linear_sum` moves from `{a: 77.75, b: 69.08}`
+to `{a: 63.22, b: -56.21}` — the centre of a micro-cluster the model keeps
+learning into has jumped from (0.54, 0.48) to (0.44, -0.39) because of a
+prediction.
+
+### Root cause
+
+```python
+cluster = copy.copy(micro_clusters[0])
+for mc in range(1, len(micro_clusters)):
+    cluster.merge(micro_clusters[mc])
+```
+
+`copy.copy` on a `__slots__` object shares every attribute by reference, so the
+copy's `linear_sum` and `squared_sum` are the *same dicts* as the first
+member's. `merge` then does `linear_sum[key] += val` in place, and adds the
+neighbours' sums into the live p-micro-cluster while its `N` is untouched.
+Every further `predict_one` adds them again.
+
+### Impact on benchmarking
+
+Any window in which DenStream's DBSCAN puts two p-micro-clusters under one
+label degrades the model's own centres, radii and weights on every prediction
+that follows — test-then-train calls `predict_one` once per sample. The effect
+is invisible in the metrics (nothing raises) and grows with the number of
+predictions between learns. In practice the path fires rarely, because of
+BUG-8 below, which is the only reason it has not shown up in the matrices.
+
+### Suggested upstream fix
+
+`copy.deepcopy(micro_clusters[0])`, or build the merged cluster from a fresh
+`DenStreamMicroCluster` and merge every member into it.
+
+### Workaround here
+
+None registered yet: with BUG-8 in place the path is almost never taken, and a
+`DenStream` subclass overriding `_generate_clusters_for_labels` would have to
+be registered under its own name (AGENTS.md rule 1.3) and benchmarked against
+the untouched one. `conf_pipeline` records `n_macro_clusters` next to
+`n_pred_labels` per window, which is where a run that did take the path would
+show.
+
+---
+
+## BUG-8 — the DBSCAN inside `DenStream.predict_one` never expands past a direct neighbour
+
+**Severity:** medium — DenStream's macro-clusters are, in practice, its p-micro-clusters.
+**Status:** reproduced on unmodified river (2026-09-26).
+**Location:** [`river/cluster/denstream.py:351-389`](../river/river/cluster/denstream.py) (`predict_one`), with `_is_directly_density_reachable` at `:242`.
+
+### Symptom
+
+Five configurations (`epsilon` 0.3–1.5, `mu` 2–3) over one Gaussian blob of
+800 points, `n_samples_init=100`, produced 3–10 p-micro-clusters each and, on
+every one of them, `n_clusters == len(p_micro_clusters)` after `predict_one`.
+
+### Root cause
+
+Two things, in the seed-queue loop:
+
+```python
+neighbor_neighbors = self._query_neighbor(seed_queue[0])
+for neighbor_neighbor in neighbor_neighbors:
+    if labels[neighbor_neighbor] is not None:   # inverted
+        seed_queue.append(neighbor_neighbor)
+```
+
+Only *already labelled* neighbours are queued, so a label never travels beyond
+the first ring of direct neighbours of the seed. And the reachability test
+`distance <= r_p + r_q` uses `calc_radius`, whose norm-based formula (the
+paper's) returns 0 for micro-clusters whose sums are not centred at the origin
+— on the blob above, two of five radii were exactly 0 — so most pairs never
+qualify in the first place.
+
+### Impact on benchmarking
+
+`final_macro_clusters`, `n_macro_clusters` and every "number of clusters"
+column reads DenStream's micro-cluster count. Its ARI is the ARI of the
+micro-cluster partition. Neither is wrong as a measurement of River; both are
+wrong as a description of DenStream.
+
+### Suggested upstream fix
+
+`if labels[neighbor_neighbor] is None:`; and decide whether `calc_radius` is
+meant to be the paper's formula (then document that it can be 0) or the
+per-dimension variance one that CluStream uses.
+
+### Workaround here
+
+None: reported, not patched. `conf_pipeline` and the HPO matrix both carry
+`n_pred_labels`/`n_macro_clusters` per window so the reading is visible.

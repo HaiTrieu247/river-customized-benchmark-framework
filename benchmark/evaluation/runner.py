@@ -269,6 +269,7 @@ def run_once(
     seed: int | None = None,
     score_from: int = 0,
     progress: Callable[[int, int | None, int | None], None] | None = None,
+    predictions: list | None = None,
 ) -> RunResult:
     """Run one algorithm/setting over one dataset and measure it.
 
@@ -309,6 +310,12 @@ def run_once(
         caller can draw a progress bar without inflating the measured runtime.
         ``length`` is ``None`` when the stream length is unknown, and
         ``n_micro_clusters`` is ``None`` for a model that exposes none.
+    predictions:
+        Optional list the per-sample predictions are appended to, one entry per
+        streamed sample in stream order (including the unscored prefix before
+        ``score_from``). A caller that needs the partition itself -- to score a
+        window with a batch criterion, say -- reads it from here; the metrics
+        above never expose it.
     """
     labeled = dataset.has_labels
     # An algorithm that does not partition samples has no per-sample label to
@@ -406,6 +413,8 @@ def run_once(
         y_pred = adapter.process_one(x)  # scale -> predict -> learn
         total_runtime += time.perf_counter() - t0
         n_seen += 1
+        if predictions is not None:
+            predictions.append(y_pred)
 
         # Outside the timed region on purpose: reporting progress must not be
         # charged to the algorithm. The modulo keeps the per-sample cost to one
