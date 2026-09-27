@@ -285,6 +285,11 @@ def checkpoint_frame(records: list[dict]):
 
 
 def main() -> None:
+    # One line per finished run must reach a pipe (`| tee run.log`) as it lands,
+    # not when the block buffer fills: a full-length batch runs for hours and
+    # prints only a few dozen lines in total.
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(line_buffering=True)
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--run-one", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--final-sets", default=str(FINAL_SETS))
