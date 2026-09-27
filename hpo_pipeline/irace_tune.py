@@ -587,7 +587,11 @@ def race(*, algo: str, arm: str, space: str, opt_folds: list[str], grids_spec: d
     if first_test > len(seeds):
         raise SystemExit(f"--irace-first-test {first_test} needs at least that many seeds; "
                          f"got {list(seeds)}")
-    run_dir = Path(run_dir)
+    # irace is started with cwd=run_dir and starts the target runner from its
+    # execDir, so every path handed to either must be absolute; a relative
+    # run_dir or out_dir would otherwise be resolved twice.
+    run_dir = Path(run_dir).resolve()
+    out_dir = Path(out_dir).resolve()
     axes = axes_of(algo, arm, grids_spec, rule)
     points = grid_points(algo, arm, grids_spec, rule) if space == "grid" else None
     block = len(opt_folds)

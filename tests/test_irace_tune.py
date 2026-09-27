@@ -7,6 +7,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import os
 
 import numpy as np
 import pandas as pd
@@ -140,6 +141,53 @@ def test_race_refuses_a_budget_that_cannot_reach_the_first_test(tmp_path):
                grids_spec=GRIDS, reference={}, probes={}, tuned=[], n_samples=2000,
                timeout=10, workers=1, run_dir=tmp_path, out_dir=tmp_path, rscript="Rscript",
                budget=10)
+
+
+def test_out_dir_is_made_absolute_because_irace_changes_directory(tmp_path, monkeypatch):
+    """`irace_tune` starts irace with cwd=run_dir and the target runner from
+    irace's execDir; a relative --out-dir was resolved against those and irace
+    reported a doubled scenario path (seen 2026-09-27 on the Linux box)."""
+    monkeypatch.chdir(tmp_path)
+    before = (H.OUT_DIR, H.RUNS_JSONL)
+    try:
+        H.set_out_dir("hpo_pipeline/out/compare_smoke")
+        assert H.OUT_DIR.is_absolute()
+        assert H.OUT_DIR == (tmp_path / "hpo_pipeline/out/compare_smoke").resolve()
+        assert H.RUNS_JSONL == H.OUT_DIR / "runs.jsonl"
+    finally:
+        H.OUT_DIR, H.RUNS_JSONL = before
+
+
+def test_race_hands_irace_absolute_paths_even_for_a_relative_run_dir(tmp_path, monkeypatch):
+    """Every path irace or the target runner sees must survive a change of cwd."""
+    monkeypatch.chdir(tmp_path)
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append((cmd, kwargs))
+        # irace writes to the log handle the caller opened; emulate a failed race
+        # so `race` stops right after writing its files.
+        return type("P", (), {"returncode": 1})()
+
+    monkeypatch.setattr(I.subprocess, "run", fake_run)
+    with pytest.raises(SystemExit, match="irace failed"):
+        I.race(algo="DenStream", arm="ladder", space="grid", opt_folds=["a", "b"],
+               grids_spec=GRIDS, reference={"a": {"default": 0, "gain": 1},
+                                            "b": {"default": 0, "gain": 1}},
+               probes={"a": {"s": 1.0}, "b": {"s": 1.0}}, tuned=[], n_samples=2000,
+               timeout=10, workers=1, run_dir="rel/run", out_dir="rel/out", rscript="Rscript",
+               budget=1000)
+    cmd, kwargs = calls[0]
+    scenario = cmd[cmd.index("--scenario") + 1]
+    assert os.path.isabs(scenario) and os.path.isabs(kwargs["cwd"])
+    run_dir = (tmp_path / "rel/run").resolve()
+    text = (run_dir / "scenario.txt").read_text()
+    for key in ("parameterFile", "trainInstancesFile", "targetRunner", "execDir", "logFile"):
+        line = next(l for l in text.splitlines() if l.startswith(key))
+        assert os.path.isabs(line.split('"')[1]), line
+    ctx = json.loads((run_dir / "context.json").read_text())
+    assert os.path.isabs(ctx["out_dir"]) and os.path.isabs(ctx["run_dir"])
+    assert str(run_dir / "context.json") in (run_dir / "target-runner").read_text()
 
 
 # --- candidates ----------------------------------------------------------------

@@ -152,7 +152,12 @@ def set_out_dir(path) -> None:
     global OUT_DIR, RUNS_JSONL
     from pathlib import Path
 
-    OUT_DIR = Path(path)
+    # Absolute on purpose. `irace_tune` starts irace and its target runner from
+    # other working directories (the race's run_dir, then irace's execDir), and a
+    # relative --out-dir would be resolved against those and break -- irace 4.5
+    # reported "scenario file .../all/hpo_pipeline/out/.../scenario.txt does not
+    # exist" when a relative --out-dir was passed.
+    OUT_DIR = Path(path).resolve()
     RUNS_JSONL = OUT_DIR / "runs.jsonl"
 
 # --- the grids ---------------------------------------------------------------

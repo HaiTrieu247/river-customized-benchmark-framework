@@ -74,3 +74,5 @@ hpo_pipeline/out/
 !hpo_pipeline/configs/pool.json
 !hpo_pipeline/configs/probe.json
 !hpo_pipeline/configs/search_space.json
+
+result/
