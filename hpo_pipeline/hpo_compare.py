@@ -78,6 +78,7 @@ import argparse
 import inspect
 import itertools
 import json
+import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -2643,6 +2644,10 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> None:
+    # Progress lines must reach a pipe (`| tee run.log`) as they happen, not when
+    # the block buffer fills: a race or a scoring batch runs for hours.
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(line_buffering=True)
     args = build_parser().parse_args()
     set_min_throughput(args.min_throughput)
     set_gate(args.min_ceiling, args.min_ceiling_gain)

@@ -149,8 +149,7 @@ def test_budget_floor_matches_what_irace_4_5_enforces(tmp_path, monkeypatch):
     refused by irace itself with "not enough budget to enforce the value of
     nbConfigurations" (2026-09-27); the check has to refuse it first, and 1008
     has to get through to irace."""
-    monkeypatch.setattr(I.subprocess, "run",
-                        lambda cmd, **kw: type("P", (), {"returncode": 1})())
+    monkeypatch.setattr(I, "_run_irace", lambda cmd, **kw: 1)
     folds = ["kdd99", "insects_ir_bal", "keystroke", "shuttle"]
     common = dict(algo="DenStream", arm="raw", space="grid", opt_folds=folds, grids_spec=GRIDS,
                   reference={f: {"default": 0, "gain": 1} for f in folds},
@@ -185,13 +184,11 @@ def test_race_hands_irace_absolute_paths_even_for_a_relative_run_dir(tmp_path, m
     monkeypatch.chdir(tmp_path)
     calls = []
 
-    def fake_run(cmd, **kwargs):
-        calls.append((cmd, kwargs))
-        # irace writes to the log handle the caller opened; emulate a failed race
-        # so `race` stops right after writing its files.
-        return type("P", (), {"returncode": 1})()
+    def fake_irace(cmd, *, cwd, log_path, echo=True):
+        calls.append((cmd, {"cwd": cwd, "log_path": log_path}))
+        return 1  # a failed race: `race` stops right after writing its files
 
-    monkeypatch.setattr(I.subprocess, "run", fake_run)
+    monkeypatch.setattr(I, "_run_irace", fake_irace)
     with pytest.raises(SystemExit, match="irace failed"):
         I.race(algo="DenStream", arm="ladder", space="grid", opt_folds=["a", "b"],
                grids_spec=GRIDS, reference={"a": {"default": 0, "gain": 1},
@@ -210,6 +207,24 @@ def test_race_hands_irace_absolute_paths_even_for_a_relative_run_dir(tmp_path, m
     ctx = json.loads((run_dir / "context.json").read_text())
     assert os.path.isabs(ctx["out_dir"]) and os.path.isabs(ctx["run_dir"])
     assert str(run_dir / "context.json") in (run_dir / "target-runner").read_text()
+
+
+def test_irace_output_is_logged_whole_and_echoed_after_the_banner(tmp_path, capsys):
+    """A race can run for hours; the terminal must show irace's table rows as
+    they arrive, while the log keeps everything including the banner."""
+    import sys
+
+    script = ("import sys; print('# irace: banner'); print('# Copyright'); "
+              "print('# called with: --scenario x'); print('# 2026 Iteration 1 of 1'); "
+              "print('|x|  1|  84|'); sys.exit(3)")
+    code = I._run_irace([sys.executable, "-c", script], cwd=str(tmp_path),
+                        log_path=tmp_path / "irace.out")
+    assert code == 3
+    log = (tmp_path / "irace.out").read_text()
+    assert log.startswith("# irace: banner") and "|x|  1|  84|" in log
+    out = capsys.readouterr().out
+    assert "banner" not in out and "called with" not in out
+    assert "    # 2026 Iteration 1 of 1" in out and "    |x|  1|  84|" in out
 
 
 # --- candidates ----------------------------------------------------------------

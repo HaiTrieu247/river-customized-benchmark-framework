@@ -571,6 +571,35 @@ def _hash(*parts) -> str:
     return digest.hexdigest()[:16]
 
 
+def _run_irace(cmd: list[str], *, cwd: str, log_path: Path, echo: bool = True) -> int:
+    """Run irace, keep its whole output in ``log_path``, and echo the useful part
+    to the terminal as it arrives.
+
+    irace prints its race table one row per instance and a note per iteration,
+    so with the output kept only in a file a two-hour race shows nothing on the
+    terminal. Everything still goes to the log; what is echoed is everything
+    after irace's licence banner, which ends with its "# called with:" line.
+    """
+    log_path = Path(log_path)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(log_path, "w", encoding="utf-8") as log:
+        proc = subprocess.Popen(cmd, cwd=cwd, stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT, text=True, bufsize=1)
+        past_banner = False
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            log.write(line)
+            log.flush()
+            if not echo:
+                continue
+            if not past_banner:
+                past_banner = line.startswith("# called with")
+                continue
+            print("    " + line.rstrip("\n"), flush=True)
+        proc.wait()
+    return proc.returncode
+
+
 def race(*, algo: str, arm: str, space: str, opt_folds: list[str], grids_spec: dict,
          reference: dict, probes: dict, tuned: list[str], n_samples, timeout: int,
          workers: int, run_dir: Path, out_dir: Path, rscript: str,
@@ -644,7 +673,8 @@ def race(*, algo: str, arm: str, space: str, opt_folds: list[str], grids_spec: d
         previous = json.loads(result_path.read_text(encoding="utf-8"))
         if previous.get("inputs") == inputs:
             if run:
-                print(f"  irace {algo} {arm} [{', '.join(opt_folds)}]: reusing {result_path}")
+                print(f"  irace {algo} {arm} [{', '.join(opt_folds)}]: reusing {result_path}",
+                      flush=True)
             return previous
     if not run:
         return None
@@ -663,18 +693,17 @@ def race(*, algo: str, arm: str, space: str, opt_folds: list[str], grids_spec: d
     started = time.time()
     print(f"  irace {algo} {arm} [{', '.join(opt_folds)}]: "
           f"{'1 race over ' + str(len(points)) + ' grid points' if points else 'iterated racing'}, "
-          f"{len(seeds)} seed blocks x {block} datasets, budget {budget}, {test}")
-    with open(run_dir / "irace.out", "w", encoding="utf-8") as log:
-        proc = subprocess.run(
-            [rscript, "-e",
-             "suppressMessages(library(irace)); irace_cmdline(commandArgs(trailingOnly = TRUE))",
-             "--scenario", str(run_dir / "scenario.txt")],
-            cwd=str(run_dir), stdout=log, stderr=subprocess.STDOUT, text=True,
-        )
-    tail = (run_dir / "irace.out").read_text(encoding="utf-8")[-1500:]
-    if proc.returncode != 0:
-        raise SystemExit(f"irace failed for {algo} {arm} (exit {proc.returncode}); "
-                         f"see {run_dir / 'irace.out'}:\n{tail}")
+          f"{len(seeds)} seed blocks x {block} datasets, budget {budget}, {test}", flush=True)
+    log_path = run_dir / "irace.out"
+    code = _run_irace(
+        [rscript, "-e",
+         "suppressMessages(library(irace)); irace_cmdline(commandArgs(trailingOnly = TRUE))",
+         "--scenario", str(run_dir / "scenario.txt")],
+        cwd=str(run_dir), log_path=log_path)
+    tail = log_path.read_text(encoding="utf-8")[-1500:] if log_path.exists() else ""
+    if code != 0:
+        raise SystemExit(f"irace failed for {algo} {arm} (exit {code}); "
+                         f"see {log_path}:\n{tail}")
     dump = subprocess.run(
         [rscript, "-e", _DUMP_R, str(run_dir / "exec" / "irace.Rdata"), str(run_dir / "results")],
         capture_output=True, text=True,
