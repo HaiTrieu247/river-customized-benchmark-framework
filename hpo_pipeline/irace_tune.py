@@ -70,10 +70,15 @@ from pathlib import Path
 #: configuration can be evaluated on (seeds x datasets).
 IRACE_SEEDS = (1, 7, 8, 9, 10)
 #: maxExperiments per irace run, i.e. target-runner calls (a P2R call runs a
-#: whole ladder). Sec. 10.1 calls 1 000 - 100 000 typical; this is the low end,
-#: and a placeholder. A grid race cannot spend more than configurations x
-#: instances whatever the budget.
-IRACE_BUDGET = 1000
+#: whole ladder). Sec. 10.1 calls 1 000 - 100 000 typical. A placeholder, set so
+#: that a ``grid`` race over the pilot grids is never cut short by the budget: a
+#: grid race cannot spend more than configurations x instances (84 x 20 = 1 680
+#: here), so above that only the statistical test eliminates, which is the
+#: comparison with the argmax that the arm exists to make. It also clears the
+#: floor irace 4.5 enforces before racing at all (see `race`): 1 000 did not --
+#: irace stopped with "not enough budget to enforce the value of
+#: nbConfigurations" on the 84-point DenStream grid over 4 datasets.
+IRACE_BUDGET = 2000
 #: First elimination test after this many blocks, then one every IRACE_EACH_TEST
 #: blocks. Sec. 10.5 uses firstTest=2 for ML folds; placeholders.
 IRACE_FIRST_TEST = 2
@@ -596,12 +601,21 @@ def race(*, algo: str, arm: str, space: str, opt_folds: list[str], grids_spec: d
     points = grid_points(algo, arm, grids_spec, rule) if space == "grid" else None
     block = len(opt_folds)
     if points is not None:
-        floor = len(points) * first_test * block
+        # irace 4.5 refuses to start unless every configuration can be run on
+        # ``mu`` instances plus one more test block: it computes
+        # floor(budget / (mu + eachTest * blockSize)) and, when that is below
+        # nbConfigurations, stops with "not enough budget to enforce the value of
+        # nbConfigurations" and then fails in its post-selection. Observed on the
+        # 84-point DenStream grid over 4 datasets: budget 1000 -> 83 < 84. The
+        # rule is not in the user guide; the formula below reproduces the number.
+        floor = len(points) * (first_test + each_test) * block
         if budget < floor:
             raise SystemExit(
-                f"irace budget {budget} is below what one race needs to reach its first test "
-                f"({len(points)} configurations x {first_test} blocks x {block} datasets = "
-                f"{floor}); raise --irace-budget or --irace-first-test down")
+                f"irace budget {budget} is below what irace needs to race {len(points)} "
+                f"configurations: {len(points)} x ({first_test} + {each_test}) blocks x "
+                f"{block} datasets = {floor}; raise --irace-budget (a grid race can never "
+                f"spend more than {len(points) * block * len(seeds)} anyway) or lower "
+                "--irace-first-test")
     ctx = {
         "algo": algo, "arm": arm, "space": space, "rule": rule, "criterion": criterion,
         "axes": axes, "grids_spec": grids_spec,

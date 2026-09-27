@@ -143,6 +143,28 @@ def test_race_refuses_a_budget_that_cannot_reach_the_first_test(tmp_path):
                budget=10)
 
 
+def test_budget_floor_matches_what_irace_4_5_enforces(tmp_path, monkeypatch):
+    """84 DenStream points over 4 datasets, firstTest 2, eachTest 1: irace needs
+    84 x (2 + 1) x 4 = 1008 experiments before it starts a race. 1000 was
+    refused by irace itself with "not enough budget to enforce the value of
+    nbConfigurations" (2026-09-27); the check has to refuse it first, and 1008
+    has to get through to irace."""
+    monkeypatch.setattr(I.subprocess, "run",
+                        lambda cmd, **kw: type("P", (), {"returncode": 1})())
+    folds = ["kdd99", "insects_ir_bal", "keystroke", "shuttle"]
+    common = dict(algo="DenStream", arm="raw", space="grid", opt_folds=folds, grids_spec=GRIDS,
+                  reference={f: {"default": 0, "gain": 1} for f in folds},
+                  probes={f: {"s": 1.0} for f in folds}, tuned=[], n_samples=50000,
+                  timeout=10, workers=1, run_dir=tmp_path / "r", out_dir=tmp_path / "o",
+                  rscript="Rscript")
+    assert len(I.grid_points("DenStream", "raw", GRIDS)) == 84
+    with pytest.raises(SystemExit, match="1008"):
+        I.race(budget=1007, **common)
+    with pytest.raises(SystemExit, match="irace failed"):
+        I.race(budget=1008, **common)
+    assert I.IRACE_BUDGET >= 84 * 4 * len(I.IRACE_SEEDS), "default must never cap a grid race"
+
+
 def test_out_dir_is_made_absolute_because_irace_changes_directory(tmp_path, monkeypatch):
     """`irace_tune` starts irace with cwd=run_dir and the target runner from
     irace's execDir; a relative --out-dir was resolved against those and irace
