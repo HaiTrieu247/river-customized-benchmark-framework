@@ -21,9 +21,14 @@ Two departures from the paper, both deliberate. A child is always a fresh
 instance replayed on the last window, whatever its parameters: River models
 bake most parameters into their state at construction, and one warm-start rule
 for every algorithm is the only one that treats them alike. And a member that
-trips a feasibility cap (runtime relative to the fastest member, memory,
-micro-cluster count) is scored as if it had produced no partition, so the
-ensemble sheds unusable configurations instead of paying for them.
+trips a feasibility cap (runtime relative to the fastest member that produced
+a partition, memory, micro-cluster count) is scored as if it had produced no
+partition, so the ensemble sheds unusable configurations instead of paying for
+them. The runtime cap sheds *slow* members; a member that does nothing is the
+fastest of all, so it is never the reference, and when members tie on the
+undefined score the runtime does not break the tie either: the tie goes to the
+previous incumbent, then to the oldest surviving member, so a window on which
+nothing in the ensemble works leaves the incumbent where it was.
 
 The ensemble scores; it does not write. The caller decides what a window
 report becomes.
@@ -42,6 +47,13 @@ from .space import ParamSpace, SamplerState, SpaceContext
 from .window import UNDEFINED_SCORE, WindowBuffer, batch_silhouette, warm_start
 
 
+#: The two ways a child configuration can be drawn: ``"evolutionary"`` (the
+#: paper's rule -- a parent by roulette, a child by Gaussian perturbation with
+#: shrinking sigma) or ``"uniform"`` (a fresh draw over the whole space, no
+#: parent, no sigma shrink).
+SAMPLERS = ("evolutionary", "uniform")
+
+
 @dataclass
 class EnsembleConfig:
     e_size: int = 20
@@ -51,13 +63,22 @@ class EnsembleConfig:
     #: Probability that a child starts again at the initial exploration width.
     p_reset: float = 0.01
     #: Feasibility caps, per window. A member slower than ``runtime_factor``
-    #: times the fastest member of the same window, heavier than
-    #: ``max_memory_mb`` or holding more than ``max_micro_clusters`` gets the
-    #: undefined score for that window.
+    #: times the fastest member of the same window that produced a partition
+    #: (a defined silhouette), heavier than ``max_memory_mb`` or holding more
+    #: than ``max_micro_clusters`` gets the undefined score for that window.
     runtime_factor: float = 30.0
     max_memory_mb: float = 2048.0
     max_micro_clusters: int = 10_000
     external_metrics: tuple[str, ...] = ("ari", "nmi", "purity")
+    #: How children are drawn; see ``SAMPLERS``.
+    sampler: str = "evolutionary"
+    #: Window index at which the ensemble collapses onto its incumbent and
+    #: stops spawning children. ``None`` disables freezing.
+    freeze_after_window: int | None = None
+
+    def __post_init__(self):
+        if self.sampler not in SAMPLERS:
+            raise ValueError(f"sampler must be one of {SAMPLERS}, got {self.sampler!r}")
 
 
 @dataclass
@@ -148,6 +169,7 @@ class WindowReport:
     n_discarded: int
     n_spawned: int
     n_reset: int
+    frozen: bool = False
 
     @property
     def ensemble_runtime_s(self) -> float:
@@ -189,9 +211,16 @@ def victim_weights(scores) -> np.ndarray:
 
 
 def apply_feasibility(outcomes: list[WindowOutcome], cfg: EnsembleConfig) -> None:
-    """Mark the outcomes that tripped a cap; an infeasible one scores undefined."""
-    clean = [o for o in outcomes if o.error is None]
-    fastest = min((o.runtime_s for o in clean), default=None)
+    """Mark the outcomes that tripped a cap; an infeasible one scores undefined.
+
+    The runtime reference is the fastest member that produced a partition
+    (no error, a defined silhouette). A member that buffered the whole window,
+    or otherwise predicted one label, did no clustering work: measuring the
+    others against it would shed every real configuration. With no defined
+    member on the window there is no reference, and the runtime cap is not
+    applied; the memory and micro-cluster caps are.
+    """
+    fastest = min((o.runtime_s for o in outcomes if o.error is None and o.defined), default=None)
     for o in outcomes:
         reason = None
         if o.error is not None:
@@ -221,7 +250,12 @@ class ConfStreamEnsemble:
         config: EnsembleConfig,
         rng: np.random.Generator,
         seed: int,
+        post_resolve: Callable[[dict], dict] | None = None,
     ):
+        """``post_resolve`` rewrites every child's resolved parameters before
+        the member records them and its model is built (e.g. the driver caps
+        initialisation buffers at the window size); the identity by default.
+        The explicit starts are taken as given."""
         if config.e_size < 1:
             raise ValueError(f"e_size must be >= 1, got {config.e_size}")
         if not start_params:
@@ -233,12 +267,19 @@ class ConfStreamEnsemble:
         self.cfg = config
         self.rng = rng
         self.seed = seed
+        self.post_resolve = post_resolve
         self.active: list[Member] = []
         self.test: list[Member] = []
         self._next_id = 0
         self._last_incumbent_id: int | None = None
+        self.frozen = False
 
     # -- members -----------------------------------------------------------------
+    def _resolve(self, u: dict) -> dict:
+        """A child's constructor kwargs: the space's reading of ``u``, then ``post_resolve``."""
+        params = self.space.resolve(u, self.ctx)
+        return self.post_resolve(params) if self.post_resolve is not None else params
+
     def _new_member(self, u, params, state, parent_id, born_window, buffer) -> Member:
         member = Member(
             id=self._next_id, u=dict(u), params=dict(params), adapter=None,  # type: ignore[arg-type]
@@ -251,6 +292,10 @@ class ConfStreamEnsemble:
         except Exception as exc:  # a configuration River cannot run is a fact to record
             member.error = f"{type(exc).__name__}: {exc}"
         return member
+
+    def find(self, member_id: int) -> Member | None:
+        """The live member with this id, active or on test; ``None`` if gone."""
+        return next((m for m in self.active + self.test if m.id == member_id), None)
 
     def initialise(self, buffer: WindowBuffer, window_index: int) -> None:
         """Fill the ensemble: the explicit starts first, then their offspring."""
@@ -266,7 +311,7 @@ class ConfStreamEnsemble:
         while len(self.active) < self.cfg.e_size:
             parent = self.active[int(self.rng.integers(len(starts)))]
             child_u, child_state = parent.state.offspring(parent.u, self.rng, self.cfg.lam)
-            params = self.space.resolve(child_u, self.ctx)
+            params = self._resolve(child_u)
             self.active.append(self._new_member(
                 child_u, params, child_state, parent.id, window_index, buffer,
             ))
@@ -326,9 +371,23 @@ class ConfStreamEnsemble:
         return n
 
     @staticmethod
-    def pick_incumbent(outcomes: list[WindowOutcome]) -> WindowOutcome:
-        """Highest score; ties go to the faster member, then the older one."""
-        return min(outcomes, key=lambda o: (-o.score, o.runtime_s, o.member_id))
+    def pick_incumbent(
+        outcomes: list[WindowOutcome], last_incumbent_id: int | None = None
+    ) -> WindowOutcome:
+        """Highest score first; a member with a usable partition (a defined
+        silhouette, within every cap) beats one without at an equal score.
+
+        Ties between usable members go to the faster one, then the older one.
+        Ties between unusable ones -- all on the undefined score -- go to
+        ``last_incumbent_id``, then the older member, never the faster one:
+        doing nothing is fastest, and the runtime of a member with no
+        partition says nothing about its configuration.
+        """
+        def key(o: WindowOutcome):
+            if o.defined and o.feasible:
+                return (-o.score, 0, o.runtime_s, o.member_id)
+            return (-o.score, 1, 0 if o.member_id == last_incumbent_id else 1, o.member_id)
+        return min(outcomes, key=key)
 
     def process_window(self, buffer: WindowBuffer, window_index: int) -> WindowReport:
         members = self.active + self.test
@@ -342,7 +401,7 @@ class ConfStreamEnsemble:
         # Resolve the test set against the active set, one challenger at a time.
         n_tested, n_accepted, n_discarded = len(self.test), 0, 0
         for challenger in self.test:
-            best = self.pick_incumbent([m.last for m in self.active])
+            best = self.pick_incumbent([m.last for m in self.active], self._last_incumbent_id)
             candidates = [m for m in self.active if m.id != best.member_id]
             if not candidates:
                 n_discarded += 1
@@ -356,25 +415,39 @@ class ConfStreamEnsemble:
                 n_discarded += 1
         self.test = []
 
-        incumbent = self.pick_incumbent([m.last for m in self.active])
+        incumbent = self.pick_incumbent([m.last for m in self.active], self._last_incumbent_id)
         self._last_incumbent_id = incumbent.member_id
 
-        # Spawn the next test set from the (possibly refreshed) active set.
+        if (self.cfg.freeze_after_window is not None and not self.frozen
+                and window_index >= self.cfg.freeze_after_window):
+            self.active = [m for m in self.active if m.id == incumbent.member_id]
+            self.frozen = True
+
+        # Spawn the next test set from the (possibly refreshed, possibly
+        # frozen) active set. A frozen ensemble spawns nothing.
         n_reset = 0
+        n_spawn = 0 if self.frozen else self.cfg.e_test
         parent_w = roulette_weights([m.score for m in self.active])
-        for _ in range(self.cfg.e_test):
-            parent = self.active[int(self.rng.choice(len(self.active), p=parent_w))]
-            child_u, child_state = parent.state.offspring(parent.u, self.rng, self.cfg.lam)
-            if self.rng.random() < self.cfg.p_reset:
-                child_state = child_state.reset(self.space)
-                n_reset += 1
-            params = self.space.resolve(child_u, self.ctx)
+        for _ in range(n_spawn):
+            if self.cfg.sampler == "uniform":
+                parent_id = None
+                child_u = {p.name: float(self.rng.random()) for p in self.space.params}
+                child_state = SamplerState.initial(self.space)
+            else:
+                parent = self.active[int(self.rng.choice(len(self.active), p=parent_w))]
+                parent_id = parent.id
+                child_u, child_state = parent.state.offspring(parent.u, self.rng, self.cfg.lam)
+                if self.rng.random() < self.cfg.p_reset:
+                    child_state = child_state.reset(self.space)
+                    n_reset += 1
+            params = self._resolve(child_u)
             self.test.append(self._new_member(
-                child_u, params, child_state, parent.id, window_index, buffer,
+                child_u, params, child_state, parent_id, window_index, buffer,
             ))
 
         return WindowReport(
             window_index=window_index, incumbent=incumbent, lag=lag, outcomes=outcomes,
             n_active=len(self.active), n_tested=n_tested, n_accepted=n_accepted,
             n_discarded=n_discarded, n_spawned=len(self.test), n_reset=n_reset,
+            frozen=self.frozen,
         )

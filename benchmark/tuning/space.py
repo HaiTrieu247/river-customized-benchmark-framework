@@ -97,6 +97,8 @@ class Param:
                 raise ValueError(f"{self.name}: {value!r} is not one of {self.values}")
             i = self.values.index(value)
             return (i + 0.5) / len(self.values)
+        if self.kind in ("log", "log_int", "scaled") and float(value) <= 0:
+            return 0.0
         if self.kind == "lin":
             u = (float(value) - self.lo) / (self.hi - self.lo)
         elif self.kind in ("log", "log_int"):

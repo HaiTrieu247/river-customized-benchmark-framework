@@ -28,8 +28,13 @@ build_river_path()
 OUT = PIPELINE_ROOT / "out"
 WINDOWS_JSONL = OUT / "windows.jsonl"
 RUNS_JSONL = OUT / "runs.jsonl"
+#: ``--log-members``: one file per job, ``<algo>__<fold>__seed<seed>__<arm>[__cfg<id>].jsonl``,
+#: so concurrent children never append to the same file.
 MEMBERS_DIR = OUT / "members"
 REPORT_DIR = OUT / "report"
+#: The a-posteriori best static configuration per (algo, fold), written by the sweep
+#: into its out dir; ``run.py`` reads ``<out-dir>/oracle_static.json`` unless told otherwise.
+ORACLE_JSON = OUT / "oracle_static.json"
 
 # --- protocol constants (every one of them is a CLI flag) -------------------------
 #: Window size in samples: the unit of evaluation, replacement and warm start.
@@ -55,17 +60,50 @@ MAX_MICRO_CLUSTERS = 10_000
 SCALE_SUBSAMPLE = 2000
 SCALE_MAX_WINDOWS = 20
 
-ALGOS: tuple[str, ...] = ("DenStream", "CluStream", "HPStream", "RepStream")
-FOLDS: tuple[str, ...] = ("covtype", "insects_abrupt_imbalanced")
-SEEDS: tuple[int, ...] = (1, 2, 3)
-ARMS: tuple[str, ...] = ("confstream", "default")
+ALGOS: tuple[str, ...] = (
+    "DenStream", "CluStream", "HPStream", "RepStream", "DBSTREAM", "STREAMKMeans", "SOStream", "BIRCH",
+)
+REAL_FOLDS: tuple[str, ...] = (
+    "covtype", "kdd99", "insects_abrupt_balanced", "insects_abrupt_imbalanced",
+    "insects_gradual_balanced", "insects_gradual_imbalanced", "insects_incremental_balanced",
+    "insects_incremental_abrupt_balanced", "insects_incremental_reoccurring_balanced",
+    "electricity", "shuttle",
+)
+SYNTH_FOLDS: tuple[str, ...] = (
+    "scale_drift", "density_drift", "k_drift", "mixed_drift",
+    "static_overlap", "incremental_drift", "evolving",
+)
+FOLDS: tuple[str, ...] = REAL_FOLDS + SYNTH_FOLDS
+SEEDS: tuple[int, ...] = (1, 2, 3, 4, 5)
+#: The tuning regimes every (algo, fold, seed) is run under.
+ARMS: tuple[str, ...] = ("default", "confstream", "random_online", "frozen_prefix")
+#: Single-configuration arms driven by a file: the sweep's points and its winner.
+EXTRA_ARMS: tuple[str, ...] = ("oracle_static", "sweep")
+#: Every fold is cut at this many samples (the driver caps; loaders never see it).
+N_SAMPLES_CAP = 100_000
+#: ``frozen_prefix`` stops tuning after this window; every arm's tail metrics
+#: start here, so all arms are compared on the same evaluation region.
+FREEZE_AFTER_WINDOW = 20
+SWEEP_N_POINTS = 32
+MIN_CEILING_GAIN = 0.05
+#: Length of a synthetic fold when no cap is given.
+SYNTH_N_SAMPLES = 120_000
 
 #: No preprocessing: the algorithms see the data's raw units, and ``s`` is the
 #: only unit in play (HPStream normalises internally; that is the algorithm's).
 SCALER = "none"
 EXTERNAL_METRICS = ("ari", "nmi", "purity")
+#: Table A's DBSCAN eps over the lagged member's micro-cluster centres, as a
+#: fraction of the calibration window's distance unit ``s_online`` -- the same
+#: unit DenStream's own ``epsilon`` is read in, so the two DBSCANs are
+#: comparable across algorithms and folds.
+TABLE_A_EPS_FACTOR = 0.5
 
 PYTHONHASHSEED = "0"
+#: One thread per native library in every child: 8 workers each running
+#: sklearn's KMeans/DBSCAN/silhouette would otherwise start a thread per core
+#: apiece, and the incumbent's throughput would measure the contention.
+THREAD_PINS = {"OMP_NUM_THREADS": "1", "OPENBLAS_NUM_THREADS": "1", "MKL_NUM_THREADS": "1"}
 MEMORY_LIMIT_BYTES = 4 * 1024**3
 TIMEOUT_S = 6 * 3600
 
@@ -90,6 +128,10 @@ def estimate_scale(xs, rng: np.random.Generator, subsample: int = SCALE_SUBSAMPL
     return float(np.median(D[iu]))
 
 
+#: Algorithms registered under a project name whose constructor is a River class.
+RIVER_CLASS = {"DenStreamPatched": "DenStream"}
+
+
 def river_defaults(algo: str) -> dict:
     """River's constructor defaults, read off the signature (``seed`` left out)."""
     import inspect
@@ -97,7 +139,7 @@ def river_defaults(algo: str) -> dict:
     from river import cluster
 
     skip = (inspect.Parameter.VAR_KEYWORD, inspect.Parameter.VAR_POSITIONAL)
-    params = inspect.signature(getattr(cluster, algo).__init__).parameters
+    params = inspect.signature(getattr(cluster, RIVER_CLASS.get(algo, algo)).__init__).parameters
     return {
         name: p.default
         for name, p in params.items()
@@ -108,24 +150,48 @@ def river_defaults(algo: str) -> dict:
 
 
 def load_fold(name: str, n_samples: int | None = None):
-    """The protocol folds in their natural order, plus the synthetic scenarios."""
-    from benchmark.datasets import load_covtype, load_insects, make_scenario
-    from benchmark.datasets.synthetic.generator import SCENARIOS
+    """The protocol folds in their natural order, plus the synthetic scenarios.
+
+    Real loaders get the whole stream (the driver cuts it at ``n_samples``);
+    synthetic streams are generated at ``n_samples``, or ``SYNTH_N_SAMPLES``.
+    """
+    from benchmark.datasets import (
+        PARAM_DRIFT_SCENARIOS, SCENARIOS, load_covtype, load_electricity, load_insects,
+        load_kddcup99, load_shuttle, make_param_drift, make_scenario,
+    )
 
     if name == "covtype":
         return load_covtype(quantitative_only=True)
+    if name == "kdd99":
+        return load_kddcup99(n_samples=None)
+    if name == "shuttle":
+        return load_shuttle()
+    if name == "electricity":
+        return load_electricity()
     if name.startswith("insects_"):
         return load_insects(variant=name[len("insects_"):])
+    if name in PARAM_DRIFT_SCENARIOS:
+        return make_param_drift(name, n_samples=n_samples or SYNTH_N_SAMPLES)
     if name in SCENARIOS:
-        kw = {"seed": 42}
-        if n_samples is not None:
-            kw["n_samples"] = n_samples
-        return make_scenario(name, **kw)
-    raise KeyError(f"unknown fold {name!r}; protocol folds: {FOLDS}; synthetic: {sorted(SCENARIOS)}")
+        return make_scenario(name, seed=42, n_samples=n_samples or SYNTH_N_SAMPLES)
+    raise KeyError(
+        f"unknown fold {name!r}; protocol folds: {FOLDS}; "
+        f"synthetic: {sorted(SCENARIOS) + sorted(PARAM_DRIFT_SCENARIOS)}"
+    )
+
+
+def drift_points(fold: str, n_samples: int | None) -> tuple[int, ...]:
+    """Sample indices where a parameter-drift fold changes regime; ``()`` otherwise."""
+    from benchmark.datasets import PARAM_DRIFT_SCENARIOS, make_param_drift
+
+    if fold in PARAM_DRIFT_SCENARIOS:
+        return make_param_drift(fold, n_samples=n_samples or SYNTH_N_SAMPLES).drift_points
+    return ()
 
 
 def child_env() -> dict:
-    return {**os.environ, "PYTHONHASHSEED": PYTHONHASHSEED}
+    """The parent's environment with the hash seed and the thread counts pinned."""
+    return {**os.environ, "PYTHONHASHSEED": PYTHONHASHSEED, **THREAD_PINS}
 
 
 # --- files -------------------------------------------------------------------------

@@ -18,8 +18,10 @@ from .real import (
 from .synthetic import (
     BIRCH_BASE_WORKLOAD,
     BIRCH_PAPER_REFERENCE,
+    PARAM_DRIFT_SCENARIOS,
     SCENARIOS,
     BirchGeneratorConfig,
+    ParamDriftStream,
     StreamConfig,
     SyntheticStream,
     make_dstream_30k_nonconvex,
@@ -28,6 +30,7 @@ from .synthetic import (
     make_ds1,
     make_ds2,
     make_ds3,
+    make_param_drift,
     make_scalability_dataset,
     make_repstream_ds1,
     make_repstream_ds2,
@@ -46,6 +49,9 @@ __all__ = [
     "make_dstream_30k_nonconvex",
     "make_dstream_85k_dynamic",
     "make_scalability_dataset",
+    "ParamDriftStream",
+    "PARAM_DRIFT_SCENARIOS",
+    "make_param_drift",
     # BIRCH SIGMOD'96 base workload
     "BirchGeneratorConfig",
     "make_birch_dataset",

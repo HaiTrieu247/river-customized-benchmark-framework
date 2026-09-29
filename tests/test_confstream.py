@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import random
+import time
 
 import numpy as np
 import pytest
@@ -76,10 +77,11 @@ def test_victim_weights_are_uniform_when_every_score_is_equal():
     assert np.allclose(victim_weights([0.3, 0.3]), [0.5, 0.5])
 
 
-def _outcome(member_id, runtime, score=0.5, memory_mb=1.0, n_micro=10, error=None):
+def _outcome(member_id, runtime, score=0.5, memory_mb=1.0, n_micro=10, error=None, defined=True):
     return WindowOutcome(
-        member_id=member_id, score=score, defined=True, runtime_s=runtime,
-        memory_bytes=int(memory_mb * 1024 * 1024), n_micro_clusters=n_micro, error=error,
+        member_id=member_id, score=score if defined else UNDEFINED_SCORE, defined=defined,
+        runtime_s=runtime, memory_bytes=int(memory_mb * 1024 * 1024), n_micro_clusters=n_micro,
+        error=error,
     )
 
 
@@ -106,6 +108,30 @@ def test_apply_feasibility_ignores_errored_members_when_finding_the_fastest():
     apply_feasibility(outs, cfg)
     assert outs[0].feasible is False and outs[0].feasible_reason == "error"
     assert outs[1].feasible and outs[2].feasible
+
+
+def test_apply_feasibility_measures_runtime_against_the_fastest_defined_member():
+    # A member that produced no partition (it buffered the whole window, say)
+    # is the fastest by doing nothing; it must not be the runtime reference.
+    outs = [_outcome(0, 1e-4, defined=False), _outcome(1, 5e-3, score=0.7)]
+    apply_feasibility(outs, EnsembleConfig())
+    assert outs[1].feasible and outs[1].feasible_reason is None and outs[1].score == 0.7
+
+
+def test_apply_feasibility_still_sheds_a_slow_defined_member():
+    outs = [_outcome(0, 1e-3), _outcome(1, 2e-3), _outcome(2, 1.0)]
+    apply_feasibility(outs, EnsembleConfig())
+    assert [o.feasible for o in outs] == [True, True, False]
+    assert outs[2].feasible_reason == "runtime" and outs[2].score == UNDEFINED_SCORE
+
+
+def test_apply_feasibility_skips_the_runtime_cap_when_no_member_is_defined():
+    cfg = EnsembleConfig(max_memory_mb=10.0)
+    outs = [_outcome(0, 1e-4, defined=False), _outcome(1, 1.0, defined=False),
+            _outcome(2, 1.0, defined=False, memory_mb=11.0)]
+    apply_feasibility(outs, cfg)
+    assert outs[0].feasible and outs[1].feasible
+    assert outs[2].feasible is False and outs[2].feasible_reason == "memory"
 
 
 # --- ensemble life cycle ----------------------------------------------------------
@@ -274,3 +300,144 @@ def test_incumbent_tie_breaks_on_runtime_then_id():
     outs = [_outcome(3, 2.0, score=0.7), _outcome(1, 1.0, score=0.7), _outcome(2, 1.0, score=0.7)]
     ens = _ensemble(e_size=1, e_test=0)
     assert ens.pick_incumbent(outs).member_id == 1
+
+
+def test_undefined_ties_keep_the_previous_incumbent_not_the_fastest():
+    # Doing nothing is fastest: among members with no usable partition the
+    # runtime says nothing about quality, so the incumbent stays put.
+    outs = [_outcome(0, 3.0, defined=False), _outcome(1, 2.0, defined=False),
+            _outcome(2, 1e-4, defined=False)]
+    ens = _ensemble(e_size=1, e_test=0)
+    assert ens.pick_incumbent(outs, last_incumbent_id=1).member_id == 1
+
+
+def test_undefined_ties_without_a_previous_incumbent_go_to_the_oldest_member():
+    outs = [_outcome(2, 1e-4, defined=False), _outcome(0, 3.0, defined=False),
+            _outcome(1, 2.0, defined=False)]
+    ens = _ensemble(e_size=1, e_test=0)
+    assert ens.pick_incumbent(outs).member_id == 0
+    assert ens.pick_incumbent(outs, last_incumbent_id=None).member_id == 0
+    # a previous incumbent that is no longer among the outcomes changes nothing
+    assert ens.pick_incumbent(outs, last_incumbent_id=7).member_id == 0
+
+
+def test_a_defined_member_beats_an_undefined_one_whatever_the_runtime():
+    outs = [_outcome(0, 1e-4, defined=False), _outcome(1, 5.0, score=-0.2)]
+    ens = _ensemble(e_size=1, e_test=0)
+    assert ens.pick_incumbent(outs).member_id == 1
+    assert ens.pick_incumbent(outs, last_incumbent_id=0).member_id == 1
+    # even at the floor: a real silhouette of -1 still outranks no partition
+    outs = [_outcome(0, 1e-4, defined=False), _outcome(1, 5.0, score=UNDEFINED_SCORE)]
+    assert ens.pick_incumbent(outs, last_incumbent_id=0).member_id == 1
+
+
+def test_a_capped_member_ties_with_the_undefined_ones_not_with_the_defined_ones():
+    # An infeasible member carries the undefined score; the runtime that got it
+    # capped must not decide the tie either.
+    capped = _outcome(1, 9.0, score=0.8)
+    capped.feasible, capped.feasible_reason, capped.score = False, "runtime", UNDEFINED_SCORE
+    outs = [_outcome(0, 1e-4, defined=False), capped]
+    ens = _ensemble(e_size=1, e_test=0)
+    assert ens.pick_incumbent(outs, last_incumbent_id=1).member_id == 1
+    assert ens.pick_incumbent(outs).member_id == 0
+
+
+def test_process_window_keeps_the_incumbent_when_every_member_is_undefined():
+    class SlowThird:
+        """Member 2 is built to be the slowest, so a runtime tie-break never picks it."""
+
+        def __init__(self):
+            self.calls = 0
+
+        def __call__(self, params, seed):
+            self.calls += 1
+            adapter = get_algorithm("KMeans", seed=seed, **params)
+            if self.calls == 3:
+                inner = adapter.model.learn_one
+
+                def slow(x, **kw):
+                    time.sleep(0.002)
+                    return inner(x, **kw)
+                adapter.model.learn_one = slow
+            return adapter
+
+    cfg = EnsembleConfig(e_size=3, e_test=0, lam=0.05, p_reset=0.0)
+    ens = ConfStreamEnsemble(
+        space=SPACE, ctx=CTX, make_adapter=SlowThird(), start_params=[START, START, START],
+        config=cfg, rng=np.random.default_rng(0), seed=0,
+    )
+    ens.initialise(_blob_window(40, seed=0), window_index=0)
+    ens._last_incumbent_id = 2
+    # a window of identical points: no silhouette is defined for anyone
+    flat = WindowBuffer(40)
+    for i in range(40):
+        flat.push({"a": 1.0, "b": 1.0}, i % 2)
+    r = ens.process_window(flat, window_index=1)
+    assert all(not o.defined for o in r.outcomes)
+    assert all(o.feasible for o in r.outcomes)   # no defined reference, no runtime cap
+    assert r.incumbent.member_id == 2
+
+
+def test_post_resolve_is_applied_to_every_child_but_not_to_the_starts():
+    seen = []
+
+    def cap(params):
+        seen.append(dict(params))
+        return {**params, "n_clusters": 2}
+
+    cfg = EnsembleConfig(e_size=3, e_test=2, lam=0.05, p_reset=0.0)
+    ens = ConfStreamEnsemble(
+        space=SPACE, ctx=CTX, make_adapter=_make_adapter,
+        start_params=[{"n_clusters": 8, "halflife": 0.5}], config=cfg,
+        rng=np.random.default_rng(0), seed=0, post_resolve=cap,
+    )
+    ens.initialise(_blob_window(40, seed=0), window_index=0)
+    assert ens.active[0].params["n_clusters"] == 8           # an explicit start is kept
+    assert ens.active[0].adapter.model.n_clusters == 8
+    ens.process_window(_blob_window(40, seed=1), window_index=1)
+    children = ens.active[1:] + ens.test
+    assert len(children) == 4 and len(seen) == 4
+    for m in children:
+        assert m.params["n_clusters"] == 2                   # recorded as clamped
+        assert m.adapter.model.n_clusters == 2               # and built as clamped
+
+
+def test_post_resolve_defaults_to_the_identity():
+    ens = _ensemble(e_size=2, e_test=0)
+    ens.initialise(_blob_window(40, seed=0), window_index=0)
+    child = ens.active[1]
+    assert child.params == SPACE.resolve(child.u, CTX)
+
+
+# --- ensemble regimes: uniform sampler and freeze --------------------------------
+
+
+def test_uniform_sampler_spawns_parentless_children_at_initial_width():
+    ens = _ensemble(e_size=3, e_test=2, sampler="uniform")
+    ens.initialise(_blob_window(60, 0), 0)
+    rep = ens.process_window(_blob_window(60, 1), 1)
+    assert rep.n_spawned == 2
+    assert all(m.parent_id is None for m in ens.test)
+    assert all(m.state.sigma["n_clusters"] == 0.5 for m in ens.test)
+
+
+def test_unknown_sampler_is_rejected():
+    with pytest.raises(ValueError):
+        _ensemble(sampler="genetic")
+
+
+def test_freeze_collapses_onto_the_incumbent_and_stops_spawning():
+    ens = _ensemble(e_size=3, e_test=2, freeze_after_window=2)
+    ens.initialise(_blob_window(60, 0), 0)
+    r1 = ens.process_window(_blob_window(60, 1), 1)
+    assert not r1.frozen and r1.n_spawned == 2
+    r2 = ens.process_window(_blob_window(60, 2), 2)
+    assert r2.frozen and r2.n_spawned == 0 and len(ens.active) == 1
+    assert ens.active[0].id == r2.incumbent.member_id
+    r3 = ens.process_window(_blob_window(60, 3), 3)
+    assert r3.lag is not None and r3.lag.member_id == r3.incumbent.member_id
+
+
+def test_find_returns_the_live_member():
+    ens = _ensemble(); ens.initialise(_blob_window(60, 0), 0)
+    assert ens.find(ens.active[0].id) is ens.active[0] and ens.find(999) is None

@@ -18,6 +18,7 @@ from .paper_benchmarks import (
     make_dstream_85k_dynamic,
     make_scalability_dataset,
 )
+from .param_drift import PARAM_DRIFT_SCENARIOS, ParamDriftStream, make_param_drift
 from .repstream import (
     DS1_NAMES,
     DS2_NAMES,
@@ -33,6 +34,9 @@ __all__ = [
     "SCENARIOS",
     "make_scenario",
     "EVENTS",
+    "ParamDriftStream",
+    "PARAM_DRIFT_SCENARIOS",
+    "make_param_drift",
     "make_dstream_30k_nonconvex",
     "make_dstream_85k_dynamic",
     "make_scalability_dataset",

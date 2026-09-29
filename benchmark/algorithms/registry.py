@@ -30,6 +30,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable
 
 from .adapter import ClustererAdapter, build_river_path, make_adapter
+from .denstream_patched import DenStreamPatched
 from .transformers import OneHotCategorical, safe_standard_scaler
 
 # Ensure the sibling river tree is importable before we touch river.*.
@@ -191,6 +192,18 @@ def _denstream(**kw):
     return cluster.DenStream(**params), params
 
 
+def _denstream_patched(**kw):
+    # Same defaults as `_denstream` -- DenStreamPatched changes nothing but the
+    # two methods fixed in RIVER_BUGS.md BUG-7/BUG-8, so its runnable defaults
+    # stay identical and comparable to the untouched upstream entry.
+    params = dict(
+        decaying_factor=0.25, beta=0.5, mu=2.5, epsilon=0.5, n_samples_init=1000,
+        stream_speed=100,
+    )
+    params.update(kw)
+    return DenStreamPatched(**params), params
+
+
 def _dbstream(**kw):
     params = dict(
         clustering_threshold=1.0, fading_factor=0.01, cleanup_interval=2,
@@ -333,6 +346,19 @@ ALGORITHMS: dict[str, AlgorithmSpec] = {
     "DenStream": AlgorithmSpec(
         _denstream, default_preprocessor="standard",
         note="density-based with time decay; epsilon must match the data scale",
+    ),
+    "DenStreamPatched": AlgorithmSpec(
+        _denstream_patched, default_preprocessor="standard",
+        note=(
+            "DenStream with RIVER_BUGS.md BUG-7 (predict_one merges p-micro-clusters "
+            "into a shared live object, corrupting it) and BUG-8 (the offline DBSCAN "
+            "never expands a label past a direct neighbour) fixed in a subclass; "
+            "epsilon must match the data scale, same as DenStream"
+        ),
+        provenance=(
+            "DenStream from the vendored River tree with RIVER_BUGS.md BUG-7 and "
+            "BUG-8 fixed in a subclass; upstream untouched"
+        ),
     ),
     "DBSTREAM": AlgorithmSpec(
         _dbstream, default_preprocessor="standard",
@@ -592,7 +618,12 @@ def accepts_seed(name: str) -> bool:
     get_spec(name)  # validate the name
     cls = getattr(cluster, name, None)
     if cls is None:
-        return False
+        # Not every registered algorithm's class lives in `river.cluster` --
+        # DenStreamPatched (RIVER_BUGS.md BUG-7/BUG-8) is a subclass kept
+        # outside the vendored tree on purpose (AGENTS.md rule 1). Fall back to
+        # the class the registered factory actually builds, rather than
+        # reporting "no seed" just because the namespace lookup missed it.
+        cls = type(get_spec(name).factory()[0])
     params = inspect.signature(cls.__init__).parameters
     if "seed" in params:
         return True

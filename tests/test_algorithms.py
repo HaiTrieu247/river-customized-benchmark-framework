@@ -25,8 +25,18 @@ def _stream(n=3000, k=4, d=6, seed=1):
 
 
 def test_registry_covers_every_river_clusterer():
-    """A clusterer River adds and the registry misses is silently un-benchmarkable."""
-    assert set(discover_clusterers()) == set(ALGORITHMS)
+    """A clusterer River adds and the registry misses is silently un-benchmarkable.
+
+    ``DenStreamPatched`` is the one deliberate exception: a RIVER_BUGS.md
+    BUG-7/BUG-8 bug-fix subclass registered under its own name per AGENTS.md
+    rule 1, kept out of the vendored river tree on purpose, so it is not a
+    member of ``river.cluster`` and ``discover_clusterers`` will never see it.
+    Everything river actually ships still has to be a strict subset of the
+    registry, and the extra has to be exactly that one name, not a silent
+    accumulation of others.
+    """
+    assert set(discover_clusterers()) <= set(ALGORITHMS)
+    assert set(ALGORITHMS) - set(discover_clusterers()) == {"DenStreamPatched"}
 
 
 def test_capability_filters_split_the_registry_correctly():
@@ -34,11 +44,13 @@ def test_capability_filters_split_the_registry_correctly():
     # be a deliberate edit here too. It went stale once already -- DStream,
     # HPStream and RepStream were registered without it being updated, and then
     # DCUStream, DDStream and MRStream were added to river without being
-    # registered at all, so the list said nothing for either group.
+    # registered at all, so the list said nothing for either group. DenStreamPatched
+    # joined it here too (Task 7): a numeric, sample-partitioning entry like DenStream,
+    # so the default filter picks it up the same way.
     assert set(algorithms_for()) == {
         "BIRCH", "CluStream", "DBSTREAM", "DCUStream", "DDStream", "DStream",
-        "DenStream", "HPStream", "ImprovedBIRCH", "KMeans", "MRStream", "RepStream",
-        "SOStream", "STREAMKMeans",
+        "DenStream", "DenStreamPatched", "HPStream", "ImprovedBIRCH", "KMeans",
+        "MRStream", "RepStream", "SOStream", "STREAMKMeans",
     }
     # ...and the property behind it, which cannot go stale: the default filter is
     # exactly the numeric, sample-partitioning entries.

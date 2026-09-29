@@ -177,3 +177,7 @@ and the process-RSS figures respectively, and everything else still runs.
 predate the `benchmark/` package and are **superseded by it**. They are kept for
 reference only; they have not been updated for the current framework and are not
 covered by the test suite.
+
+## Online-tuning benchmark (`conf_pipeline/`)
+
+Four tuning regimes on one driver (`default`, `confstream`, `random_online`, `frozen_prefix`) plus an a-posteriori oracle from a Sobol sweep, over 8 algorithms × 18 streams, with headroom, regret decomposition, drift adaptation, Table-A common reclustering and cross-fold statistics. Open `otb_benchmark.ipynb` at this directory's root with `OTB_PRESET=tiny|pilot|full`; see [conf_pipeline/README.md](conf_pipeline/README.md).

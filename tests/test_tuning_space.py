@@ -72,6 +72,12 @@ def test_param_unit_of_clips_a_value_outside_the_range():
     assert p.unit_of(-100.0, CTX) == 0.0
 
 
+def test_unit_of_clips_a_nonpositive_value_of_a_log_kind_to_zero():
+    p = Param("threshold", "scaled", 0.05, 2.0)
+    assert p.unit_of(0.0, SpaceContext(s=10.0)) == 0.0
+    assert Param("f", "log", 0.001, 0.1).unit_of(-1.0, SpaceContext()) == 0.0
+
+
 # --- a space: resolve a unit point into constructor kwargs --------------------
 
 
