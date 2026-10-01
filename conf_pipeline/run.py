@@ -702,8 +702,17 @@ class JsonlLockPair:
         self.locks = [C.JsonlLock(runs_path, force), C.JsonlLock(windows_path, force)]
 
     def __enter__(self):
-        for lock in self.locks:
-            lock.__enter__()
+        # A lock that is refused must not leave the ones taken before it behind:
+        # the ``with`` statement never calls ``__exit__`` when ``__enter__`` fails.
+        held = []
+        try:
+            for lock in self.locks:
+                lock.__enter__()
+                held.append(lock)
+        except BaseException:
+            for lock in reversed(held):
+                lock.__exit__(None, None, None)
+            raise
         return self
 
     def __exit__(self, *exc):

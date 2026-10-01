@@ -635,3 +635,14 @@ def test_member_log_is_truncated_before_a_child_writes_so_a_retry_does_not_appen
     lines = log_path.read_text().splitlines()
     assert "stale line from a previous failed attempt" not in lines
     assert len(lines) > 0
+
+
+def test_lock_pair_releases_the_first_lock_when_the_second_is_held(tmp_path):
+    # A driver killed mid-run leaves both lock files; deleting only runs.jsonl.lock
+    # must not make the next attempt leak a fresh runs.jsonl.lock on its way out.
+    runs, windows = tmp_path / "runs.jsonl", tmp_path / "windows.jsonl"
+    (tmp_path / "windows.jsonl.lock").write_text("pid=1 started=stale\n")
+    with pytest.raises(SystemExit, match="windows.jsonl.lock"):
+        with run.JsonlLockPair(runs, windows):
+            pass
+    assert not (tmp_path / "runs.jsonl.lock").exists()
