@@ -64,7 +64,7 @@ def test_load_fold_knows_the_protocol_folds_and_the_synthetic_ones():
 
 def test_protocol_lists_eight_algorithms_eighteen_folds_four_arms():
     assert len(_common.ALGOS) == 8 and len(_common.FOLDS) == 18 and _common.ARMS == ("default","confstream","random_online","frozen_prefix")
-    assert _common.SEEDS == (1,2,3,4,5) and _common.N_SAMPLES_CAP == 100_000
+    assert _common.SEEDS == (1, 2, 3) and _common.N_SAMPLES_CAP == 100_000
 
 
 @pytest.mark.parametrize("name", ["scale_drift", "k_drift", "static_overlap"])
@@ -138,6 +138,53 @@ def test_denstreampatched_reuses_denstreams_space_and_river_defaults_via_the_ali
     assert spaces.SPACES["DenStreamPatched"].fixed == spaces.SPACES["DenStream"].fixed
     assert _common.RIVER_CLASS["DenStreamPatched"] == "DenStream"
     assert _common.river_defaults("DenStreamPatched") == _common.river_defaults("DenStream")
+
+
+def test_denstreampatchedfast_reuses_denstreams_space_and_river_defaults_via_the_alias():
+    assert spaces.SPACES["DenStreamPatchedFast"].names == spaces.SPACES["DenStream"].names
+    assert spaces.SPACES["DenStreamPatchedFast"].fixed == spaces.SPACES["DenStream"].fixed
+    assert _common.river_defaults("DenStreamPatchedFast") == _common.river_defaults("DenStream")
+    assert _common.IMPL_VARIANTS == {"DenStreamPatchedFast": "DenStream"}
+
+
+@pytest.mark.parametrize("algo", ["CluStream", "STREAMKMeans"])
+def test_kmeans_sigma_is_tuned_in_units_of_s_and_starts_at_rivers_default(algo):
+    """RIVER_BUGS.md GAP-5: the inner KMeans draws its centres from N(mu, sigma) in absolute units."""
+    (sigma,) = [p for p in spaces.SPACES[algo].params if p.name == "sigma"]
+    assert sigma.kind == "scaled" and (sigma.lo, sigma.hi) == (0.01, 1.0)
+    assert spaces.start_params(algo, h=1000, d=5)["sigma"] == 1.0
+
+
+def _small_blobs(n, seed=0):
+    # three tight blobs inside [0, 0.25]^2: the scale where River's N(0, 1) centres collapse
+    rng = random.Random(seed)
+    centres = [(0.05, 0.05), (0.2, 0.05), (0.12, 0.2)]
+    out = []
+    for i in range(n):
+        c = i % 3
+        out.append(({"a": centres[c][0] + rng.gauss(0, 0.01), "b": centres[c][1] + rng.gauss(0, 0.01)}, c))
+    return out
+
+
+def test_sigma_in_units_of_s_lifts_clustream_off_a_single_label_at_small_scale():
+    from sklearn.metrics import adjusted_rand_score
+
+    train, test = _small_blobs(3000), _small_blobs(900, seed=1)
+    s = _common.estimate_scale([x for x, _ in train[:1000]], np.random.default_rng(0))
+    space = spaces.SPACES["CluStream"]
+    base = dict(n_macro_clusters=3, max_micro_clusters=30, time_gap=100, seed=1)
+
+    def labels(sigma):
+        model = get_algorithm("CluStream", **base, sigma=sigma).model
+        for x, _ in train:
+            model.learn_one(dict(x))
+        return [model.predict_one(dict(x)) for x, _ in test]
+
+    (sigma,) = [p for p in space.params if p.name == "sigma"]
+    river_default = labels(spaces.start_params("CluStream", h=1000, d=2)["sigma"])
+    tuned = labels(sigma.value(0.5, SpaceContext(s=s, d=2)))   # the middle of the log range, 0.1 s
+    assert len(set(river_default)) == 1
+    assert adjusted_rand_score([y for _, y in test], tuned) > 0.5
 
 
 def test_hpstream_start_snaps_its_2000_sample_initialisation_into_the_space():
@@ -457,6 +504,20 @@ def test_unit_override_replaces_the_start_configuration():
     assert s["e_size"] == 1 and s["unit_override"] == {"n_clusters": 1.0, "halflife": 0.0}
 
 
+def test_params_override_replaces_the_start_by_exactly_those_parameters():
+    rows = _toy_run(arm="sweep", params_override={"n_clusters": 5, "halflife": 0.3})
+    wins = [r for r in rows if r["kind"] == "window"]
+    assert all(w["params"] == {"n_clusters": 5, "halflife": 0.3} for w in wins)
+    (s,) = [r for r in rows if r["kind"] == "run"]
+    assert s["e_size"] == 1 and s["params_override"] == {"n_clusters": 5, "halflife": 0.3}
+
+
+def test_params_override_and_unit_override_are_exclusive():
+    with pytest.raises(ValueError, match="not both"):
+        _toy_run(arm="sweep", params_override={"n_clusters": 5, "halflife": 0.3},
+                 unit_override={"n_clusters": 0.5})
+
+
 # --- CLI ------------------------------------------------------------------------------
 
 
@@ -471,7 +532,7 @@ def _cli(*args, env=None):
 def test_cli_dry_run_lists_the_full_protocol_by_default(tmp_path):
     proc = _cli("--dry-run", "--out-dir", str(tmp_path))
     assert proc.returncode == 0, proc.stderr
-    assert "2880 jobs" in proc.stdout   # 8 algos x 18 folds x 5 seeds x 4 arms
+    assert "1728 jobs" in proc.stdout   # 8 algos x 18 folds x 3 seeds x 4 arms
 
 
 def test_cli_oracle_arm_without_an_oracle_entry_is_skipped_not_run(tmp_path):

@@ -108,3 +108,17 @@ def test_the_count_reaches_the_run_result():
                        efficiency=EfficiencyMetrics(total_runtime_s=1.0, n_samples=1),
                        n_sentinel_predictions=42)
     assert result.to_dict()["n_sentinel_predictions"] == 42
+
+
+@pytest.mark.parametrize("name", ["DenStream", "DenStreamPatched", "DenStreamPatchedFast"])
+def test_subclasses_of_denstream_count_the_sentinel_they_inherit(name):
+    """BUG-6 lives in DenStream.predict_one, which both framework subclasses inherit."""
+    import random
+
+    from benchmark.algorithms.registry import get_algorithm
+
+    a = get_algorithm(name, epsilon=1e-4, mu=2, beta=0.75, n_samples_init=10, stream_speed=10)
+    rng = random.Random(0)
+    for _ in range(200):
+        a.process_one({"x": rng.random() * 1000, "y": rng.random() * 1000})
+    assert a.n_sentinel_predictions > 0

@@ -203,6 +203,7 @@ def run_ensemble(
     freeze_after_window: int | None = None,
     tail_from: int | None = None,
     config_id: int | None = None,
+    params_override: dict | None = None,
 ) -> list[dict]:
     """Run one ensemble over ``dataset`` and return its window rows + summary row.
 
@@ -210,7 +211,10 @@ def run_ensemble(
     dimension it leaves out keeps the start's *unit* value --
     ``space.unit_point(start, ctx)``, i.e. the start clamped into the space --
     not the raw River value the start resolves to. It is resolved once the
-    distance unit is known. ``freeze_after_window`` (default
+    distance unit is known. ``params_override`` replaces the start by exactly
+    these constructor parameters instead (a configuration another run settled
+    on, see ``sweep.incumbent_candidates``); the two are exclusive.
+    ``freeze_after_window`` (default
     ``FREEZE_AFTER_WINDOW``) is where ``frozen_prefix`` stops tuning, and where
     every arm's tail metrics start unless ``tail_from`` says otherwise.
 
@@ -226,6 +230,8 @@ def run_ensemble(
     if tail_from is None:
         tail_from = freeze_after_window
     cfg = arm_config(arm, cfg, freeze_after_window)
+    if unit_override and params_override:
+        raise ValueError("give unit_override or params_override, not both")
     if unit_override:
         unknown = sorted(set(unit_override) - set(space.names))
         if unknown:
@@ -285,7 +291,9 @@ def run_ensemble(
             d = len(buffer.xs[0])
             if s_online > 0 or len(calibration) >= scale_max_windows:
                 ctx = SpaceContext(s=s_online if s_online > 0 else None, d=d)
-                if unit_override:
+                if params_override:
+                    start = [dict(params_override)]
+                elif unit_override:
                     start = [space.resolve({**space.unit_point(start[0], ctx), **unit_override}, ctx)]
                 start = [clamp_init_buffers(algo, p, h) for p in start]
                 ensemble = ConfStreamEnsemble(
@@ -360,7 +368,7 @@ def run_ensemble(
     if ensemble is None:
         return [{
             "kind": "run", **base, "status": "error", "unit_override": unit_override,
-            "n_samples_cap": n_samples, "error": f"stream shorter than one window (h={h}, seen {n_seen})",
+            "params_override": params_override, "n_samples_cap": n_samples, "error": f"stream shorter than one window (h={h}, seen {n_seen})",
         }]
 
     def _mean(key, rows=window_rows):
@@ -439,6 +447,7 @@ def run_ensemble(
         "frozen_at_window": frozen_at_window,
         "frozen_params": window_rows[frozen_idx]["params"] if frozen_idx is not None else None,
         "unit_override": unit_override,
+        "params_override": params_override,
     }
     return [*window_rows, summary]
 
@@ -506,6 +515,7 @@ def _run_one_child() -> None:
         h=job["h"], n_samples=job["n_samples"], half_life_frac=job["half_life_frac"],
         lam=job["lam"], member_log=member_log, unit_override=job.get("unit_override"),
         freeze_after_window=job.get("freeze_after_window"), config_id=job.get("config_id"),
+        params_override=job.get("params_override"),
     )
     for row in rows:
         row["n_samples_cap"] = job["n_samples"]
@@ -516,6 +526,7 @@ def _failed_row(job: dict, status: str, error: str) -> dict:
     return {
         "kind": "run", "algo": job["algo"], "fold": job["fold"], "seed": job["seed"],
         "arm": job["arm"], "config_id": job.get("config_id"), "unit_override": job.get("unit_override"),
+        "params_override": job.get("params_override"),
         "n_samples_cap": job["n_samples"], "status": status, "error": (error or "")[-500:],
     }
 
@@ -616,7 +627,7 @@ def main() -> None:
             "runtime_factor": args.runtime_factor, "max_memory_mb": args.max_memory_mb,
             "max_micro_clusters": args.max_micro_clusters,
             "freeze_after_window": args.freeze_after_window, "member_log": None,
-            "config_id": None, "unit_override": None,
+            "config_id": None, "unit_override": None, "params_override": None,
         }
         if arm == "oracle_static":
             # Never fall back to defaults: an (algo, fold) the sweep has not
@@ -638,7 +649,10 @@ def main() -> None:
                     f"oracle entry for {algo}/{fold} in {oracle_file} has no 'unit' key "
                     "(a well-formed sweep output always has one, null meaning River default)"
                 )
+            # An incumbent candidate carries its exact parameters (sweep.py); a
+            # Sobol point or the default carries its unit point.
             job["config_id"], job["unit_override"] = entry.get("config_id"), entry["unit"]
+            job["params_override"] = entry.get("params_override")
         if args.log_members:
             job["member_log"] = _member_log_path(out, job)
         jobs.append(job)

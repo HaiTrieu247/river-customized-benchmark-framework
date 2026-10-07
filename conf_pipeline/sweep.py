@@ -12,14 +12,28 @@ The sweep writes its own files (``sweep.jsonl`` for summaries,
 ``windows.jsonl`` with ``run.py``: a sweep job is not one of the four protocol
 arms, and mixing them would make the resume keys in ``run.py`` ambiguous.
 
+A design of 33 points is thin in five dimensions, and an online arm that keeps
+one configuration for most of the stream can beat every one of them, which
+reads as headroom above 1 without any adaptation behind it. ``--incumbents``
+therefore adds, per (algo, fold), the configurations the online arms settled on
+(``incumbent_candidates``: the incumbent held longest and the last one, per
+run), each rerun as a fixed configuration from the start of the stream with its
+exact parameters (``params_override``) and a ``config_id`` derived from them.
+Labels play no part in picking the candidates; they only pick the winner, as
+for every other point.
+
 ``select_oracle`` then reduces the sweep to one fixed configuration per
-(algo, fold) -- the one with the best lagged score -- and writes it to
-``oracle_static.json``, which ``run.py --arms oracle_static`` reads.
+(algo, fold) -- the one with the best lagged score on the tail, the region
+every arm is compared on (the whole stream when the stream has no tail) --
+and writes it to ``oracle_static.json``, which ``run.py --arms oracle_static``
+reads.
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
+import json
 import warnings
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from itertools import product
@@ -73,6 +87,18 @@ def build_sweep_jobs(
     """
     if run_seed is None:
         run_seed = seed
+    proto = _protocol(protocol)
+
+    jobs: list[dict] = []
+    for algo, fold in product(algos, folds):
+        units = sobol_units(SPACES[algo], n_points, seed)
+        for config_id, unit_override in enumerate(units):
+            jobs.append(_sweep_job(algo, fold, run_seed, n_samples, h, proto, config_id,
+                                   unit_override=unit_override))
+    return jobs
+
+
+def _protocol(protocol: dict) -> dict:
     defaults = dict(
         p_reset=C.P_RESET, half_life_frac=C.HALF_LIFE_FRAC, runtime_factor=C.RUNTIME_FACTOR,
         max_memory_mb=C.MAX_MEMORY_MB, max_micro_clusters=C.MAX_MICRO_CLUSTERS,
@@ -80,23 +106,91 @@ def build_sweep_jobs(
     )
     unknown = sorted(set(protocol) - set(defaults))
     if unknown:
-        raise TypeError(f"build_sweep_jobs got unknown protocol overrides {unknown}")
-    proto = {**defaults, **protocol}
+        raise TypeError(f"unknown protocol overrides {unknown}")
+    return {**defaults, **protocol}
 
-    jobs: list[dict] = []
-    for algo, fold in product(algos, folds):
-        units = sobol_units(SPACES[algo], n_points, seed)
-        for config_id, unit_override in enumerate(units):
-            jobs.append({
-                "algo": algo, "fold": fold, "seed": run_seed, "arm": "sweep",
-                "n_samples": n_samples, "h": h, "e_size": 1, "e_test": 0,
-                "p_reset": proto["p_reset"], "half_life_frac": proto["half_life_frac"], "lam": None,
-                "runtime_factor": proto["runtime_factor"], "max_memory_mb": proto["max_memory_mb"],
-                "max_micro_clusters": proto["max_micro_clusters"],
-                "freeze_after_window": proto["freeze_after_window"], "member_log": None,
-                "config_id": config_id, "unit_override": unit_override,
-            })
-    return jobs
+
+def _sweep_job(algo, fold, run_seed, n_samples, h, proto, config_id,
+               unit_override=None, params_override=None) -> dict:
+    """The job dict ``run.execute`` / the child expect, for one fixed configuration."""
+    return {
+        "algo": algo, "fold": fold, "seed": run_seed, "arm": "sweep",
+        "n_samples": n_samples, "h": h, "e_size": 1, "e_test": 0,
+        "p_reset": proto["p_reset"], "half_life_frac": proto["half_life_frac"], "lam": None,
+        "runtime_factor": proto["runtime_factor"], "max_memory_mb": proto["max_memory_mb"],
+        "max_micro_clusters": proto["max_micro_clusters"],
+        "freeze_after_window": proto["freeze_after_window"], "member_log": None,
+        "config_id": config_id, "unit_override": unit_override, "params_override": params_override,
+    }
+
+
+# --- incumbents of the online arms as candidates ----------------------------------------
+
+#: Arms whose incumbents are candidates: the ones that pick configurations online.
+ONLINE_ARMS = ("confstream", "random_online", "frozen_prefix")
+#: An incumbent candidate's ``config_id`` is above every Sobol index.
+INCUMBENT_ID_BASE = C.INCUMBENT_ID_BASE
+
+
+def params_config_id(params: dict) -> int:
+    """A ``config_id`` for exact parameters: stable across resumes and key orders."""
+    blob = json.dumps(params, sort_keys=True, default=C._json_default)
+    return INCUMBENT_ID_BASE + int(hashlib.sha1(blob.encode("utf-8")).hexdigest()[:7], 16)
+
+
+def incumbent_candidates(out_dir, algos=None, folds=None, n_samples=None) -> dict[tuple, list[dict]]:
+    """Per (algo, fold), the configurations the online arms settled on, deduplicated.
+
+    From ``<out_dir>/windows.jsonl``, for every run of an ``ONLINE_ARMS`` arm
+    (algo, fold, arm, seed): the parameters of the incumbent that held the most
+    windows (ties: the earlier one), then those of the last window's incumbent.
+    Each entry is ``{"config_id", "params", "sources"}``, ``sources`` naming
+    every run and pick that produced it (``"confstream/seed1/longest"``), in
+    arm order, then seed. Rows of another sample cap than ``n_samples`` are
+    ignored when both are known.
+    """
+    runs: dict[tuple, list[tuple]] = {}
+    for row in C.read_jsonl(Path(out_dir) / "windows.jsonl"):
+        if row.get("kind") != "window" or row.get("arm") not in ONLINE_ARMS or row.get("params") is None:
+            continue
+        if (algos is not None and row["algo"] not in algos) or (folds is not None and row["fold"] not in folds):
+            continue
+        cap = row.get("n_samples_cap")
+        if n_samples is not None and cap is not None and cap != n_samples:
+            continue
+        key = (row["algo"], row["fold"], ONLINE_ARMS.index(row["arm"]), row["seed"])
+        runs.setdefault(key, []).append((row["window"], row.get("incumbent_id"), row["params"]))
+
+    out: dict[tuple, list[dict]] = {}
+    for (algo, fold, arm_i, seed) in sorted(runs):
+        rows = sorted(runs[(algo, fold, arm_i, seed)], key=lambda r: r[0])
+        held, first, params_of = {}, {}, {}
+        for window, inc, params in rows:
+            held[inc] = held.get(inc, 0) + 1
+            first.setdefault(inc, window)
+            params_of[inc] = params
+        longest = max(held, key=lambda i: (held[i], -first[i]))
+        cands = out.setdefault((algo, fold), [])
+        for pick, params in (("longest", params_of[longest]), ("last", rows[-1][2])):
+            cid = params_config_id(params)
+            source = f"{ONLINE_ARMS[arm_i]}/seed{seed}/{pick}"
+            hit = next((c for c in cands if c["config_id"] == cid), None)
+            if hit is None:
+                cands.append({"config_id": cid, "params": params, "sources": [source]})
+            else:
+                hit["sources"].append(source)
+    return out
+
+
+def build_incumbent_jobs(out_dir, algos, folds, seed: int, n_samples: int | None, h: int,
+                         **protocol) -> list[dict]:
+    """One ``arm="sweep"`` job per incumbent candidate, run with its exact parameters."""
+    proto = _protocol(protocol)
+    cands = incumbent_candidates(out_dir, algos=set(algos), folds=set(folds), n_samples=n_samples)
+    return [
+        _sweep_job(algo, fold, seed, n_samples, h, proto, c["config_id"], params_override=c["params"])
+        for (algo, fold), group in sorted(cands.items()) for c in group
+    ]
 
 
 # --- running the sweep -----------------------------------------------------------------
@@ -159,16 +253,19 @@ def run_sweep(
 
 # --- the oracle --------------------------------------------------------------------------
 
-def select_oracle(out_dir, metric: str = "lag_ari_win_mean") -> dict:
-    """Per (algo, fold), the ``ok`` sweep row with the best ``metric``.
+def select_oracle(out_dir, metrics: tuple[str, ...] = C.ORACLE_METRICS) -> dict:
+    """Per (algo, fold), the ``ok`` sweep row with the best reading (``_common.best_static``).
 
-    Rows whose ``metric`` is missing or ``None`` never win, even if their
-    ``status`` says ``"ok"``. Ties go to the smaller ``config_id`` (the
-    earlier, cheaper point). An (algo, fold) the sweep ran but produced no
-    such point for still gets an entry, with ``config_id``, ``unit`` and
-    ``params`` None and ``n_ok`` 0: ``run.py`` skips it with that reason and
-    the report tells it apart from an (algo, fold) never swept. Writes
-    ``<out_dir>/oracle_static.json`` and returns the same dict.
+    The tail decides when the sweep's rows have one, the whole stream when the
+    stream is too short to have a tail; ``select_metric`` names the one used,
+    and the winner's tail and whole-stream readings are both kept. Rows
+    without the deciding reading never win, even if their ``status`` says
+    ``"ok"``; ties go to the smaller ``config_id``. An (algo, fold) the sweep
+    ran but produced no such point for still gets an entry, with
+    ``config_id``, ``unit`` and ``params`` None and ``n_ok`` 0: ``run.py``
+    skips it with that reason and the report tells it apart from an
+    (algo, fold) never swept. Writes ``<out_dir>/oracle_static.json`` and
+    returns the same dict.
     """
     out = Path(out_dir)
     groups: dict[tuple, list[dict]] = {}
@@ -177,20 +274,25 @@ def select_oracle(out_dir, metric: str = "lag_ari_win_mean") -> dict:
 
     oracle: dict = {}
     for (algo, fold), rows in groups.items():
-        ok_rows = [r for r in rows if r.get("status") == "ok" and r.get(metric) is not None]
-        if not ok_rows:
+        picked = C.best_static(rows, metrics)
+        if picked is None:
             oracle.setdefault(algo, {})[fold] = {
                 "config_id": None, "unit": None, "params": None, "n_ok": 0, "n_error": len(rows),
             }
             continue
-        best = max(ok_rows, key=lambda r: (r[metric], -r["config_id"]))
+        best, metric = picked
+        n_ok = sum(1 for r in rows if r.get("status") == "ok" and C._reading(r.get(metric)) is not None)
         oracle.setdefault(algo, {})[fold] = {
             "config_id": best["config_id"],
+            "source": ("incumbent" if best.get("params_override")
+                       else "default" if best["config_id"] == 0 else "sobol"),
             "unit": best.get("unit_override"),
+            "params_override": best.get("params_override"),
             "params": best.get("final_params"),
-            metric: best[metric],
-            "n_ok": len(ok_rows),
-            "n_error": len(rows) - len(ok_rows),
+            "select_metric": metric,
+            **{m: best.get(m) for m in metrics},
+            "n_ok": n_ok,
+            "n_error": len(rows) - n_ok,
         }
     C.write_json(out / "oracle_static.json", oracle)
     return oracle
@@ -218,6 +320,9 @@ def main() -> None:
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--select-only", action="store_true",
                         help="skip the sweep itself; just (re)select the oracle from sweep.jsonl")
+    parser.add_argument("--incumbents", action="store_true",
+                        help="also rerun, as fixed configurations, the incumbents the online arms "
+                             "settled on (read from <out-dir>/windows.jsonl)")
     args = parser.parse_args()
 
     out = Path(args.out_dir)
@@ -227,10 +332,15 @@ def main() -> None:
         if unknown:
             raise SystemExit(f"no search space for {unknown}; known: {sorted(SPACES)}")
         n_samples = args.n_samples or None
+        folds = _csv(args.folds)
         jobs = build_sweep_jobs(
-            algos, _csv(args.folds), n_points=args.n_points, seed=args.seed,
-            n_samples=n_samples, h=args.h,
+            algos, folds, n_points=args.n_points, seed=args.seed, n_samples=n_samples, h=args.h,
         )
+        if args.incumbents:
+            incumbents = build_incumbent_jobs(out, algos, folds, seed=args.seed,
+                                              n_samples=n_samples, h=args.h)
+            print(f"{len(incumbents)} incumbent jobs from {out / 'windows.jsonl'}")
+            jobs += incumbents
         print(f"{len(jobs)} sweep jobs")
         if args.dry_run:
             for j in jobs:

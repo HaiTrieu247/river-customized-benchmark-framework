@@ -74,7 +74,10 @@ SYNTH_FOLDS: tuple[str, ...] = (
     "static_overlap", "incremental_drift", "evolving",
 )
 FOLDS: tuple[str, ...] = REAL_FOLDS + SYNTH_FOLDS
-SEEDS: tuple[int, ...] = (1, 2, 3, 4, 5)
+#: Seeds of every arm. Three, the same for all four arms, so every comparison
+#: between arms sees the same seed noise (decided 2026-10-07 after the pilot,
+#: for budget: five seeds cost 900-1 600 CPU-h).
+SEEDS: tuple[int, ...] = (1, 2, 3)
 #: The tuning regimes every (algo, fold, seed) is run under.
 ARMS: tuple[str, ...] = ("default", "confstream", "random_online", "frozen_prefix")
 #: Single-configuration arms driven by a file: the sweep's points and its winner.
@@ -85,6 +88,11 @@ N_SAMPLES_CAP = 100_000
 #: start here, so all arms are compared on the same evaluation region.
 FREEZE_AFTER_WINDOW = 20
 SWEEP_N_POINTS = 32
+#: The readings the static oracle is picked on, in order of preference: the tail, the
+#: region every arm is compared on, then the whole stream for a stream too short to
+#: have a tail. Picking on the whole stream would let a strong start win a ceiling
+#: that is read on the tail.
+ORACLE_METRICS: tuple[str, ...] = ("lag_ari_win_tail_mean", "lag_ari_win_mean")
 MIN_CEILING_GAIN = 0.05
 #: Length of a synthetic fold when no cap is given.
 SYNTH_N_SAMPLES = 120_000
@@ -129,7 +137,15 @@ def estimate_scale(xs, rng: np.random.Generator, subsample: int = SCALE_SUBSAMPL
 
 
 #: Algorithms registered under a project name whose constructor is a River class.
-RIVER_CLASS = {"DenStreamPatched": "DenStream"}
+RIVER_CLASS = {"DenStreamPatched": "DenStream", "DenStreamPatchedFast": "DenStream"}
+#: Implementation variants run beside the River class they re-implement (spec
+#: 4.6, table T7): never ranked with the protocol algorithms, read against
+#: their reference instead. DenStreamPatchedFast fixes BUG-7/BUG-8 and returns
+#: what DenStreamPatched returns at a fraction of the cost (GAP-3).
+IMPL_VARIANTS = {"DenStreamPatchedFast": "DenStream"}
+#: ``config_id`` of a sweep point that reruns an online arm's incumbent with its
+#: exact parameters (``sweep.incumbent_candidates``): above every Sobol index.
+INCUMBENT_ID_BASE = 1_000_000
 
 
 def river_defaults(algo: str) -> dict:
@@ -187,6 +203,33 @@ def drift_points(fold: str, n_samples: int | None) -> tuple[int, ...]:
     if fold in PARAM_DRIFT_SCENARIOS:
         return make_param_drift(fold, n_samples=n_samples or SYNTH_N_SAMPLES).drift_points
     return ()
+
+
+def best_static(rows, metrics: tuple[str, ...] = ORACLE_METRICS) -> tuple[dict, str] | None:
+    """The winning fixed configuration among one (algo, fold)'s sweep rows, and the metric it won on.
+
+    The first of ``metrics`` that some ``ok`` row has a reading of decides; a row
+    without that reading never wins. Ties go to the smaller ``config_id`` (the
+    earlier, cheaper point). None when no ``ok`` row has any of ``metrics``.
+    """
+    ok = [r for r in rows if r.get("status") == "ok"]
+    for metric in metrics:
+        cands = [r for r in ok if _reading(r.get(metric)) is not None]
+        if cands:
+            best = max(cands, key=lambda r: (_reading(r[metric]), -(r.get("config_id") or 0)))
+            return best, metric
+    return None
+
+
+def _reading(v) -> float | None:
+    """A finite number, or None (a missing key, None, NaN)."""
+    if v is None or isinstance(v, bool):
+        return None
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return None
+    return None if f != f else f
 
 
 def child_env() -> dict:

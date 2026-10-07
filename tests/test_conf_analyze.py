@@ -119,6 +119,42 @@ def test_kendall_matrix_without_a_shared_fold_is_nan_off_the_diagonal(summary):
     assert np.isnan(k.loc["default", "confstream"]) and k.loc["default", "default"] == 1.0
 
 
+def test_kendall_complete_only_ranks_just_the_algos_both_arms_read(summary):
+    # A, best on f2, has no confstream reading there. Ranked last it reverses two pairs
+    # (tau(f2) = -1/3); compared only on B and C, which agree, f2 reads 1.
+    s = summary[~((summary["arm"] == "confstream") & (summary["fold"] == "f2") & (summary["algo"] == "A"))]
+    every = analyze.kendall_matrix(s, ["default", "confstream"])
+    both = analyze.kendall_matrix(s, ["default", "confstream"], complete_only=True)
+    # f1 1/3 (as in the fixture), f3 and f4 1
+    assert every.loc["default", "confstream"] == pytest.approx((1 / 3 - 1 / 3 + 2) / 4)
+    assert both.loc["default", "confstream"] == pytest.approx((1 / 3 + 3) / 4)
+
+
+def test_kendall_complete_only_skips_a_fold_with_fewer_than_two_shared_algos(summary):
+    # f1: confstream reads A and B, default A and C. Each arm ranks two algorithms, so the
+    # fold counts when a missing reading ranks last (tau 1/3), but only A is shared.
+    s = summary[~((summary["arm"] == "confstream") & (summary["fold"] == "f1") & (summary["algo"] == "C"))]
+    s = s[~((s["arm"] == "default") & (s["fold"] == "f1") & (s["algo"] == "B"))]
+    every = analyze.kendall_matrix(s, ["default", "confstream"])
+    both = analyze.kendall_matrix(s, ["default", "confstream"], complete_only=True)
+    assert every.loc["default", "confstream"] == pytest.approx((1 / 3 + 3) / 4)
+    assert both.loc["default", "confstream"] == 1.0     # f1 skipped; f2..f4 agree
+
+
+# --- degenerate cells ----------------------------------------------------------------------
+
+def test_degenerate_table_counts_cells_whose_lagged_windows_are_mostly_undefined(summary):
+    s = summary.assign(lag_undefined_share=0.0)
+    s.loc[(s["arm"] == "default") & (s["fold"].isin(["f1", "f2"])), "lag_undefined_share"] = 0.9
+    s.loc[(s["arm"] == "default") & (s["fold"] == "f3") & (s["algo"] == "A"), "lag_undefined_share"] = 0.5
+    t = analyze.degenerate_table(s).set_index("arm")
+    # default: 11 cells, 6 on f1/f2 above 0.5; 0.5 itself is not above the threshold
+    assert t.loc["default", "n_cells"] == 11 and t.loc["default", "n_degenerate"] == 6
+    assert t.loc["default", "share"] == pytest.approx(6 / 11)
+    assert t.loc["confstream", "n_degenerate"] == 0
+    assert analyze.degenerate_table(s, threshold=0.4).set_index("arm").loc["default", "n_degenerate"] == 7
+
+
 # --- friedman_nemenyi ----------------------------------------------------------------------
 
 def test_friedman_nemenyi_returns_cd_for_three_methods(summary):
@@ -295,6 +331,15 @@ def test_regret_means_read_the_tail_region_of_one_arm():
     assert analyze.regret_means(regret, "frozen_prefix").empty
 
 
+def test_regret_means_read_the_delayed_label_terms_the_figure_plots():
+    rows = [("A", "f1", "confstream", "tail", 0.1, 0.5), ("A", "f2", "confstream", "tail", 0.3, -0.1)]
+    regret = pd.DataFrame(rows, columns=["algo", "fold", "arm", "region", "R_search_lag", "R_proxy_lag"],
+                          dtype=object)
+    means = analyze.regret_means(regret, "confstream", terms=analyze.REGRET_TERMS_LAG)
+    assert list(means.columns) == ["R_search_lag", "R_proxy_lag"]
+    assert means.loc["A", "R_search_lag"] == pytest.approx(0.2) and means.loc["A", "R_proxy_lag"] == pytest.approx(0.2)
+
+
 # --- fidelity ------------------------------------------------------------------------------
 
 def test_fidelity_is_one_for_the_same_ranking_and_nan_below_three_algos(summary):
@@ -390,6 +435,23 @@ def test_write_analysis_writes_every_table_and_figure(summary_dir):
     assert kendall.loc["default", "confstream"] == pytest.approx(1 / 3)
 
 
+def test_write_analysis_adds_the_complete_case_kendall_and_the_degenerate_count(summary_dir):
+    runs = [json.loads(line) for line in (summary_dir / "runs.jsonl").read_text().splitlines()]
+    for r in runs:
+        r["lag_undefined_share"] = 1.0 if (r["arm"], r["algo"]) == ("default", "Beta") else 0.0
+    _write_jsonl(summary_dir / "runs.jsonl", runs)
+    names = {p.name for p in analyze.write_analysis(summary_dir)}
+    assert {"kendall_complete.csv", "degenerate.csv", "F2_kendall_complete.png"} <= names
+    rep = summary_dir / "report"
+    both = pd.read_csv(rep / "kendall_complete.csv", index_col=0)
+    assert both.loc["default", "confstream"] == pytest.approx(1 / 3)   # every cell has both arms
+    deg = pd.read_csv(rep / "degenerate.csv").set_index("arm")
+    assert deg.loc["default", "n_degenerate"] == 3 and deg.loc["confstream", "n_degenerate"] == 0
+    section = (rep / "analysis.md").read_text().split("## Ranking agreement between arms (Kendall τ)")[1]
+    section = section.split("\n## ")[0]
+    assert "complete" in section and "degenerate" in section
+
+
 def test_write_analysis_ranks_a_cell_missing_a_seed_last(summary_dir):
     runs = [json.loads(line) for line in (summary_dir / "runs.jsonl").read_text().splitlines()]
     runs = [r for r in runs if (r["algo"], r["fold"], r["arm"], r["seed"]) != ("Alpha", "covtype", "confstream", 2)]
@@ -424,3 +486,51 @@ def test_write_analysis_on_an_empty_out_dir(tmp_path):
     names = {p.name for p in paths}
     assert "analysis.md" in names and "F3_regret.png" not in names
     assert not any(n.startswith("F4_") for n in names)
+
+
+# --- implementation variants (spec 4.6, table T7) -----------------------------------------------
+
+@pytest.fixture
+def with_variant(summary, monkeypatch):
+    """B re-implemented as Bfast: equal to B everywhere except confstream/f1, where it leads."""
+    monkeypatch.setattr(analyze.C, "IMPL_VARIANTS", {"Bfast": "B"})
+    rows = summary[summary["algo"] == "B"].assign(algo="Bfast")
+    rows.loc[(rows["arm"] == "confstream") & (rows["fold"] == "f1"), TAIL] = 0.85
+    return pd.concat([summary, rows], ignore_index=True)
+
+
+def test_an_implementation_variant_is_ranked_with_nobody(summary, with_variant):
+    assert analyze.rank_matrix(with_variant, "confstream").columns.tolist() == ["A", "B", "C"]
+    pd.testing.assert_frame_equal(analyze.kendall_matrix(with_variant, ["default", "confstream"]),
+                                  analyze.kendall_matrix(summary, ["default", "confstream"]))
+    assert analyze.win_tie_loss(with_variant, "confstream")["algo"].tolist() == ["A", "B", "C"]
+    pd.testing.assert_frame_equal(analyze.pareto_table(with_variant), analyze.pareto_table(summary))
+    assert analyze.fidelity(with_variant, with_variant, "confstream")["n"] == 3
+
+
+def test_impl_table_reads_each_variant_against_its_reference(with_variant):
+    t = analyze.impl_table(with_variant).set_index(["arm", "fold"])
+    f1 = t.loc[("confstream", "f1")]
+    assert (f1["variant"], f1["reference"]) == ("Bfast", "B")
+    assert f1["delta"] == pytest.approx(0.25)
+    assert (f1["rank_reference"], f1["rank_variant"], f1["rank_change"]) == (2.0, 1.0, 1.0)
+    rest = t.drop(index=("confstream", "f1"))
+    assert (rest["delta"].abs() < 1e-12).all() and (rest["rank_change"] == 0).all()
+    assert len(t) == 12            # 3 arms x 4 folds where both B and Bfast have a reading
+
+
+def test_impl_table_without_a_variant_is_empty_with_its_columns(summary):
+    assert analyze.impl_table(summary).columns.tolist() == analyze.IMPL_COLS
+    assert analyze.impl_table(summary).empty
+
+
+def test_write_analysis_reports_the_variant_in_its_own_section(summary_dir, monkeypatch):
+    monkeypatch.setattr(analyze.C, "IMPL_VARIANTS", {"BetaFast": "Beta"})
+    runs = [json.loads(line) for line in (summary_dir / "runs.jsonl").read_text().splitlines()]
+    _write_jsonl(summary_dir / "runs.jsonl",
+                 runs + [{**r, "algo": "BetaFast"} for r in runs if r["algo"] == "Beta"])
+    paths = analyze.write_analysis(summary_dir)
+    assert "impl_T7.csv" in {p.name for p in paths}
+    md = (summary_dir / "report" / "analysis.md").read_text()
+    assert "## Implementation variants (T7)" in md
+    assert pd.read_csv(summary_dir / "report" / "ranks_confstream.csv", index_col=0).columns.tolist() == ["Alpha", "Beta"]

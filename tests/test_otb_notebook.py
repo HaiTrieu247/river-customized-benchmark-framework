@@ -52,3 +52,37 @@ def test_the_notebook_on_disk_is_the_generated_one():
     assert [(c.cell_type, c.source) for c in on_disk.cells] == [
         (c.cell_type, c.source) for c in make_notebook.build().cells
     ]
+
+
+def _panel(preset, out_dir, monkeypatch):
+    """The control panel cell, run for ``preset``: the globals it leaves behind."""
+    from conf_pipeline import _common as C
+    from conf_pipeline import make_notebook
+
+    monkeypatch.setenv("OTB_PRESET", preset)
+    monkeypatch.setenv("OTB_OUT_DIR", str(out_dir))
+    ns = {"os": os, "Path": Path, "REPO": REPO, "C": C}
+    exec(make_notebook.PANEL, ns)
+    return ns
+
+
+@pytest.mark.parametrize("preset", ["tiny", "smoke", "pilot", "full"])
+def test_every_preset_leaves_a_tail_and_reruns_the_oracle_on_known_seeds(preset, tmp_path, monkeypatch):
+    ns = _panel(preset, tmp_path, monkeypatch)
+    assert ns["N_SAMPLES"] // ns["H"] > ns["FREEZE_AFTER_WINDOW"]
+    assert "--incumbents" in ns["SWEEP_ARGS"]
+
+
+def test_full_runs_three_seeds_and_reruns_the_oracle_on_three_others(tmp_path, monkeypatch):
+    from conf_pipeline import _common as C
+
+    ns = _panel("full", tmp_path, monkeypatch)
+    assert ns["SEEDS"] == [1, 2, 3] and ns["ORACLE_SEEDS"] == [2, 3, 4]
+    assert ns["ALGOS"] == [*C.ALGOS, *C.IMPL_VARIANTS] and ns["FOLDS"] == list(C.FOLDS)
+
+
+def test_smoke_covers_every_cell_of_full_on_a_short_stream(tmp_path, monkeypatch):
+    smoke, full = _panel("smoke", tmp_path, monkeypatch), _panel("full", tmp_path, monkeypatch)
+    assert smoke["ALGOS"] == full["ALGOS"] and smoke["FOLDS"] == full["FOLDS"]
+    assert smoke["SEEDS"] == [1] and smoke["N_SAMPLES"] < full["N_SAMPLES"]
+    assert smoke["E_SIZE"] == full["E_SIZE"] and smoke["E_TEST"] == full["E_TEST"]

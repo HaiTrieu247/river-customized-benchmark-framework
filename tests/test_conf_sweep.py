@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import json
+import subprocess
+import sys
+from pathlib import Path
 
 from conf_pipeline import sweep
 from conf_pipeline.spaces import SPACES
@@ -42,6 +45,31 @@ def test_select_oracle_skips_errored_configs_and_reports_them(tmp_path):
     assert o["A"]["f"]["config_id"] == 1 and o["A"]["f"]["n_error"] == 1
 
 
+def test_select_oracle_picks_the_best_tail_not_the_best_whole_stream(tmp_path):
+    # config 1 wins the whole stream on a strong start; config 2 wins the tail, the region
+    # every arm is compared on
+    rows = [{"algo": "A", "fold": "f", "seed": 1, "config_id": 1, "status": "ok",
+             "lag_ari_win_mean": 0.6, "lag_ari_win_tail_mean": 0.3,
+             "unit_override": {"x": 0.1}, "final_params": {"x": 1}},
+            {"algo": "A", "fold": "f", "seed": 1, "config_id": 2, "status": "ok",
+             "lag_ari_win_mean": 0.5, "lag_ari_win_tail_mean": 0.4,
+             "unit_override": {"x": 0.9}, "final_params": {"x": 2}}]
+    (tmp_path / "sweep.jsonl").write_text("\n".join(json.dumps(r) for r in rows) + "\n")
+    entry = sweep.select_oracle(tmp_path)["A"]["f"]
+    assert entry["config_id"] == 2 and entry["select_metric"] == "lag_ari_win_tail_mean"
+    assert entry["lag_ari_win_tail_mean"] == 0.4 and entry["lag_ari_win_mean"] == 0.5
+
+
+def test_select_oracle_falls_back_to_the_whole_stream_without_a_tail(tmp_path):
+    # a stream shorter than tail_from has no tail reading on any point
+    rows = [{"algo": "A", "fold": "f", "seed": 1, "config_id": c, "status": "ok",
+             "lag_ari_win_mean": whole, "lag_ari_win_tail_mean": None,
+             "unit_override": {"x": 0.5}, "final_params": {"x": c}} for c, whole in ((1, 0.2), (2, 0.3))]
+    (tmp_path / "sweep.jsonl").write_text("\n".join(json.dumps(r) for r in rows) + "\n")
+    entry = sweep.select_oracle(tmp_path)["A"]["f"]
+    assert entry["config_id"] == 2 and entry["select_metric"] == "lag_ari_win_mean"
+
+
 def test_select_oracle_records_an_algo_fold_whose_sweep_produced_no_ok_point(tmp_path):
     rows = [{"algo": "A", "fold": "g", "seed": 1, "config_id": c, "status": "error", "error": "boom"}
             for c in (0, 1)]
@@ -52,3 +80,92 @@ def test_select_oracle_records_an_algo_fold_whose_sweep_produced_no_ok_point(tmp
     assert o["A"]["g"] == {"config_id": None, "unit": None, "params": None, "n_ok": 0, "n_error": 2}
     assert o["A"]["f"]["config_id"] == 0
     assert json.loads((tmp_path / "oracle_static.json").read_text()) == o
+
+
+# --- incumbents of the online arms as ceiling candidates ---------------------------------
+
+def _win(algo, fold, arm, seed, w, inc, params):
+    return {"kind": "window", "algo": algo, "fold": fold, "arm": arm, "seed": seed, "window": w,
+            "config_id": None, "incumbent_id": inc, "params": params}
+
+
+P1, P2, P3 = {"x": 1, "y": 0.5}, {"x": 2, "y": 0.5}, {"x": 3, "y": 0.1}
+
+
+def _write_windows(path, rows):
+    path.write_text("\n".join(json.dumps(r) for r in rows) + "\n")
+
+
+def test_incumbent_candidates_are_the_longest_held_and_the_last_incumbent(tmp_path):
+    rows = [_win("A", "f", "confstream", 1, w, inc, p) for w, (inc, p) in
+            enumerate([(7, P1), (7, P1), (9, P2), (9, P2), (9, P2), (4, P3)])]
+    rows += [_win("A", "f", "frozen_prefix", 1, w, 2, P2) for w in range(4)]          # same as P2
+    rows += [_win("A", "f", "default", 1, w, 0, {"x": 9, "y": 9}) for w in range(4)]   # not online
+    rows += [_win("A", "f", "oracle_static", 1, w, 0, {"x": 8, "y": 8}) for w in range(4)]
+    _write_windows(tmp_path / "windows.jsonl", rows)
+    cands = sweep.incumbent_candidates(tmp_path)
+    got = cands[("A", "f")]
+    assert [c["params"] for c in got] == [P2, P3]            # longest held, then last; deduplicated
+    assert {c["config_id"] for c in got} == {sweep.params_config_id(P2), sweep.params_config_id(P3)}
+    assert all(c["config_id"] >= sweep.INCUMBENT_ID_BASE for c in got)
+    assert got[0]["sources"] == ["confstream/seed1/longest", "frozen_prefix/seed1/longest",
+                                 "frozen_prefix/seed1/last"]
+
+
+def test_params_config_id_is_stable_and_ignores_key_order():
+    assert sweep.params_config_id({"x": 1, "y": 0.5}) == sweep.params_config_id({"y": 0.5, "x": 1})
+    assert sweep.params_config_id(P1) != sweep.params_config_id(P2)
+
+
+def test_incumbent_jobs_run_their_parameters_and_can_become_the_oracle(tmp_path):
+    rows = [_win("A", "f", "confstream", 1, w, 3, P1) for w in range(3)]
+    _write_windows(tmp_path / "windows.jsonl", rows)
+    jobs = sweep.build_incumbent_jobs(tmp_path, ["A"], ["f"], seed=1, n_samples=900, h=300)
+    (job,) = jobs
+    assert job["params_override"] == P1 and job["unit_override"] is None and job["arm"] == "sweep"
+    assert job["config_id"] == sweep.params_config_id(P1)
+    (tmp_path / "sweep.jsonl").write_text("\n".join(json.dumps(r) for r in [
+        {"algo": "A", "fold": "f", "seed": 1, "config_id": 0, "status": "ok", "lag_ari_win_mean": 0.2,
+         "unit_override": None, "params_override": None, "final_params": {"x": 0}},
+        {"algo": "A", "fold": "f", "seed": 1, "config_id": job["config_id"], "status": "ok",
+         "lag_ari_win_mean": 0.6, "unit_override": None, "params_override": P1, "final_params": P1},
+    ]) + "\n")
+    entry = sweep.select_oracle(tmp_path)["A"]["f"]
+    assert entry["source"] == "incumbent" and entry["params_override"] == P1 and entry["unit"] is None
+
+
+def test_the_cli_reruns_an_incumbent_oracle_with_its_parameters(tmp_path):
+    """End to end: arms, sweep with incumbents, oracle rerun on the incumbent's exact parameters."""
+    repo = Path(__file__).resolve().parent.parent
+    common = ["--algos", "DenStream", "--folds", "static_easy", "--n-samples", "900", "--h", "300",
+              "--out-dir", str(tmp_path), "--workers", "1"]
+    env = {"PYTHONHASHSEED": "0", "PATH": "/usr/bin:/bin"}
+
+    def cli(module, *args):
+        proc = subprocess.run([sys.executable, "-m", module, *common, *args], cwd=repo, env=env,
+                              capture_output=True, text=True)
+        assert proc.returncode == 0, proc.stderr
+        return proc.stdout
+
+    cli("conf_pipeline.run", "--seeds", "1", "--arms", "confstream", "--e-size", "2", "--e-test", "1",
+        "--freeze-after-window", "1")
+    out = cli("conf_pipeline.sweep", "--n-points", "1", "--incumbents")
+    assert "incumbent" in out
+    sweep_rows = [json.loads(l) for l in (tmp_path / "sweep.jsonl").read_text().splitlines()]
+    inc = [r for r in sweep_rows if r["config_id"] >= sweep.INCUMBENT_ID_BASE]
+    assert inc and all(r["status"] == "ok" and r["params_override"] for r in inc)
+    # Make an incumbent the oracle whatever won, so the rerun path is always exercised.
+    pick = inc[0]
+    path = tmp_path / "oracle_static.json"
+    oracle = json.loads(path.read_text())
+    oracle["DenStream"]["static_easy"].update(
+        config_id=pick["config_id"], source="incumbent", unit=None,
+        params_override=pick["params_override"], params=pick["final_params"],
+    )
+    path.write_text(json.dumps(oracle))
+    cli("conf_pipeline.run", "--seeds", "1", "--arms", "oracle_static")
+    runs = [json.loads(l) for l in (tmp_path / "runs.jsonl").read_text().splitlines()]
+    (o,) = [r for r in runs if r["arm"] == "oracle_static"]
+    assert o["status"] == "ok" and o["config_id"] == pick["config_id"]
+    assert o["start_params"] == pick["params_override"]
+    assert o["lag_ari_win_mean"] == pick["lag_ari_win_mean"]      # same seed, same configuration

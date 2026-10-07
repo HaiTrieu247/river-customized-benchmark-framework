@@ -76,3 +76,4 @@ hpo_pipeline/out/
 !hpo_pipeline/configs/search_space.json
 
 result/
+conf_pipeline/out/

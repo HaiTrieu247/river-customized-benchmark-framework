@@ -24,19 +24,29 @@ def _stream(n=3000, k=4, d=6, seed=1):
     )
 
 
+#: The framework subclasses in the registry: entry -> (the entry it extends,
+#: whether it predicts exactly what that entry predicts on every sample).
+FRAMEWORK_ENTRIES = {
+    "DenStreamPatched": ("DenStream", False),            # RIVER_BUGS.md BUG-7, BUG-8
+    "DenStreamPatchedFast": ("DenStreamPatched", True),  # GAP-3
+    "CluStreamPyramidal": ("CluStream", True),           # GAP-4, without a horizon
+}
+
+
 def test_registry_covers_every_river_clusterer():
     """A clusterer River adds and the registry misses is silently un-benchmarkable.
 
-    ``DenStreamPatched`` is the one deliberate exception: a RIVER_BUGS.md
-    BUG-7/BUG-8 bug-fix subclass registered under its own name per AGENTS.md
-    rule 1, kept out of the vendored river tree on purpose, so it is not a
-    member of ``river.cluster`` and ``discover_clusterers`` will never see it.
-    Everything river actually ships still has to be a strict subset of the
-    registry, and the extra has to be exactly that one name, not a silent
-    accumulation of others.
+    The deliberate exceptions are the framework subclasses in
+    ``FRAMEWORK_ENTRIES``: ``DenStreamPatched`` (RIVER_BUGS.md BUG-7/BUG-8),
+    ``DenStreamPatchedFast`` (GAP-3) and ``CluStreamPyramidal`` (GAP-4), each
+    registered under its own name per AGENTS.md rule 1.3 and kept out of the
+    vendored river tree on purpose, so none is a member of ``river.cluster``
+    and ``discover_clusterers`` will never see them. Everything river actually
+    ships still has to be a subset of the registry, and the extras have to be
+    exactly those names, not a silent accumulation of others.
     """
     assert set(discover_clusterers()) <= set(ALGORITHMS)
-    assert set(ALGORITHMS) - set(discover_clusterers()) == {"DenStreamPatched"}
+    assert set(ALGORITHMS) - set(discover_clusterers()) == set(FRAMEWORK_ENTRIES)
 
 
 def test_capability_filters_split_the_registry_correctly():
@@ -46,11 +56,14 @@ def test_capability_filters_split_the_registry_correctly():
     # DCUStream, DDStream and MRStream were added to river without being
     # registered at all, so the list said nothing for either group. DenStreamPatched
     # joined it here too (Task 7): a numeric, sample-partitioning entry like DenStream,
-    # so the default filter picks it up the same way.
+    # so the default filter picks it up the same way. DenStreamPatchedFast (GAP-3)
+    # and CluStreamPyramidal (GAP-4) joined it the same way, so a default
+    # run_benchmark.py run includes them next to the entries they extend.
     assert set(algorithms_for()) == {
-        "BIRCH", "CluStream", "DBSTREAM", "DCUStream", "DDStream", "DStream",
-        "DenStream", "DenStreamPatched", "HPStream", "ImprovedBIRCH", "KMeans",
-        "MRStream", "RepStream", "SOStream", "STREAMKMeans",
+        "BIRCH", "CluStream", "CluStreamPyramidal", "DBSTREAM", "DCUStream",
+        "DDStream", "DStream", "DenStream", "DenStreamPatched", "DenStreamPatchedFast",
+        "HPStream", "ImprovedBIRCH", "KMeans", "MRStream", "RepStream", "SOStream",
+        "STREAMKMeans",
     }
     # ...and the property behind it, which cannot go stale: the default filter is
     # exactly the numeric, sample-partitioning entries.
@@ -74,6 +87,37 @@ def test_sample_partitioning_algorithms_produce_scored_runs(name):
     assert res.partitions_samples is True
     assert res.quality["ari"] is not None
     assert res.efficiency.throughput_sps > 0
+
+
+@pytest.mark.parametrize("name", sorted(FRAMEWORK_ENTRIES))
+def test_framework_entries_produce_scored_runs_like_the_entry_they_extend(name):
+    """Each framework subclass runs through the registry as its reference does.
+
+    It shares the reference's protocol and preprocessor and says in its
+    provenance that upstream is untouched. Where the subclass claims exact
+    predictions, the same run must score identically, which is what lets a
+    report put the two rows side by side.
+    """
+    ref, exact = FRAMEWORK_ENTRIES[name]
+    spec, ref_spec = get_spec(name), get_spec(ref)
+    assert (spec.partitions_samples, spec.input_kind, spec.default_preprocessor) == (
+        ref_spec.partitions_samples, ref_spec.input_kind, ref_spec.default_preprocessor
+    )
+    assert "upstream untouched" in spec.provenance
+    assert spec.factory()[1].items() >= ref_spec.factory()[1].items()
+
+    res = run_once(get_algorithm(name, scaler="standard"), _stream(),
+                   n_checkpoints=3, window_size=500)
+    assert res.partitions_samples is True
+    assert res.quality["ari"] is not None
+    assert res.efficiency.throughput_sps > 0
+    assert type(get_algorithm(name).model).__name__ == name
+    if exact:
+        ref_res = run_once(get_algorithm(ref, scaler="standard"), _stream(),
+                           n_checkpoints=3, window_size=500)
+        assert res.quality == ref_res.quality
+        assert res.quality_stream == ref_res.quality_stream
+        assert res.efficiency.final_macro_clusters == ref_res.efficiency.final_macro_clusters
 
 
 def test_odac_clusters_variables_so_it_is_scored_on_structure_not_labels():

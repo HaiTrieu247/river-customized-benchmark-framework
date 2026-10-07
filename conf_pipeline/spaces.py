@@ -4,13 +4,18 @@ The ranges of DenStream, CluStream and RepStream are the ones
 ``hpo_pipeline/space.py`` searches, so the two pipelines can be read against
 each other; the other five are new here. Every parameter is explored on its own
 scale (see ``benchmark.tuning.space``) and the only data-dependent unit is
-``s``, the median pairwise distance of the calibration window. Four algorithms
+``s``, the median pairwise distance of the calibration window. Six algorithms
 consume it, each through one distance parameter of kind ``scaled``: DenStream's
-``epsilon``, DBSTREAM's ``clustering_threshold``, SOStream's ``merge_threshold``
-and BIRCH's ``threshold``. The rest carry no distance in their parameters:
-CluStream tunes a count and a radius factor, HPStream normalises internally,
-RepStream's ``alpha`` scales a representative's own local density, and
-STREAMKMeans tunes a count, a chunk size and a half-life.
+``epsilon``, DBSTREAM's ``clustering_threshold``, SOStream's ``merge_threshold``,
+BIRCH's ``threshold``, and the ``sigma`` that CluStream and STREAMKMeans forward
+to their inner ``KMeans``. That ``KMeans`` draws every centre coordinate from
+N(mu=0, sigma=1) in absolute units (RIVER_BUGS.md GAP-5), so on data whose
+spread is far from 1 all points fall to one centre; ``sigma`` in units of ``s``
+follows the data's spread. It cannot fix a stream whose features sit on
+different scales or far from the origin (covtype, INSECTS raw): no single
+N(mu, sigma) covers them, and the protocol does not rescale. The rest carry no
+distance in their parameters: HPStream normalises internally and RepStream's
+``alpha`` scales a representative's own local density.
 
 ``n_samples_init`` (and STREAMKMeans' ``chunk_size``) is capped at the window
 size, for the start (``start_params``) and for every child the ensemble draws
@@ -45,6 +50,7 @@ SPACES: dict[str, ParamSpace] = {
             Param("n_macro_clusters", "log_int", 2, 60),
             Param("max_micro_clusters", "log_int", 25, 800),
             Param("micro_cluster_r_factor", "choice", values=(1, 2, 4, 8)),
+            Param("sigma", "scaled", 0.01, 1.0),
         ),
         fixed={"time_gap": 100},
     ),
@@ -86,6 +92,7 @@ SPACES: dict[str, ParamSpace] = {
             Param("n_clusters", "log_int", 2, 60),
             Param("chunk_size", "choice", values=(10, 100, 500, 1000)),
             Param("halflife", "lin", 0.1, 0.9),
+            Param("sigma", "scaled", 0.01, 1.0),
         ),
     ),
     "SOStream": ParamSpace(
@@ -113,18 +120,24 @@ SPACES: dict[str, ParamSpace] = {
     ),
 }
 
-#: DenStreamPatched (Task 7) is a River-side workaround registered under its own
-#: name; the search space it tunes is identical to DenStream's.
+#: DenStreamPatched (BUG-7/BUG-8) and DenStreamPatchedFast (the same, with GAP-3
+#: closed) are River-side workarounds registered under their own names; the
+#: search space they tune is identical to DenStream's. The protocol runs the
+#: fast one as DenStream's implementation variant (``_common.IMPL_VARIANTS``).
 SPACES["DenStreamPatched"] = dataclasses.replace(SPACES["DenStream"], algo="DenStreamPatched")
+SPACES["DenStreamPatchedFast"] = dataclasses.replace(SPACES["DenStream"], algo="DenStreamPatchedFast")
 
 
 #: River's HPStream projects on this share of the dimensions when
 #: ``n_projected_dimensions`` is left at ``None`` (`hpstream._DEFAULT_PROJECTION`).
 HPSTREAM_DEFAULT_PROJECTION = 0.6
 
-#: Tunable names River's signature does not default (STREAMKMeans forwards
-#: halflife through **kwargs to KMeans, whose default is 0.5).
-START_OVERRIDES = {"STREAMKMeans": {"halflife": 0.5}}
+#: Tunable names River's signature does not default: CluStream and
+#: STREAMKMeans forward them through **kwargs to KMeans, whose defaults these are.
+START_OVERRIDES = {
+    "CluStream": {"sigma": 1.0},
+    "STREAMKMeans": {"halflife": 0.5, "sigma": 1.0},
+}
 #: Buffers a member must fill before it partitions anything; capped at h.
 INIT_BUFFER_PARAMS = ("n_samples_init", "chunk_size")
 

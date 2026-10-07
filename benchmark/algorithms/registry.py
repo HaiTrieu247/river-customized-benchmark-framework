@@ -30,6 +30,8 @@ from dataclasses import dataclass, field
 from typing import Any, Callable
 
 from .adapter import ClustererAdapter, build_river_path, make_adapter
+from .clustream_pyramidal import CluStreamPyramidal
+from .denstream_fast import DenStreamPatchedFast
 from .denstream_patched import DenStreamPatched
 from .transformers import OneHotCategorical, safe_standard_scaler
 
@@ -91,6 +93,18 @@ def _clustream(**kw):
     params = dict(n_macro_clusters=5, max_micro_clusters=100, time_gap=100, seed=42)
     params.update(kw)
     return cluster.CluStream(**params), params
+
+
+def _clustream_pyramidal(**kw):
+    # Same defaults as `_clustream`. alpha/l/snapshot_interval are the
+    # pyramidal time frame's own knobs (RIVER_BUGS.md GAP-4) and runnable
+    # placeholders, not tuned values.
+    params = dict(
+        n_macro_clusters=5, max_micro_clusters=100, time_gap=100, seed=42,
+        alpha=2, l=1, snapshot_interval=100,
+    )
+    params.update(kw)
+    return CluStreamPyramidal(**params), params
 
 
 def _dcustream(**kw):
@@ -204,6 +218,18 @@ def _denstream_patched(**kw):
     return DenStreamPatched(**params), params
 
 
+def _denstream_patched_fast(**kw):
+    # Same runnable placeholders as `_denstream_patched`, not tuned values:
+    # DenStreamPatchedFast returns exactly what DenStreamPatched returns
+    # (RIVER_BUGS.md GAP-3), so its defaults stay identical and comparable to it.
+    params = dict(
+        decaying_factor=0.25, beta=0.5, mu=2.5, epsilon=0.5, n_samples_init=1000,
+        stream_speed=100,
+    )
+    params.update(kw)
+    return DenStreamPatchedFast(**params), params
+
+
 def _dbstream(**kw):
     params = dict(
         clustering_threshold=1.0, fading_factor=0.01, cleanup_interval=2,
@@ -257,11 +283,30 @@ def _textclust(**kw):
     return cluster.TextClust(**params), params
 
 
-#: name -> spec. Covers every clusterer exported by ``river.cluster``.
+#: name -> spec. Covers every clusterer exported by ``river.cluster``, plus the
+#: framework subclasses that work around a RIVER_BUGS.md entry under their own
+#: name (AGENTS.md rule 1.3): DenStreamPatched, DenStreamPatchedFast and
+#: CluStreamPyramidal. Each sits next to the river entry it extends.
 ALGORITHMS: dict[str, AlgorithmSpec] = {
     "CluStream": AlgorithmSpec(
         _clustream, default_preprocessor="standard",
         note="micro-clusters with cluster features; offline k-means on top",
+    ),
+    "CluStreamPyramidal": AlgorithmSpec(
+        _clustream_pyramidal, default_preprocessor="standard",
+        note=(
+            "CluStream plus the paper's pyramidal time frame (RIVER_BUGS.md GAP-4): a snapshot "
+            "every snapshot_interval samples, kept by alpha/l; micro_clusters_for_horizon(h) and "
+            "predict_one(x, horizon=h) answer for the last `covered` samples, h <= covered <= "
+            "(1 + 1/alpha**(l-1))*h, reported by micro_clusters_for_horizon. Without a horizon it is "
+            "CluStream, and the runner never passes one, so a row measures CluStream plus the "
+            "snapshot cost"
+        ),
+        provenance=(
+            "CluStream from the vendored river tree with the pyramidal time frame of Aggarwal "
+            "et al. (2003) added in a framework subclass (RIVER_BUGS.md GAP-4); online phase "
+            "identical to river's, verified in lockstep; upstream untouched"
+        ),
     ),
     "BIRCH": AlgorithmSpec(
         _birch, default_preprocessor="standard",
@@ -358,6 +403,22 @@ ALGORITHMS: dict[str, AlgorithmSpec] = {
         provenance=(
             "DenStream from the vendored River tree with RIVER_BUGS.md BUG-7 and "
             "BUG-8 fixed in a subclass; upstream untouched"
+        ),
+    ),
+    "DenStreamPatchedFast": AlgorithmSpec(
+        _denstream_patched_fast, default_preprocessor="standard",
+        note=(
+            "DenStreamPatched (RIVER_BUGS.md BUG-7 and BUG-8 fixed) with GAP-3 closed: "
+            "predict_one reuses cached neighbourhoods instead of re-running the O(P^2) "
+            "offline DBSCAN scan, with predictions and clusters equal to DenStreamPatched's "
+            "at every call; not equal to DenStream's, so do not use it to time DenStream; "
+            "epsilon must match the data scale, same as DenStream"
+        ),
+        provenance=(
+            "DenStream from the vendored River tree with RIVER_BUGS.md BUG-7 and BUG-8 "
+            "fixed and an exact incremental offline phase (GAP-3) in a subclass; exact "
+            "with DenStreamPatched, not with upstream DenStream; upstream untouched. "
+            "Defaults are DenStreamPatched's runnable placeholders, not tuned values"
         ),
     ),
     "DBSTREAM": AlgorithmSpec(
@@ -619,7 +680,8 @@ def accepts_seed(name: str) -> bool:
     cls = getattr(cluster, name, None)
     if cls is None:
         # Not every registered algorithm's class lives in `river.cluster` --
-        # DenStreamPatched (RIVER_BUGS.md BUG-7/BUG-8) is a subclass kept
+        # DenStreamPatched, DenStreamPatchedFast and CluStreamPyramidal
+        # (RIVER_BUGS.md BUG-7/BUG-8, GAP-3, GAP-4) are subclasses kept
         # outside the vendored tree on purpose (AGENTS.md rule 1). Fall back to
         # the class the registered factory actually builds, rather than
         # reporting "no seed" just because the namespace lookup missed it.

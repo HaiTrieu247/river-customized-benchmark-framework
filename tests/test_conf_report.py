@@ -259,6 +259,19 @@ def test_oracle_table_prefers_the_oracle_rerun_and_falls_back_to_the_sweep(out_d
     assert hp["ceiling"] == pytest.approx(0.13) and hp["ceiling_source"] == "sweep"
 
 
+def test_oracle_table_sweep_fallback_reads_the_best_tail_point(out_dir):
+    # HPStream has no oracle rerun. Point 0 wins the whole stream, point 1 the tail: the
+    # ceiling is point 1's tail, and its whole-stream reading goes with it
+    sweep = _read_jsonl(out_dir / "sweep.jsonl")
+    for r in sweep:
+        r["lag_ari_win_tail_mean"] = {0: 0.10, 1: 0.20, 2: None}[r["config_id"]]
+    _write_jsonl(out_dir / "sweep.jsonl", sweep)
+    hp = report.oracle_table(out_dir).set_index(["algo", "fold"]).loc[("HPStream", "covtype")]
+    assert hp["ceiling"] == pytest.approx(0.20) and hp["ceiling_metric"] == "lag_ari_win_tail_mean"
+    assert hp["ceiling_all"] == pytest.approx(0.12) and hp["config_id"] == 1
+    assert hp["ceiling_source"] == "sweep"
+
+
 def test_headroom_gates_on_gain_and_noise(out_dir):
     h = report.headroom_table(out_dir).set_index(["algo", "fold"])
     d = h.loc[("DenStream", "covtype")]
@@ -329,6 +342,69 @@ def test_regret_without_member_log_reports_only_the_lag_term(out_dir):
     r = _regret_row(out_dir, "DenStream", "covtype", "confstream")
     assert r["R_lag"] is not None and r["R_proxy"] is None and "members" in r["note"]
     assert r["R_search"] is None
+    assert r["a_star_lag"] is None and r["R_proxy_lag"] is None and r["R_search_lag"] is None
+
+
+def _rewrite_members(out_dir, seed, rows):
+    _write_jsonl(out_dir / "members" / f"DenStream__covtype__seed{seed}__confstream.jsonl", rows)
+
+
+def test_regret_delayed_label_pick_is_not_the_same_window_maximum(out_dir):
+    # two members swap places every window: whichever led on t-1 trails on t. The best
+    # member of each window reads 0.5, but a pick made by labels one window earlier,
+    # the delay the silhouette pick has, reads 0.2
+    swap = {1: (0.2, 0.5), 2: (0.5, 0.2), 3: (0.2, 0.5)}
+    for s in (1, 2):
+        _rewrite_members(out_dir, s, [_member("DenStream", "confstream", s, w, m, swap[w][m])
+                                      for w in swap for m in (0, 1)])
+    r = _regret_row(out_dir, "DenStream", "covtype", "confstream")
+    assert r["a_star"] == pytest.approx(0.5) and r["a_star_lag"] == pytest.approx(0.2)
+    assert r["R_proxy_lag"] == pytest.approx(0.2 - 0.3)      # a_star_lag - a_lag
+    assert r["R_search_lag"] == pytest.approx(0.6 - 0.2)     # A_static - a_star_lag
+    assert r["R_proxy_lag"] + r["R_search_lag"] == pytest.approx(r["A_static"] - r["a_lag"])
+
+
+def test_regret_delayed_label_pick_skips_infeasible_members_and_ties_to_the_incumbent(out_dir):
+    # windows 1 and 3: members 0 and 1 tie at 0.4, member 3 reads 0.9 but is infeasible;
+    # window 2: 0.3, 0.6 and 0.95. The incumbent is member 1 on every window.
+    ari = {1: (0.4, 0.4, 0.9), 2: (0.3, 0.6, 0.95), 3: (0.4, 0.4, 0.9)}
+    rows = _read_jsonl(out_dir / "windows.jsonl")
+    for r in rows:
+        if (r["algo"], r["fold"], r["arm"]) == ("DenStream", "covtype", "confstream"):
+            r["incumbent_id"] = 1
+    _write_jsonl(out_dir / "windows.jsonl", rows)
+    for s in (1, 2):
+        members = []
+        for w, (a0, a1, a3) in ari.items():
+            infeasible = _member("DenStream", "confstream", s, w, 3, a3)
+            infeasible.update(feasible=False, score=-1.0)
+            members += [_member("DenStream", "confstream", s, w, 0, a0),
+                        _member("DenStream", "confstream", s, w, 1, a1), infeasible]
+        _rewrite_members(out_dir, s, members)
+    # window 2: the tie on window 1 goes to the incumbent, member 1 (0.6 on window 2);
+    # window 3: member 1 led window 2 among the feasible ones (0.4 on window 3)
+    r = _regret_row(out_dir, "DenStream", "covtype", "confstream")
+    assert r["a_star_lag"] == pytest.approx((0.6 + 0.4) / 2)
+
+
+def test_regret_delayed_label_pick_counts_a_challenger_accepted_on_the_previous_window(out_dir):
+    # challenger 2 leads window 1 on test (0.9) and is accepted: it is an active member from
+    # window 2 on, where it reads 0.1. The label pick for window 2 is it; for window 3, member 1.
+    for s in (1, 2):
+        members = []
+        for w in (1, 2, 3):
+            members += [_member("DenStream", "confstream", s, w, 0, 0.35),
+                        _member("DenStream", "confstream", s, w, 1, 0.42),
+                        _member("DenStream", "confstream", s, w, 2, 0.9 if w == 1 else 0.1, is_test=w == 1)]
+        _rewrite_members(out_dir, s, members)
+    r = _regret_row(out_dir, "DenStream", "covtype", "confstream")
+    assert r["a_star_lag"] == pytest.approx((0.1 + 0.42) / 2)
+
+
+def test_regret_delayed_label_pick_ignores_a_challenger_that_was_not_accepted(out_dir):
+    # the fixture's challenger 2 reads 0.9 on test every window and never joins the active set
+    r = _regret_row(out_dir, "DenStream", "covtype", "confstream")
+    assert r["a_star_lag"] == pytest.approx(0.42)
 
 
 def test_regret_without_a_static_oracle_leaves_the_search_term_out(out_dir):
@@ -391,6 +467,66 @@ def test_regret_tail_row_is_empty_when_no_window_reaches_tail_from(out_dir):
     assert t["n_windows"] == 0 and t["n_seeds"] == 0
     assert all(t[c] is None for c in ("a_lag", "a_inc", "a_star", "R_lag", "R_proxy", "R_search"))
     assert "tail_from" in t["note"]
+
+
+# --- silhouette against ARI --------------------------------------------------------------------
+
+def _scored(seed, w, member_id, score, ari, **over):
+    m = _member("DenStream", "confstream", seed, w, member_id, ari)
+    m.update(score=score, **over)
+    return m
+
+
+def _proxy_row(out_dir, algo="DenStream", arm="confstream", region="all"):
+    p = report.proxy_table(out_dir)
+    return p[(p.algo == algo) & (p.fold == "covtype") & (p.arm == arm) & (p.region == region)].iloc[0]
+
+
+def test_proxy_table_is_the_mean_spearman_over_windows_then_seeds(out_dir):
+    # seed 1: silhouette and ARI agree on every window (rho 1); an infeasible member that
+    # would break the agreement is left out. Seed 2: one swap among four members, the
+    # fourth a challenger on test, which counts: rho = 1 - 6 * 2 / (4 * 15) = 0.8
+    seed1 = [m for w in (1, 2, 3) for m in (
+        _scored(1, w, 0, 0.1, 0.1), _scored(1, w, 1, 0.2, 0.2), _scored(1, w, 2, 0.3, 0.3),
+        _scored(1, w, 3, -1.0, 0.99, feasible=False))]
+    seed2 = [m for w in (1, 2, 3) for m in (
+        _scored(2, w, 0, 0.1, 0.2), _scored(2, w, 1, 0.2, 0.1), _scored(2, w, 2, 0.3, 0.3),
+        _scored(2, w, 3, 0.4, 0.4, is_test=True))]
+    _rewrite_members(out_dir, 1, seed1)
+    _rewrite_members(out_dir, 2, seed2)
+    r = _proxy_row(out_dir)
+    assert r["n_seeds"] == 2 and r["n_windows"] == 6
+    assert r["spearman"] == pytest.approx((1.0 + 0.8) / 2)
+    assert r["ari_spread"] == pytest.approx((0.2 + 0.3) / 2)   # max - min ARI of the members kept
+    assert r["note"] == ""
+
+
+def test_proxy_table_skips_windows_with_too_few_members_or_a_constant_reading(out_dir):
+    # the fixture's members all score 0.1: the silhouette is constant, no window has a rho
+    r = _proxy_row(out_dir)
+    assert r["n_windows"] == 0 and r["spearman"] is None and "no window" in r["note"]
+
+
+def test_proxy_table_gives_no_number_where_ari_barely_differs_between_members(out_dir):
+    # ARIs 0.01-0.03 on every window: a spread under 0.05, so a rank correlation with ARI
+    # would read noise as a result
+    for s in (1, 2):
+        _rewrite_members(out_dir, s, [_scored(s, w, m, 0.1 * (m + 1), 0.01 * (m + 1))
+                                      for w in (1, 2, 3) for m in (0, 1, 2)])
+    r = _proxy_row(out_dir)
+    assert r["spearman"] is None and r["n_windows"] == 6
+    assert r["ari_spread"] == pytest.approx(0.02) and r["note"].startswith("ARI spread")
+
+
+def test_proxy_table_reads_a_fold_whose_static_ceiling_is_flat(out_dir):
+    # HPStream's static ceiling clears the default by 0.03 only, yet its members differ on
+    # every window: the static gate says nothing about how members compare within a window
+    _write_jsonl(out_dir / "members" / "HPStream__covtype__seed1__confstream.jsonl", [
+        {**_member("HPStream", "confstream", 1, w, m, a), "score": s}
+        for w in (1, 2, 3) for m, s, a in ((0, 0.1, 0.1), (1, 0.2, 0.2), (2, 0.3, 0.3))
+    ])
+    r = _proxy_row(out_dir, algo="HPStream")
+    assert r["spearman"] == pytest.approx(1.0) and r["n_windows"] == 3
 
 
 # --- drift -------------------------------------------------------------------------------------
@@ -494,15 +630,28 @@ def test_write_report_lists_table_a_errors_under_table_a(out_dir):
 def test_write_report_produces_csv_markdown_and_curves(out_dir):
     paths = report.write_report(out_dir)
     rep = out_dir / "report"
-    for name in ("summary.csv", "gain.csv", "oracle.csv", "headroom.csv", "regret.csv", "drift.csv"):
+    for name in ("summary.csv", "gain.csv", "oracle.csv", "headroom.csv", "regret.csv", "proxy.csv",
+                 "drift.csv"):
         assert (rep / name).exists(), name
     md = (rep / "report.md").read_text()
     assert "DenStream" in md and "confstream" in md and "default" in md
     assert "timeout" in md  # failed runs are listed, not hidden
     assert "lag" in md.lower()
     for section in ("Arms vs default", "Ceiling and headroom", "Regret decomposition",
-                    "Drift adaptation", "Table A (common reclustering)"):
+                    "Silhouette against ARI", "Drift adaptation", "Table A (common reclustering)"):
         assert f"## {section}" in md, section
     curves = rep / "curves_covtype.csv"
     assert curves.exists()
     assert all(p.exists() for p in paths)
+
+
+def test_oracle_table_names_where_the_ceiling_configuration_came_from(out_dir):
+    import pandas as pd
+
+    from conf_pipeline import _common as C
+
+    o = report.oracle_table(out_dir)
+    expected = [None if pd.isna(c) else "default" if c == 0
+                else "incumbent" if c >= C.INCUMBENT_ID_BASE else "sobol" for c in o["config_id"]]
+    assert o["config_source"].tolist() == expected
+    assert report.config_source(C.INCUMBENT_ID_BASE + 7) == "incumbent"

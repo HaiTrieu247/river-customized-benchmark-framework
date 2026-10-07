@@ -43,10 +43,20 @@ from typing import Any
 #: throughput table. See RIVER_BUGS.md BUG-6.
 #:
 #: Keyed by River class name so a workaround is scoped to the model that needs
-#: it, never applied globally.
+#: it, never applied globally. A subclass that inherits the method emitting the
+#: sentinel inherits the entry (DenStreamPatched, DenStreamPatchedFast).
 SENTINEL_LABELS: dict[str, tuple] = {
     "DenStream": (-1,),
 }
+
+
+def sentinel_labels(model) -> tuple:
+    """The ``SENTINEL_LABELS`` entry of the nearest class in ``model``'s MRO, else ``()``."""
+    for cls in type(model).__mro__:
+        labels = SENTINEL_LABELS.get(cls.__name__)
+        if labels is not None:
+            return labels
+    return ()
 
 
 def build_river_path() -> str:
@@ -179,7 +189,7 @@ class ClustererAdapter:
         except (ValueError, ZeroDivisionError, KeyError):
             self.n_fallback_predictions += 1
             return 0
-        if label in SENTINEL_LABELS.get(type(self.model).__name__, ()):
+        if label in sentinel_labels(self.model):
             self.n_sentinel_predictions += 1
             if self.drop_sentinel_predictions:
                 return None

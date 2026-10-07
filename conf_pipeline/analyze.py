@@ -11,11 +11,18 @@ is read as it is.
 
 - ``rank_matrix``       folds x algos, rank 1 = best, a missing reading ranks last
 - ``kendall_matrix``    arms x arms, mean over folds of Kendall's tau between rankings
+- ``degenerate_table``  per arm, the cells whose configuration produced no usable partition
 - ``friedman_nemenyi``  Friedman's test over folds and the Nemenyi critical difference
 - ``win_tie_loss``      every algo against ``default``, ties inside the seed-noise band
 - ``pareto_table``      quality against incumbent throughput, with a mean per-fold hypervolume
 - ``fidelity``          does a capped run rank algorithms like the full-length run?
+- ``impl_table``        spec 4.6 / T7: an implementation variant against its River reference
 - ``write_analysis``    all of the above as CSVs, ``analysis.md`` and figures F1-F4
+
+An implementation variant (``_common.IMPL_VARIANTS``, e.g. DenStreamPatchedFast
+for DenStream) is the same algorithm under another implementation, so it is
+never ranked with the protocol algorithms: every function above except
+``impl_table`` leaves it out.
 
 Run from the repo root::
 
@@ -47,6 +54,8 @@ WTL_COLS = ["algo", "wins", "ties", "losses", "n_folds", "worst_gap"]
 PARETO_COLS = ["algo", "arm", "ari", "sps", "hv", "n_folds"]
 FIDELITY_COLS = ["arm", "spearman", "n"]
 FRIEDMAN_COLS = ["arm", "n_folds", "k", "statistic", "pvalue", "cd"]
+IMPL_COLS = ["variant", "reference", "arm", "fold", "reference_value", "variant_value", "delta",
+             "rank_reference", "rank_variant", "rank_change"]
 #: Protocol order of the arms, for tables and colours; anything else follows, sorted.
 ARM_ORDER: tuple[str, ...] = C.ARMS + C.EXTRA_ARMS
 #: Float slack on the noise-band comparison (0.6 - 0.55 is 0.04999999999999993).
@@ -74,10 +83,17 @@ def _has_group(summary: pd.DataFrame | None) -> bool:
 
 
 def _algos(summary: pd.DataFrame | None) -> list[str]:
-    """Every algo in ``summary``, over all arms, sorted."""
+    """Every protocol algo in ``summary``, over all arms, sorted (no implementation variant)."""
     if summary is None or "algo" not in summary:
         return []
-    return sorted(summary["algo"].dropna().unique())
+    return sorted(set(summary["algo"].dropna().unique()) - set(C.IMPL_VARIANTS))
+
+
+def _protocol(summary: pd.DataFrame | None) -> pd.DataFrame | None:
+    """``summary`` without the rows of implementation variants."""
+    if summary is None or "algo" not in summary:
+        return summary
+    return summary[~summary["algo"].isin(list(C.IMPL_VARIANTS))]
 
 
 def _arms_in(summary: pd.DataFrame | None) -> list[str]:
@@ -150,13 +166,21 @@ def rank_matrix(summary: pd.DataFrame, arm: str, metric: str = TAIL) -> pd.DataF
     return _ranks(_wide(_complete(summary), arm, metric, _algos(summary)))
 
 
-def kendall_matrix(summary: pd.DataFrame, arms, metric: str = TAIL) -> pd.DataFrame:
+def kendall_matrix(summary: pd.DataFrame, arms, metric: str = TAIL,
+                   complete_only: bool = False) -> pd.DataFrame:
     """arms x arms: Kendall's tau-b between two arms' rank vectors, mean over folds.
 
     Folds: those both arms rank, less any where fewer than two algorithms have
     a reading in either arm (no ranking to compare). Identical rank vectors read
     tau = 1; a fold where only one of the two vectors is constant has no tau and
     is skipped. NaN when no fold is left. Symmetric, unit diagonal.
+
+    By default an algorithm without a reading ranks last (``rank_matrix``), so
+    a run that failed or timed out under one arm only -- the costly online
+    arms -- moves the ranking of that arm alone and lowers tau with no change
+    in quality. ``complete_only=True`` compares, on each fold, only the
+    algorithms both arms have a reading for, ranked among themselves, and
+    skips a fold where fewer than two are shared.
     """
     arms = list(dict.fromkeys(arms))
     algos = _algos(summary)
@@ -171,7 +195,14 @@ def kendall_matrix(summary: pd.DataFrame, arms, metric: str = TAIL) -> pd.DataFr
             for fold in ranks[a].index.intersection(ranks[b].index):
                 if present[a][fold] < 2 or present[b][fold] < 2:
                     continue
-                x, y = ranks[a].loc[fold].to_numpy(), ranks[b].loc[fold].to_numpy()
+                if complete_only:
+                    both = wide[a].loc[fold].notna() & wide[b].loc[fold].notna()
+                    if both.sum() < 2:
+                        continue
+                    x = _ranks(wide[a].loc[[fold], both]).iloc[0].to_numpy()
+                    y = _ranks(wide[b].loc[[fold], both]).iloc[0].to_numpy()
+                else:
+                    x, y = ranks[a].loc[fold].to_numpy(), ranks[b].loc[fold].to_numpy()
                 if np.array_equal(x, y):
                     taus.append(1.0)
                 elif np.ptp(x) > 0 and np.ptp(y) > 0:
@@ -205,6 +236,35 @@ def friedman_nemenyi(ranks: pd.DataFrame, alpha: float = 0.05) -> dict:
     cd = float(q * math.sqrt(k * (k + 1) / (6 * n))) if q is not None and n > 0 else np.nan
     return {"statistic": statistic, "pvalue": pvalue, "avg_rank": avg, "cd": cd,
             "n_folds": int(n), "k": int(k)}
+
+
+#: A cell whose lagged incumbent had no defined partition on more than this share of its
+#: windows is degenerate. A runnable placeholder: pass ``threshold`` to change it.
+DEGENERATE_SHARE = 0.5
+
+
+def degenerate_table(summary: pd.DataFrame, threshold: float = DEGENERATE_SHARE) -> pd.DataFrame:
+    """Per arm, how many (algo, fold) cells are degenerate: ``lag_undefined_share > threshold``.
+
+    Such a cell reads ARI near 0 because the configuration produced no usable
+    partition (one label, or the -1 sentinel), not because it clustered badly;
+    a ranking under an arm with many of them -- typically ``default`` -- ranks
+    broken configurations, and Kendall tau against it should be read beside
+    this count. Over the cells with a reading of ``lag_undefined_share``; a
+    cell missing a seed is left out (``_complete``). Implementation variants
+    are left out, as everywhere outside ``impl_table``.
+    """
+    cols = ["arm", "n_cells", "n_degenerate", "share"]
+    summary = _complete(_protocol(summary))
+    if not _has_group(summary) or "lag_undefined_share" not in summary:
+        return pd.DataFrame(columns=cols)
+    rows = []
+    for arm in _arms_in(summary):
+        v = pd.to_numeric(summary.loc[summary["arm"] == arm, "lag_undefined_share"], errors="coerce").dropna()
+        n_bad = int((v > threshold + _EPS).sum())
+        rows.append({"arm": arm, "n_cells": int(len(v)), "n_degenerate": n_bad,
+                     "share": n_bad / len(v) if len(v) else np.nan})
+    return pd.DataFrame(rows, columns=cols)
 
 
 # --- arm against default ---------------------------------------------------------------------
@@ -267,7 +327,7 @@ def pareto_table(summary: pd.DataFrame, metric: str = TAIL, cost: str = COST) ->
     """
     if not _has_group(summary) or metric not in summary or cost not in summary:
         return _typed_pareto(pd.DataFrame(columns=PARETO_COLS))
-    summary = _complete(summary)
+    summary = _complete(_protocol(summary))
     df = summary[GROUP].assign(
         ari=pd.to_numeric(summary[metric], errors="coerce"),
         sps=pd.to_numeric(summary[cost], errors="coerce"),
@@ -312,7 +372,7 @@ def fidelity(summary_cap: pd.DataFrame, summary_full: pd.DataFrame, arm: str,
     ``n`` = algos compared; ``spearman`` is NaN when ``n < 3`` or either side's
     means are all equal (no ranking).
     """
-    cap, full = _cells(summary_cap, arm, metric), _cells(summary_full, arm, metric)
+    cap, full = _cells(_protocol(summary_cap), arm, metric), _cells(_protocol(summary_full), arm, metric)
     common = cap.index.intersection(full.index)
     if common.empty:
         return {"spearman": np.nan, "n": 0}
@@ -322,6 +382,45 @@ def fidelity(summary_cap: pd.DataFrame, summary_full: pd.DataFrame, arm: str,
     if n < 3 or c.nunique() < 2 or f.nunique() < 2:
         return {"spearman": np.nan, "n": n}
     return {"spearman": float(stats.spearmanr(c.to_numpy(), f.to_numpy()).statistic), "n": n}
+
+
+# --- implementation variants ---------------------------------------------------------------------
+
+def impl_table(summary: pd.DataFrame, metric: str = TAIL) -> pd.DataFrame:
+    """Spec 4.6 / T7: every implementation variant against the River class it re-implements.
+
+    One row per (variant, arm, fold) where both the variant and its reference
+    have ``metric`` (a cell missing a seed has none, see ``_complete``):
+    ``delta = variant - reference``; ``rank_reference`` is the reference's rank
+    among the protocol algorithms on that fold (``rank_matrix``'s rule);
+    ``rank_variant`` the rank it would take with its reading replaced by the
+    variant's; ``rank_change = rank_reference - rank_variant`` (positive: the
+    variant ranks better). Empty, with the declared columns, without a variant.
+    """
+    rows = []
+    complete = _complete(summary)
+    algos = _algos(summary)
+    for variant, reference in C.IMPL_VARIANTS.items():
+        if reference not in algos:
+            continue
+        for arm in _arms_in(summary):
+            wide = _wide(complete, arm, metric, [*algos, variant])
+            for fold, row in wide.iterrows():
+                ref, var = row[reference], row[variant]
+                if pd.isna(ref) or pd.isna(var):
+                    continue
+                base = row[algos].to_frame().T
+                swapped = base.copy()
+                swapped[reference] = var
+                r_ref = float(_ranks(base)[reference].iloc[0])
+                r_var = float(_ranks(swapped)[reference].iloc[0])
+                rows.append({
+                    "variant": variant, "reference": reference, "arm": arm, "fold": fold,
+                    "reference_value": float(ref), "variant_value": float(var), "delta": float(var - ref),
+                    "rank_reference": r_ref, "rank_variant": r_var, "rank_change": r_ref - r_var,
+                })
+    rows.sort(key=lambda r: (r["variant"], _arm_key(r["arm"]), r["fold"]))
+    return pd.DataFrame(rows, columns=IMPL_COLS)
 
 
 # --- the report --------------------------------------------------------------------------------
@@ -346,6 +445,10 @@ def write_analysis(out_dir: Path, full_out_dir: Path | None = None) -> list[Path
         written.append(_csv(ranks[arm], rep / f"ranks_{arm}.csv", index=True))
     kendall = kendall_matrix(summary, arms)
     written.append(_csv(kendall, rep / "kendall.csv", index=True))
+    kendall_both = kendall_matrix(summary, arms, complete_only=True)
+    written.append(_csv(kendall_both, rep / "kendall_complete.csv", index=True))
+    degenerate = degenerate_table(summary)
+    written.append(_csv(degenerate, rep / "degenerate.csv"))
     fried_table = pd.DataFrame(
         [{"arm": arm, **{c: fried[arm][c] for c in FRIEDMAN_COLS[1:]},
           **{f"avg_rank_{a}": fried[arm]["avg_rank"].get(a, np.nan) for a in algos}} for arm in arms],
@@ -370,10 +473,14 @@ def write_analysis(out_dir: Path, full_out_dir: Path | None = None) -> list[Path
                            columns=FIDELITY_COLS)
         written.append(_csv(fid, rep / "fidelity.csv"))
 
-    figures = _figures(out_dir, rep, summary, arms, kendall)
+    impl = impl_table(summary)
+    if not impl.empty:
+        written.append(_csv(impl, rep / "impl_T7.csv"))
+
+    figures = _figures(out_dir, rep, summary, arms, kendall, kendall_both)
     md = rep / "analysis.md"
     md.write_text(_markdown(summary, arms, algos, fried, kendall, wtl, pareto, fid, figures,
-                            full_out_dir), encoding="utf-8")
+                            full_out_dir, impl, kendall_both, degenerate), encoding="utf-8")
     return written + [md] + figures
 
 
@@ -408,7 +515,8 @@ def _pvalue(p) -> str:
     return f"{p:.2e}" if p < 1e-3 else f"{p:.4f}"
 
 
-def _markdown(summary, arms, algos, fried, kendall, wtl, pareto, fid, figures, full_out_dir) -> str:
+def _markdown(summary, arms, algos, fried, kendall, wtl, pareto, fid, figures, full_out_dir,
+              impl=None, kendall_both=None, degenerate=None) -> str:
     n_folds = summary["fold"].nunique() if "fold" in summary else 0
     lines = ["# conf_pipeline analysis", ""]
     lines.append(
@@ -453,8 +561,26 @@ def _markdown(summary, arms, algos, fried, kendall, wtl, pareto, fid, figures, f
     lines.append("")
     if len(arms) > 1:
         lines.append(_md_table(kendall.reset_index(), digits=3))
+        if kendall_both is not None:
+            lines += ["", (
+                "The same on complete cases only: on each fold, the algorithms both arms have a "
+                "reading for, ranked among themselves (a fold sharing fewer than two is skipped). "
+                "Above, an algorithm that failed or timed out under one arm ranks last in that arm "
+                "alone, which lowers τ without any change in quality; a gap between the two tables "
+                "is that effect."
+            ), ""]
+            lines.append(_md_table(kendall_both.reset_index(), digits=3))
     else:
         lines.append("fewer than two arms: nothing to compare")
+    if degenerate is not None and not degenerate.empty:
+        lines += ["", (
+            f"Degenerate cells per arm: `lag_undefined_share > {DEGENERATE_SHARE}`, the lagged "
+            "incumbent produced no usable partition (one label, or the -1 sentinel) on most "
+            "windows. Such a cell reads ARI near 0 because the configuration is broken, not "
+            "because it clusters badly, so τ against an arm with many of them compares a "
+            "ranking of broken configurations."
+        ), ""]
+        lines.append(_md_table(degenerate, digits=3))
 
     lines += ["", "## Win/tie/loss vs default", ""]
     lines.append(
@@ -498,6 +624,22 @@ def _markdown(summary, arms, algos, fried, kendall, wtl, pareto, fid, figures, f
         lines.append("")
         lines.append(_md_table(fid, digits=3) if not fid.empty else "no arm in both runs")
 
+    if impl is not None and not impl.empty:
+        lines += ["", "## Implementation variants (T7)", ""]
+        lines.append(
+            "Each variant is the same algorithm as its reference under another implementation "
+            "(spec §4.6), so it is ranked with nobody above. Per arm, over the folds where both "
+            "have a reading: `mean_delta` is the mean of `variant - reference`; `n_rank_changes` "
+            "counts the folds where the reference's rank among the protocol algorithms would "
+            "change if its reading were the variant's. Per-fold rows: `impl_T7.csv`."
+        )
+        lines.append("")
+        agg = (impl.groupby(["variant", "reference", "arm"], sort=False)
+               .agg(n_folds=("fold", "nunique"), mean_delta=("delta", "mean"),
+                    n_rank_changes=("rank_change", lambda r: int((r != 0).sum())))
+               .reset_index())
+        lines.append(_md_table(agg, digits=3))
+
     lines += ["", "## Figures", ""]
     if figures:
         lines += [f"- `{p.name}`: {_figure_caption(p.name)}" for p in figures]
@@ -509,10 +651,13 @@ def _markdown(summary, arms, algos, fried, kendall, wtl, pareto, fid, figures, f
 def _figure_caption(name: str) -> str:
     if name.startswith("F1_heatmap_"):
         return f"`{TAIL}` per algo x fold, arm `{name[len('F1_heatmap_'):-4]}` (— : no reading)"
+    if name == "F2_kendall_complete.png":
+        return "mean Kendall τ between the arms' rankings, complete cases only"
     if name == "F2_kendall.png":
         return "mean Kendall τ between the arms' rankings"
     if name == "F3_regret.png":
-        return "R_lag / R_proxy / R_search per algo on the tail windows, mean over folds, arm `confstream`"
+        return ("R_search_lag / R_proxy_lag per algo on the tail windows (labels given the silhouette's "
+                "one-window delay), mean over folds, arm `confstream`")
     if name.startswith("F4_drift_"):
         return f"lagged ARI per window around the drift points of `{name[len('F4_drift_'):-4]}`"
     return ""
@@ -548,7 +693,7 @@ def _arm_color(arm: str) -> str:
 
 
 def _figures(out_dir: Path, rep: Path, summary: pd.DataFrame, arms: list[str],
-             kendall: pd.DataFrame) -> list[Path]:
+             kendall: pd.DataFrame, kendall_both: pd.DataFrame | None = None) -> list[Path]:
     plt = _pyplot()
     if plt is None or not arms:
         return []
@@ -557,6 +702,8 @@ def _figures(out_dir: Path, rep: Path, summary: pd.DataFrame, arms: list[str],
         written += _f1_heatmaps(plt, rep, summary, arms)
         if len(arms) > 1:
             written.append(_f2_kendall(plt, rep, kendall))
+            if kendall_both is not None:
+                written.append(_f2_kendall(plt, rep, kendall_both, complete_only=True))
         p = _f3_regret(plt, rep, report.regret_table(out_dir))
         if p is not None:
             written.append(p)
@@ -606,7 +753,7 @@ def _f1_heatmaps(plt, rep: Path, summary: pd.DataFrame, arms: list[str]) -> list
     return out
 
 
-def _f2_kendall(plt, rep: Path, kendall: pd.DataFrame) -> Path:
+def _f2_kendall(plt, rep: Path, kendall: pd.DataFrame, complete_only: bool = False) -> Path:
     from matplotlib.colors import LinearSegmentedColormap
 
     arms = list(kendall.index)
@@ -622,27 +769,34 @@ def _f2_kendall(plt, rep: Path, kendall: pd.DataFrame) -> Path:
                     fontsize=8, color="white" if np.isfinite(v) and abs(v) > 0.6 else _INK)
     ax.set_xticks(range(len(arms)), arms, rotation=30, ha="right")
     ax.set_yticks(range(len(arms)), arms)
-    ax.set_title("Ranking agreement between arms (mean Kendall τ over folds)")
+    ax.set_title("Ranking agreement between arms (mean Kendall τ over folds"
+                 + (", complete cases)" if complete_only else ")"))
     ax.tick_params(length=0)
     for spine in ax.spines.values():
         spine.set_visible(False)
     cbar = fig.colorbar(im, ax=ax, fraction=0.04, pad=0.03)
     cbar.outline.set_visible(False)
     cbar.set_label("τ", fontsize=8)
-    return _save(plt, fig, rep / "F2_kendall.png")
+    return _save(plt, fig, rep / ("F2_kendall_complete.png" if complete_only else "F2_kendall.png"))
 
 
+#: The same-window decomposition (``a_star`` picked with the window's own labels: a bound).
 REGRET_TERMS = ("R_lag", "R_proxy", "R_search")
+#: The decomposition F3 plots: labels given the silhouette's one-window delay.
+REGRET_TERMS_LAG = ("R_search_lag", "R_proxy_lag")
 
 
-def regret_means(regret: pd.DataFrame, arm: str = "confstream", region: str = "tail") -> pd.DataFrame:
-    """algos x ``REGRET_TERMS``: the mean over folds of ``report.regret_table``'s
+def regret_means(regret: pd.DataFrame, arm: str = "confstream", region: str = "tail",
+                 terms: tuple[str, ...] = REGRET_TERMS) -> pd.DataFrame:
+    """algos x ``terms``: the mean over folds of ``report.regret_table``'s
     ``region`` rows (the tail by default, the primary region) under ``arm``.
 
-    NaN where no fold has the term; empty without a row. A table without a
-    ``region`` column (one written before the split) is read whole.
+    NaN where no fold has the term (or the table has no such column); empty
+    without a row. A table without a ``region`` column (one written before the
+    split) is read whole.
     """
-    empty = pd.DataFrame(columns=list(REGRET_TERMS), index=pd.Index([], name="algo"), dtype=float)
+    terms = list(terms)
+    empty = pd.DataFrame(columns=terms, index=pd.Index([], name="algo"), dtype=float)
     if regret is None or regret.empty or "arm" not in regret:
         return empty
     keep = regret["arm"] == arm
@@ -651,12 +805,13 @@ def regret_means(regret: pd.DataFrame, arm: str = "confstream", region: str = "t
     rows = regret[keep]
     if rows.empty:
         return empty
-    terms = rows[["algo"]].assign(**{t: pd.to_numeric(rows[t], errors="coerce") for t in REGRET_TERMS})
-    return terms.groupby("algo", sort=True)[list(REGRET_TERMS)].mean()
+    values = {t: pd.to_numeric(rows[t], errors="coerce") if t in rows else np.nan for t in terms}
+    return rows[["algo"]].assign(**values).groupby("algo", sort=True)[terms].mean()
 
 
-def _f3_regret(plt, rep: Path, regret: pd.DataFrame, arm: str = "confstream") -> Path | None:
-    means = regret_means(regret, arm)
+def _f3_regret(plt, rep: Path, regret: pd.DataFrame, arm: str = "confstream",
+               terms: tuple[str, ...] = REGRET_TERMS_LAG) -> Path | None:
+    means = regret_means(regret, arm, terms=terms)
     if means.empty:
         return None
     algos = list(means.index)
@@ -665,7 +820,7 @@ def _f3_regret(plt, rep: Path, regret: pd.DataFrame, arm: str = "confstream") ->
     # positive parts stack up from 0, negative parts down from 0
     pos, neg = np.zeros(len(algos)), np.zeros(len(algos))
     handles, missing = [], []
-    for slot, term in enumerate(REGRET_TERMS):
+    for slot, term in enumerate(terms):
         vals = means[term].to_numpy(dtype=float)
         if not np.isfinite(vals).any():
             missing.append(term)
@@ -687,7 +842,7 @@ def _f3_regret(plt, rep: Path, regret: pd.DataFrame, arm: str = "confstream") ->
     ax.axhline(0, color=_AXIS, linewidth=1)
     ax.set_xticks(x, algos, rotation=30, ha="right")
     ax.set_ylabel("regret (ARI)")
-    title = f"Regret decomposition on the tail, arm {arm} (mean over folds)"
+    title = f"Gap to the static ceiling on the tail, arm {arm} (mean over folds)"
     if missing:
         title += f"\n{', '.join(missing)} not available: no tail window / member log / static oracle"
     ax.set_title(title)

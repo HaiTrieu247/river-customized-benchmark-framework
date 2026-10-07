@@ -15,7 +15,9 @@ Tables (each a function, each written as a CSV and a section of ``report.md``):
 - ``gain_table``     every arm against ``default``, tail and whole stream
 - ``oracle_table``   the static ceiling per (algo, fold): the oracle's rerun, else the sweep
 - ``headroom_table`` share of the ceiling gain each arm realises, behind a noise gate
-- ``regret_table``   ``A_static - a_lag`` split into lag, proxy and search regret, whole stream and tail
+- ``regret_table``   ``A_static - a_lag`` split into proxy and search regret (labels given the
+                     silhouette's delay), and into lag, proxy and search against the same-window best
+- ``proxy_table``    rank correlation between the silhouette and ARI over the members of a window
 - ``drift_table``    drop and recovery around the drift points of the synthetic folds
 
 Run from the repo root::
@@ -81,15 +83,16 @@ GAIN_COLS = [
 ]
 ORACLE_COLS = [
     "algo", "fold", "ceiling", "ceiling_sd", "ceiling_metric", "ceiling_all", "ceiling_source",
-    "n_seeds", "config_id",
+    "n_seeds", "config_id", "config_source",
 ]
 REGRET_COLS = [
     "algo", "fold", "arm", "region", "n_seeds", "n_windows", "a_lag", "a_inc", "a_star", "A_static",
-    "ceiling_source", "R_lag", "R_proxy", "R_search", "note",
+    "ceiling_source", "R_lag", "R_proxy", "R_search", "a_star_lag", "R_proxy_lag", "R_search_lag", "note",
 ]
 #: The regret decomposition's two regions: the whole stream, against ``ceiling_all``, and the
 #: tail (windows >= the run's ``tail_from``), against the tail ``ceiling`` -- the primary one.
 REGRET_REGIONS: tuple[str, ...] = ("all", "tail")
+PROXY_COLS = ["algo", "fold", "arm", "region", "n_seeds", "n_windows", "spearman", "ari_spread", "note"]
 DRIFT_COLS = [
     "algo", "fold", "arm", "drift_point", "window", "n_seeds", "pre", "drop_depth",
     "recovery_windows", "n_recovered", "ref", "param", "param_ratio",
@@ -163,24 +166,83 @@ def best_active_members(
     """``a_star`` per job and window, streamed from the member logs.
 
     Returns ``({job: {window: max ari_win over is_test == False}}, jobs_seen)``
-    with ``job = (algo, fold, seed, arm, config_id)``. Streaming, because a full
-    benchmark logs millions of member rows and only this maximum is read;
-    ``folds`` / ``arms`` skip the other jobs' files by name, unread.
+    with ``job = (algo, fold, seed, arm, config_id)``; ``member_readings`` reads
+    the rest of what the logs say.
     """
-    best: dict[tuple, dict[int, float]] = {}
+    readings, seen = member_readings(out_dir, folds, arms)
+    return {job: r["star"] for job, r in readings.items() if r["star"]}, seen
+
+
+def member_readings(out_dir: Path, folds=None, arms=None) -> tuple[dict[tuple, dict], set[tuple]]:
+    """Per job and window, what the member log says, one job file at a time.
+
+    Returns ``({job: {"star": ..., "lag_pick": ..., "rho": ...}}, jobs_seen)``
+    with ``job = (algo, fold, seed, arm, config_id)``:
+
+    - ``star``: ``{window: max ari_win}`` over the active members
+      (``is_test == False``), the best member *on the window itself*.
+    - ``lag_pick``: ``{window t: {member_id: ari_win on t}}`` for the members a
+      pick by labels made after window ``t-1`` would choose -- the members
+      active on ``t`` (the set the incumbent after ``t-1`` was named from,
+      challengers accepted on ``t-1`` included) that were feasible on
+      ``t-1``, with the best ``ari_win`` there; several when they tie.
+      ``regret_table`` breaks a tie in favour of the incumbent, so a window
+      whose labels give no reason to move reads the same as the silhouette's
+      pick. A window the log has no ``t-1`` for, or with no such member,
+      has no entry.
+    - ``rho``: ``{window: Spearman}`` between the silhouette ``score`` and
+      ``ari_win`` over every member scored on the window (active and on test)
+      that was feasible and had a defined silhouette; a window with fewer
+      than three of them, or where either reading is constant, has none.
+    - ``spread``: ``{window: max - min ari_win}`` over those same members, on
+      every window with at least three of them.
+
+    Streaming, because a full benchmark logs millions of member rows and only
+    these per-window readings are kept; ``folds`` / ``arms`` skip the other
+    jobs' files by name, unread.
+    """
+    readings: dict[tuple, dict] = {}
     seen: set[tuple] = set()
     for path in _member_files(out_dir, folds, arms):
+        jobs: dict[tuple, dict[int, dict]] = {}
         for row in C.read_jsonl(path):
             key = (row["algo"], row["fold"], row["seed"], row["arm"], _cid(row.get("config_id")))
             seen.add(key)
-            ari = _num(row.get("ari_win"))
-            if row.get("is_test") or ari is None:
-                continue
-            per = best.setdefault(key, {})
-            w = int(row["window"])
-            if w not in per or ari > per[w]:
-                per[w] = ari
-    return best, seen
+            jobs.setdefault(key, {}).setdefault(int(row["window"]), {})[row["member_id"]] = (
+                bool(row.get("is_test")),
+                row.get("feasible") is not False and row.get("silhouette_defined") is not False,
+                _num(row.get("score")),
+                _num(row.get("ari_win")),
+            )
+        for key, by_window in jobs.items():
+            readings[key] = _job_readings(by_window)
+    return readings, seen
+
+
+def _job_readings(by_window: dict[int, dict]) -> dict:
+    """``member_readings``' three readings of one job; members are
+    ``(is_test, usable, score, ari)`` keyed by id, per window."""
+    from scipy.stats import spearmanr
+
+    star, lag_pick, rho, spread = {}, {}, {}, {}
+    for w, members in by_window.items():
+        active = [m[3] for m in members.values() if not m[0] and m[3] is not None]
+        if active:
+            star[w] = max(active)
+        prev = by_window.get(w - 1)
+        if prev:
+            cands = {mid: prev[mid][3] for mid, m in members.items()
+                     if not m[0] and mid in prev and prev[mid][1] and prev[mid][3] is not None}
+            if cands:
+                top = max(cands.values())
+                lag_pick[w] = {mid: members[mid][3] for mid, a in cands.items() if a == top}
+        scored = [(m[2], m[3]) for m in members.values() if m[1] and m[2] is not None and m[3] is not None]
+        if len(scored) >= 3:
+            s, a = np.array(scored).T
+            spread[w] = float(np.ptp(a))
+            if np.ptp(s) > 0 and np.ptp(a) > 0:
+                rho[w] = float(spearmanr(s, a).statistic)
+    return {"star": star, "lag_pick": lag_pick, "rho": rho, "spread": spread}
 
 
 def _member_files(out_dir: Path, folds=None, arms=None) -> list[Path]:
@@ -346,6 +408,14 @@ def gain_table(out_dir: Path) -> pd.DataFrame:
 
 # --- ceiling and headroom --------------------------------------------------------------------
 
+def config_source(config_id) -> str | None:
+    """Where a sweep configuration came from: ``default``, ``sobol`` or ``incumbent``."""
+    cid = _cid(config_id)
+    if cid is None:
+        return None
+    return "default" if cid == 0 else "incumbent" if cid >= C.INCUMBENT_ID_BASE else "sobol"
+
+
 def oracle_table(out_dir: Path) -> pd.DataFrame:
     """The static ceiling per (algo, fold).
 
@@ -353,9 +423,13 @@ def oracle_table(out_dir: Path) -> pd.DataFrame:
     ``oracle_static.json`` currently names (stale reruns are ignored), averaged
     over seeds, on ``lag_ari_win_tail_mean`` when those rows carry it and
     ``lag_ari_win_mean`` otherwise (``ceiling_metric`` says which). Fallback:
-    the sweep's best ``lag_ari_win_mean`` (one seed, whole stream),
-    ``ceiling_source = "sweep"``. ``ceiling_all`` is always the whole-stream
-    reading, the one the regret decomposition compares against.
+    the sweep's winning point (one seed), picked and read on the tail when the
+    sweep has one and on the whole stream otherwise, as ``sweep.select_oracle``
+    picks it; ``ceiling_source = "sweep"``. ``ceiling_all`` is always the same
+    configuration's whole-stream reading, the one the regret decomposition's
+    ``all`` region compares against.
+    ``config_source`` says whether the configuration is River's default, a
+    Sobol point or an online arm's incumbent rerun (``sweep --incumbents``).
     """
     runs = current_runs(out_dir)
     sweep = load_sweep(out_dir)
@@ -394,28 +468,27 @@ def oracle_table(out_dir: Path) -> pd.DataFrame:
             )
         else:
             best = _sweep_best(sweep, algo, fold)
-            if best is None and entry is not None and _num(entry.get(WHOLE)) is not None:
-                best = (_num(entry[WHOLE]), _cid(entry.get("config_id")))
+            if best is None and entry is not None:
+                metric = entry.get("select_metric") or WHOLE
+                if _num(entry.get(metric)) is not None:
+                    best = entry, metric
             if best is not None:
-                row.update(ceiling=best[0], ceiling_all=best[0], ceiling_metric=WHOLE,
-                           ceiling_source="sweep", n_seeds=1, config_id=best[1])
+                point, metric = best
+                row.update(ceiling=_num(point[metric]), ceiling_all=_num(point.get(WHOLE)),
+                           ceiling_metric=metric, ceiling_source="sweep", n_seeds=1,
+                           config_id=_cid(point.get("config_id")))
+        row["config_source"] = config_source(row["config_id"])
         out.append(row)
     return _frame(out, ORACLE_COLS)
 
 
-def _sweep_best(sweep: pd.DataFrame, algo: str, fold: str) -> tuple[float, int | None] | None:
-    """The sweep's best ``lag_ari_win_mean`` for (algo, fold); ties to the smaller config_id."""
-    if sweep.empty or WHOLE not in sweep:
+def _sweep_best(sweep: pd.DataFrame, algo: str, fold: str) -> tuple[dict, str] | None:
+    """The sweep's winning row for (algo, fold) and the metric it won on, by the
+    rule ``sweep.select_oracle`` uses (``_common.best_static``: the tail first)."""
+    if sweep.empty or "algo" not in sweep:
         return None
-    grp = sweep[(sweep["algo"] == algo) & (sweep["fold"] == fold) & (sweep["status"] == "ok")]
-    cands = []
-    for row in grp.to_dict("records"):
-        value = _num(row.get(WHOLE))
-        if value is not None:
-            cands.append((value, _cid(row.get("config_id"))))
-    if not cands:
-        return None
-    return max(cands, key=lambda vc: (vc[0], -(vc[1] or 0)))
+    grp = sweep[(sweep["algo"] == algo) & (sweep["fold"] == fold)]
+    return C.best_static([{k: _none(v) for k, v in r.items()} for r in grp.to_dict("records")])
 
 
 def headroom_table(out_dir: Path, min_gain: float = C.MIN_CEILING_GAIN) -> pd.DataFrame:
@@ -530,9 +603,28 @@ def regret_table(out_dir: Path) -> pd.DataFrame:
     ``R_lag = a_inc - a_lag``, ``R_proxy = a_star - a_inc``, ``R_search = A_static - a_star``
 
     so the three sum to ``A_static - a_lag`` by construction, row by row.
+
+    ``a_star`` is picked with the labels of the window it is read on: among
+    ``e_size`` members whose ARIs differ by window noise, the best of each
+    window is partly that window's luck, which no pick made beforehand can
+    have, labelled or not. So ``R_proxy`` overstates what the silhouette
+    costs and ``R_search`` understates the search's share. The second
+    decomposition removes that luck by giving the labels the silhouette's
+    delay:
+
+    - ``a_star_lag`` mean ``ari_win`` on window t of the member a pick by
+      labels made after window t-1 chooses (``member_readings``' ``lag_pick``;
+      a tie goes to the incumbent named after t-1, then the smallest id)
+
+    ``R_proxy_lag = a_star_lag - a_lag`` (labels against the silhouette, both
+    picking after t-1 for window t) and ``R_search_lag = A_static -
+    a_star_lag`` (the best fixed configuration against the best the ensemble
+    held, as a labelled pick could use it), which sum to ``A_static - a_lag``.
+    ``R_search_lag < 0`` means adapting beat the best static configuration.
+
     Without a member log only ``R_lag`` is defined; without a static oracle
-    ``R_search`` is None; a region with no such window (a tail the run never
-    reached) reads ``n_windows`` 0 and every term None.
+    ``R_search`` and ``R_search_lag`` are None; a region with no such window
+    (a tail the run never reached) reads ``n_windows`` 0 and every term None.
     """
     win = load_windows(out_dir)
     if win.empty or "lag_ari_win" not in win or "ari_win" not in win:
@@ -540,7 +632,7 @@ def regret_table(out_dir: Path) -> pd.DataFrame:
     win = win[win["arm"].isin(ONLINE_ARMS)]
     if win.empty:
         return _frame([], REGRET_COLS)
-    best, seen = best_active_members(out_dir, arms=set(ONLINE_ARMS))
+    readings, seen = member_readings(out_dir, arms=set(ONLINE_ARMS))
     ceilings = {(r["algo"], r["fold"]): r for r in oracle_table(out_dir).to_dict("records")}
     tail_from = _tail_from_by_job(current_runs(out_dir))
     out = []
@@ -554,7 +646,7 @@ def regret_table(out_dir: Path) -> pd.DataFrame:
                 if region == "tail":
                     start = tail_from.get((algo, fold, seed, arm), C.FREEZE_AFTER_WINDOW)
                     g = g[pd.to_numeric(g["window"], errors="coerce") >= start]
-                job = _regret_job(g, best.get(key))
+                job = _regret_job(g, readings.get(key))
                 if job is not None:
                     jobs.append(job)
             out.append(_regret_row(algo, fold, arm, region, jobs, ceiling, logged))
@@ -589,12 +681,20 @@ def _regret_row(algo: str, fold: str, arm: str, region: str, jobs: list[dict], c
     a_lag = float(np.mean([j["a_lag"] for j in use]))
     a_inc = float(np.mean([j["a_inc"] for j in use]))
     a_star = float(np.mean([j["a_star"] for j in with_star])) if with_star else None
+    # over the same seeds as a_lag, or not at all: the two terms must sum to A_static - a_lag
+    lagged = [j["a_star_lag"] for j in use]
+    a_star_lag = float(np.mean(lagged)) if with_star and None not in lagged else None
     row.update(
         n_seeds=len(use), n_windows=int(sum(j["n"] for j in use)),
         a_lag=a_lag, a_inc=a_inc, a_star=a_star, R_lag=a_inc - a_lag,
         R_proxy=a_star - a_inc if a_star is not None else None,
         R_search=A - a_star if A is not None and a_star is not None else None,
+        a_star_lag=a_star_lag,
+        R_proxy_lag=a_star_lag - a_lag if a_star_lag is not None else None,
+        R_search_lag=A - a_star_lag if A is not None and a_star_lag is not None else None,
     )
+    if with_star and a_star_lag is None:
+        notes.append("no window with a previous one in the member log: no a_star_lag")
     if not with_star:
         notes.append(NO_MEMBERS_NOTE if not logged else "member log has no active-member ari_win")
     elif len(with_star) < len(jobs):
@@ -625,23 +725,107 @@ def _a_star(g: pd.DataFrame, star: dict[int, float] | None) -> pd.Series | None:
     return s
 
 
-def _regret_job(g: pd.DataFrame, star: dict[int, float] | None) -> dict | None:
+def _a_star_lag(g: pd.DataFrame, picks: dict[int, dict] | None) -> pd.Series | None:
+    """Per window row of one job: ``ari_win`` on window t of the member labels
+    picked after t-1 (``member_readings``' ``lag_pick``). A tie goes to the
+    incumbent named on t-1, then to the smallest member id. NaN where the
+    log has no pick for the window."""
+    if not picks:
+        return None
+    inc = dict(zip(g["window"], g["incumbent_id"])) if "incumbent_id" in g else {}
+
+    def one(w):
+        tied = picks.get(int(w))
+        if not tied:
+            return np.nan
+        prev = inc.get(w - 1)
+        value = tied[prev] if prev in tied else tied[min(tied)]
+        return np.nan if value is None else value
+
+    return pd.Series([one(w) for w in g["window"]], index=g.index, dtype=float)
+
+
+def _regret_job(g: pd.DataFrame, readings: dict | None) -> dict | None:
     g = g.drop_duplicates("window", keep="last")
     lag = pd.to_numeric(g["lag_ari_win"], errors="coerce")
     inc = pd.to_numeric(g["ari_win"], errors="coerce")
     mask = lag.notna() & inc.notna()
-    s = _a_star(g, star)
+    s = _a_star(g, (readings or {}).get("star"))
+    sl = _a_star_lag(g, (readings or {}).get("lag_pick")) if s is not None else None
     if s is not None:
         if (mask & s.notna()).any():
             mask = mask & s.notna()
         else:
-            s = None
+            s = sl = None
+    if sl is not None:
+        if (mask & sl.notna()).any():
+            mask = mask & sl.notna()
+        else:
+            sl = None
     if not mask.any():
         return None
     return {
         "n": int(mask.sum()), "a_lag": float(lag[mask].mean()), "a_inc": float(inc[mask].mean()),
         "a_star": float(s[mask].mean()) if s is not None else None,
+        "a_star_lag": float(sl[mask].mean()) if sl is not None else None,
     }
+
+
+# --- silhouette against ARI --------------------------------------------------------------------
+
+def proxy_table(out_dir: Path, min_spread: float = C.MIN_CEILING_GAIN) -> pd.DataFrame:
+    """Does the silhouette order configurations the way ARI does? Per (algo, fold, online arm, region).
+
+    On every window, the Spearman correlation between the silhouette and the
+    ARI of the members scored on it (``member_readings``' ``rho``: feasible
+    members with a defined silhouette, active and on test, at least three,
+    neither reading constant); the mean over the region's windows per seed,
+    then over seeds. ``region`` is ``all`` or ``tail`` as in ``regret_table``.
+
+    ``ari_spread`` is the mean, over the same windows and seeds, of the range
+    of those members' ARIs. Below ``min_spread`` (the ceiling gate's minimum
+    gain) ARI barely tells the members apart and a rank correlation with it
+    reads noise, so ``spearman`` is left out and ``note`` says why. The gate
+    is on the members of a window, not on the static ceiling: a fold where no
+    fixed configuration beats the default can still have members that differ
+    on every window. Where ``R_proxy_lag`` says what the silhouette's pick
+    costs, this says how well it ranks the configurations as a whole.
+    """
+    readings, _ = member_readings(out_dir, arms=set(ONLINE_ARMS))
+    if not readings:
+        return _frame([], PROXY_COLS)
+    tail_from = _tail_from_by_job(current_runs(out_dir))
+    cells: dict[tuple, dict[str, list[tuple]]] = {}
+    for (algo, fold, seed, arm, _), r in readings.items():
+        if arm not in ONLINE_ARMS:
+            continue
+        start = tail_from.get((algo, fold, seed, arm), C.FREEZE_AFTER_WINDOW)
+        for region in REGRET_REGIONS:
+            keep = (lambda w: True) if region == "all" else (lambda w: w >= start)
+            rho = [v for w, v in r["rho"].items() if keep(w)]
+            spread = [v for w, v in r["spread"].items() if keep(w)]
+            cells.setdefault((algo, fold, arm), {}).setdefault(region, []).append((
+                len(rho), float(np.mean(rho)) if rho else None, float(np.mean(spread)) if spread else None,
+            ))
+    out = []
+    for (algo, fold, arm), regions in sorted(cells.items()):
+        for region in REGRET_REGIONS:
+            per_seed = regions.get(region, [])
+            means = [m for _, m, _ in per_seed if m is not None]
+            spreads = [sp for _, _, sp in per_seed if sp is not None]
+            spread = float(np.mean(spreads)) if spreads else None
+            row = {"algo": algo, "fold": fold, "arm": arm, "region": region,
+                   "n_seeds": len(means), "n_windows": int(sum(n for n, _, _ in per_seed)),
+                   "spearman": None, "ari_spread": spread, "note": ""}
+            if not means:
+                row["note"] = "no window with three or more scored members and both readings varying"
+            elif spread is None or spread < min_spread - _EPS:
+                row["note"] = (f"ARI spread among members {spread:.3f} < {min_spread}: "
+                               "ARI barely tells the configurations apart")
+            else:
+                row["spearman"] = float(np.mean(means))
+            out.append(row)
+    return _frame(out, PROXY_COLS)
 
 
 # --- drift adaptation --------------------------------------------------------------------------
@@ -832,9 +1016,10 @@ def write_report(out_dir: Path) -> list[Path]:
     oracle = oracle_table(out_dir)
     headroom = headroom_table(out_dir)
     regret = regret_table(out_dir)
+    proxy = proxy_table(out_dir)
     drift = drift_table(out_dir)
     for name, df in (("summary", table), ("gain", gain), ("oracle", oracle), ("headroom", headroom),
-                     ("regret", regret), ("drift", drift)):
+                     ("regret", regret), ("proxy", proxy), ("drift", drift)):
         p = rep / f"{name}.csv"
         df.to_csv(p, index=False)
         written.append(p)
@@ -889,18 +1074,37 @@ def write_report(out_dir: Path) -> list[Path]:
 
     lines += ["", "## Regret decomposition", ""]
     lines.append(
-        "`A_static - a_lag = R_lag + R_proxy + R_search`, means over windows then seeds. "
-        "`R_lag = a_inc - a_lag` (one window of delay), `R_proxy = a_star - a_inc` "
-        "(silhouette picks a worse member than the best active one by ARI), "
-        "`R_search = A_static - a_star` (the ensemble never held the static optimum; "
-        "negative means adapting beat the best static configuration). Two rows per arm: "
-        "`region = tail` covers the windows from the run's `tail_from` on, the region every "
-        "arm shares and the primary one, against the oracle's tail reading; `region = all` "
-        "covers the whole stream, against its whole-stream reading. `ceiling_source` says "
-        "where `A_static` comes from."
+        "Two decompositions of `A_static - a_lag`, means over windows then seeds. The primary one "
+        "gives the labels the silhouette's one-window delay: `a_star_lag` is the ARI on window t "
+        "of the member a pick by labels made after window t-1 chooses (a tie goes to the "
+        "incumbent), so `R_proxy_lag = a_star_lag - a_lag` is what picking by silhouette instead "
+        "of labels costs and `R_search_lag = A_static - a_star_lag` is what the ensemble's "
+        "configurations fall short of the best static one (negative: adapting beat it). The "
+        "same-window one, `R_lag + R_proxy + R_search`, measures against `a_star`, the best "
+        "active member on window t picked with window t's own labels: `R_lag = a_inc - a_lag` "
+        "(one window of delay), `R_proxy = a_star - a_inc`, `R_search = A_static - a_star`. "
+        "`a_star` keeps each window's luck among members whose ARIs differ by noise, so "
+        "`R_proxy` overstates the silhouette's cost and `R_search` understates the search's; "
+        "read it as a bound. Two rows per arm: `region = tail` covers the windows from the run's "
+        "`tail_from` on, the region every arm shares and the primary one, against the oracle's "
+        "tail reading; `region = all` covers the whole stream, against its whole-stream reading. "
+        "`ceiling_source` says where `A_static` comes from."
     )
     lines.append("")
     lines.append(_md_table(regret, REGRET_COLS) if not regret.empty else "no online arm with lagged windows")
+
+    lines += ["", "## Silhouette against ARI", ""]
+    lines.append(
+        "On every window, the Spearman correlation between the silhouette and the ARI of the "
+        "members scored on it (feasible, silhouette defined, active and on test, at least "
+        "three, neither reading constant), averaged over windows then seeds: 1 when the "
+        "silhouette orders the configurations as ARI does, 0 when the orders are unrelated. "
+        f"`ari_spread` is the mean range of those members' ARIs; below {C.MIN_CEILING_GAIN} ARI "
+        "barely tells the configurations apart, the correlation would read noise, and `note` "
+        "says so instead of giving it."
+    )
+    lines.append("")
+    lines.append(_md_table(proxy, PROXY_COLS) if not proxy.empty else "no member log of an online arm")
 
     lines += ["", "## Drift adaptation", ""]
     lines.append(

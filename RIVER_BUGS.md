@@ -15,6 +15,14 @@ commit `88ca4633` (branch `main`), river `0.26.1`, Python 3.13.3, macOS 26.6.2.
 BUG-6, GAP-3 and GAP-4 were verified against the same tree, river `0.26.1`,
 Python 3.13.14, macOS 26.0.0, on 2026-09-22.
 
+The GAP-1 to GAP-4 workarounds were verified on 2026-10-06 against the same
+tree at commit `873fa6e0` (branch `main`), river `0.26.1`, Python 3.13.3 (the
+repo's `.venv`), macOS 27.0.1, with `PYTHONHASHSEED=0`. The measurements in
+their workaround sections were taken the same day on the same tree, under the
+conditions each section states.
+
+GAP-5 was measured on 2026-10-07 against the same tree and environment.
+
 ---
 
 ## BUG-1 — `StandardScaler(window_size=...)` can emit complex numbers
@@ -181,7 +189,13 @@ keys += [k for k in x if k not in center]
 return sum((abs(center[k] - x.get(k, 0))) ** self.p for k in keys)
 ```
 
-Sorting would also work but can raise on heterogeneous key types.
+This removes the dependence on the hash seed but not on order altogether: new
+centre coordinates are still drawn in the caller's key order, so the result
+depends on how the caller orders its dict. Measured with the GAP-1 harness,
+`check_shuffle_features_no_impact` still fails with this fix for 19 of 20
+shuffle seeds on `KMeans` and 20 of 20 on `STREAMKMeans`; iterating in sorted
+key order removes it. Sorting is therefore the fix to prefer, with a fallback
+(e.g. `key=repr`) for heterogeneous key types, on which a plain sort raises.
 
 ### Workaround in this framework
 
@@ -530,8 +544,168 @@ bundled with them.
 
 ### Workaround in this framework
 
-Run the dataset checks explicitly against any clusterer under test rather than
-trusting `check_estimator` to have covered it.
+`benchmark/algorithms/checks.py` runs the checks river skips, without touching
+river. `yield_clusterer_checks(model)` yields three things in order:
+
+1. Everything `checks.yield_checks` yields for the model, unchanged and in order.
+2. River's own dataset-driven checks, each bound to `clusterer_datasets()`:
+   `datasets.Phishing().take(200)`, the stream the table above was measured on.
+   Each check gets a fresh one-shot stream, as in river.
+3. `check_bounded_memory_growth` on `clusterer_datasets(scale=10)`. Phishing has
+   1250 rows, so that stream has 1250 points, the same cap river's classifier
+   branch has.
+
+`check_clusterer(model)` is `check_estimator` for a clusterer. It honours
+`_unit_test_skips` and raises on the first failure, with a note naming the
+check. `run_clusterer_checks(model)` returns one of three values per check name:
+
+- `"pass"`
+- `"fail: <exception>: <message> @ file:line"`
+- `"skip: listed in _unit_test_skips"`
+
+All three functions take `make_datasets`, a function of the same shape as
+`clusterer_datasets`, so a clusterer that does not take numeric vectors can be
+checked on its own stream.
+
+There is one adaptation. River lets an inference method answer
+`NotImplementedError`: its two predict_one checks skip it, and a classifier's
+`_infer` falls back from `predict_proba_one`. But the other dataset checks call
+`_infer` unguarded. On a clusterer that predicts nothing they would stop at the
+first point and never reach `learn_one`; ODAC is one, since it clusters
+variables, not samples. So when `NotImplementedError` escapes a dataset check,
+the harness reruns the check on a fresh clone and the same, untouched data,
+with `predict_one` answering `None` instead of raising. The rerun model is a
+clone of the model with its class swapped for a subclass that overrides only
+`predict_one`, so nested estimators come through intact. Rebuilding it from
+`_get_params()` would not work, because that encodes a nested estimator as a
+`(class, params)` tuple. That is how the ODAC crash below was found.
+
+`tests/test_clusterer_checks.py` pins the rerun with three planted clusterers:
+
+- one whose `predict_one` raises `NotImplementedError` passes every check;
+- the same with a nested `StandardScaler` passes every check;
+- one whose `learn_one` indexes the first point's features in every later point
+  fails exactly the emerging and radically disappearing checks, with
+  `KeyError`. River's own checks stop at `NotImplementedError` before reaching
+  that code.
+
+The list of dataset checks is a literal inside `yield_checks`, so
+`river_dataset_checks()` copies it branch for branch. The same test file pins
+the copy in three ways:
+
+- It compares the copy with river's own output, by module, qualified name and
+  name, for eight estimator types river does feed: binary classifier,
+  multi-class tree, regressor, stochastic anomaly detector, mini-batch
+  transformer, multi-label, model selector and forecaster. A check river adds,
+  drops, reorders or wraps differently fails the test.
+- Per clusterer, it asserts that the harness yields exactly river's checks, then
+  the copy with the two GAP-2 swaps on 200-point streams, then the memory check
+  on the long stream.
+- It asserts every stream is one-shot, and checks this through a learn count:
+  `check_radically_disappearing_features` must make 190 `learn_one` calls, not
+  210.
+
+The same file asserts that the gap is still upstream: `_yield_datasets` yields
+nothing for any river clusterer. It also shows that a clusterer keeping the
+caller's `x` as a centre passes `check_estimator` and fails `check_clusterer`
+on `check_no_state_aliasing_with_input`, and only there.
+
+The matrix runs every `river.cluster` class and every registry entry, so it
+includes the three framework subclasses: `DenStreamPatched` (BUG-7, BUG-8),
+`DenStreamPatchedFast` (GAP-3) and `CluStreamPyramidal` (GAP-4). Each is built
+from registry defaults. TextClust is fed token counts made by `BagOfWords` over
+a fixed two-topic vocabulary, as in its docstring. Every other clusterer is fed
+Phishing. Re-measured 2026-10-06 at river `873fa6e0`, `PYTHONHASHSEED=0`, with
+`random.seed(0)` before each cell:
+
+| | failing checks | cause |
+|---|---|---|
+| `DBSTREAM`, `DenStream`, `DenStreamPatched`, `DenStreamPatchedFast` | aliasing | BUG-3 |
+| `CluStream`, `CluStreamPyramidal` | aliasing; emerging features (`KeyError`) | BUG-3, BUG-4 |
+| `STREAMKMeans` | aliasing | BUG-3 |
+| `STREAMKMeans` | pickling, shuffle features, emerging, disappearing, radically disappearing, predict before learn; seeding idempotence when `seed` is unset (`ValueError`) | BUG-5 |
+| `ODAC` | emerging features (`TypeError` at `odac.py:480`) | not filed |
+| `KMeans` | none under `PYTHONHASHSEED=0`; under other hash seeds, shuffle features for some shuffle seeds | BUG-2 |
+| `BIRCH`, `ImprovedBIRCH` | `check_doc`, a static check, so `check_estimator` already fails | no class docstring, not filed |
+| `DCUStream`, `DDStream`, `DStream`, `HPStream`, `MRStream`, `RepStream`, `SOStream`, `TextClust` | none | |
+
+Every failure is a strict xfail that pins the exception type and cites its
+cause, so a fix upstream turns the test red until the expectation is removed.
+KMeans is the exception: under a hash seed other than 0 its cell is a
+non-strict xfail. A separate test reruns it in two subprocesses that differ
+only in `PYTHONHASHSEED`: hash seed 0 passes and 3 fails, with `random.seed(5)`.
+
+A framework subclass may inherit the failures of the entry it extends, with the
+same exception, and add none.
+`test_framework_subclasses_fail_only_what_their_reference_fails` asserts this,
+so a new failing cell for a subclass is a defect in the subclass, not a cell to
+xfail. All three meet it: each fails the cells of its reference with the same
+exception type, which the strict xfails pin, and passes the rest. When measured
+on 2026-10-06 the exceptions were also raised at the same lines
+(`common.py:442`, `clustream.py:321`); no test pins the line.
+
+The aliasing check looks at the first `learn_one` only, where the inherited
+BUG-3 already fails it, so it cannot see an alias that a subclass adds. A
+probe, not a test, mutated every input after `learn_one` over the whole stream
+and found none that changes results:
+
+- under mutation, `DenStreamPatchedFast` predicted exactly what
+  `DenStreamPatched` predicted;
+- `CluStreamPyramidal`'s horizon answers, snapshots and id lists were the same
+  with and without mutation.
+
+The registry pins `seed=42`, and river yields `check_seeding_is_idempotent`
+only when `seed` is `None`. So a separate test clones every entry whose
+parameters include `seed` with `seed=None`: CluStream, CluStreamPyramidal,
+HPStream, KMeans and STREAMKMeans. Only STREAMKMeans fails, through BUG-5.
+
+Differences from the table above:
+
+- **`KMeans`** passes `check_shuffle_features_no_impact` under
+  `PYTHONHASHSEED=0` for 20 of 20 shuffle seeds. Under other hash seeds it
+  fails for some of them:
+
+  | hash seed | 1 | 3 | 4 | 6 | 8 | 123 |
+  |---|---|---|---|---|---|---|
+  | failing shuffle seeds (of 20) | 14 | 18 | 14 | 11 | 10 | 18 |
+
+  At the matrix's `random.seed(0)`, only hash seed 4 fails. So the earlier
+  failure was BUG-2 under an unpinned hash seed. Running the test file under
+  another hash seed usually reports that cell as XPASS.
+- **`STREAMKMeans`** fails the shuffle and emerging-feature checks through
+  BUG-5's `ValueError` on the first `predict_one`.
+  - In the shuffle check BUG-5 masks a second failure. With `predict_one`
+    answering 0 while there are no centres, the check still fails for 5 of 20
+    shuffle seeds under `PYTHONHASHSEED=0` (seed 0 among them), and for 19 of
+    20 under 3.
+  - Iterating the inner KMeans's key union in sorted order removes it under
+    both, so it is BUG-2 through the KMeans inside STREAMKMeans.
+  - BUG-2's suggested upstream fix does not remove it. That fix iterates the
+    centre's keys, then `x`'s new keys in `x`'s order, so it draws new centre
+    coordinates in the caller's key order. With it, the check fails for 20 of
+    20 shuffle seeds under both hash seeds, and plain `KMeans` for 19 of 20.
+    It trades hash-order dependence for caller-order dependence.
+  - Once BUG-5 is fixed, the shuffle cell will raise `AssertionError` and its
+    xfail will turn red.
+  - BUG-5 also fails pickling, disappearing, radically disappearing and
+    predict-before-learn, which the table did not list.
+
+`ODAC.learn_one` raises `TypeError` when `x` lacks the one series of a
+singleton cluster. There, `update_statistics` calls `float(x.get(name))`
+without the `None` guard its multi-series branch has. Minimal repro:
+`m = cluster.ODAC(); m.learn_one({'a': 1.0}); m.learn_one({'b': 2.0})`. Through
+the harness it fails `check_emerging_features` for 4 of 10 shuffle seeds, the
+same under hash seeds 0, 1 and 3. River's checks cannot see it, because they
+stop at `predict_one`'s `NotImplementedError`.
+
+At registry defaults, some clusterers never leave their initial buffer on 200
+points: `DenStream`, `DenStreamPatched` and `DenStreamPatchedFast`
+(`n_samples_init=1000`) and `HPStream` (`n_samples_init=2000`). Their passes on
+the short-stream checks cover the buffering phase only. For the two DenStream
+subclasses this means their overridden `predict_one` never gets past the
+not-initialised early return, so this matrix does not run the BUG-7, BUG-8 and
+GAP-3 code paths. Those paths are covered by `tests/test_denstream_patched.py`
+and `tests/test_denstream_fast.py`.
 
 ---
 
@@ -576,8 +750,63 @@ elif isinstance(model, base.Clusterer):
     yield "predict_one"
 ```
 
-Fixing this is what makes BUG-5 visible to CI. Best filed together with GAP-1,
-since alone it changes nothing — no dataset reaches these checks anyway.
+With GAP-1 fixed, this adds the one check that tests BUG-5's convention
+directly, `check_predict_one_before_any_learn`. BUG-5 does not depend on it:
+GAP-1's fix alone already exposes BUG-5, through the five other dataset checks
+that infer before they learn (measured, see below). Best filed together with
+GAP-1, since alone it changes nothing — no dataset reaches these checks anyway.
+
+### Workaround in this framework
+
+`benchmark/algorithms/checks.py` defines its own `check_predict_one_pure` and
+`check_predict_one_before_any_learn`. They have river's code, with
+`predict_one` as the inference method of a `base.Clusterer`; every other
+estimator type falls back to river's `_inference_methods`.
+`yield_clusterer_checks` (GAP-1) uses them in place of river's under the same
+names, so `_unit_test_skips` and reports keep working.
+
+`tests/test_clusterer_checks.py` covers this in four ways:
+
+- It asserts that the gap is still upstream: `_inference_methods(cluster.DBSTREAM())`
+  is empty.
+- It pins both functions to river's with `ast`: same arguments and statements,
+  ignoring docstrings and comments. The only difference is which
+  `_inference_methods` the name resolves to. If river changes either body, the
+  test fails until the copy follows.
+- On a regressor, where river's versions are active, the two agree, both on
+  passing and on raising.
+- It proves the fix with two planted defects: a `predict_one` that writes into
+  the caller's dict, and one that raises before the first `learn_one`. River's
+  checks return `None` on both. The framework's raise `AssertionError` and
+  `ValueError`.
+
+In the matrix, this adds the one cell that tests river's convention directly:
+`STREAMKMeans` fails `check_predict_one_before_any_learn` with `ValueError`.
+With river's `_inference_methods` swapped back in, only that one cell changes;
+the other five BUG-5 cells come from GAP-1's fix alone.
+
+`check_predict_one_pure` asserts only that the input is unchanged, as river's
+does. A `predict_one` that changes the model's own state passes it and every
+other check. The test file keeps a planted clusterer of that kind passing, so
+this limit stays visible. No such check was added: three candidates were
+measured, and none catches BUG-7 without false positives.
+
+- **State unchanged by `predict_one`.** After learning, 9 of the 15 numeric
+  clusterers registered at the time (before the GAP-3 and GAP-4 subclasses)
+  change their pickled state on the first `predict_one`, because they build a
+  lazy macro-clustering. A plain "state unchanged" check would need an
+  allowance per algorithm.
+- **A repeat call changes nothing.** None of them, DenStream with BUG-7
+  included, changes state on an immediate repeat call, so this check would not
+  catch BUG-7 either.
+- **Predicting before each learn leaves later answers unchanged.** This
+  compares a model that predicts before each `learn_one` with one that only
+  learns. DenStream (`n_samples_init=50`) gives the same answers either way on
+  Phishing, so this check misses BUG-7 too. Meanwhile `MRStream` differs on 137
+  of 200 points, because its cached clustering is refreshed only when an
+  inspection runs.
+
+BUG-7 is covered by its own tests, in `tests/test_denstream_patched.py`.
 
 ---
 
@@ -669,8 +898,9 @@ does not already know the internals.
 
 ### Workaround here
 
-`benchmark/algorithms/adapter.py` declares `SENTINEL_LABELS = {"DenStream": (-1,)}`
-and the adapter **always counts** the occurrences in
+`benchmark/algorithms/adapter.py` declares `SENTINEL_LABELS = {"DenStream": (-1,)}`,
+looked up along the model's class hierarchy so `DenStreamPatched` and
+`DenStreamPatchedFast` inherit the entry, and the adapter **always counts** the occurrences in
 `n_sentinel_predictions`, which travels into every result row. Suppression is
 opt-in via `ClustererAdapter(drop_sentinel_predictions=True)` and is **off by
 default**, because the default has to keep measuring River's own behaviour —
@@ -744,11 +974,126 @@ test-then-train loop every sample is being treated as such a request.
 
 ### Workaround here
 
-None in the model — it would change what is being measured. Instead the pipeline
-reports cost per micro-cluster rather than raw throughput, and `hpo_compare`
-adds a constrained ceiling (report section 3b-iii: best ARI subject to a
-throughput floor) so that a quality number bought with compute is visible as
-such.
+Upstream is still measured as it is. `river.cluster.DenStream` re-runs the scan
+on every `predict_one`, and nothing in this framework changes that.
+`tests/test_denstream_fast.py` asserts it: exactly P*(P-1) reachability tests
+per call, also back to back, so the test fails the day river caches upstream.
+`hpo_compare` reports throughput, memory and the micro-cluster count side by
+side, and adds a constrained ceiling (report section 3b-iii: best ARI
+subject to a throughput floor), so that a quality number bought with compute is
+visible as such. `ClustererAdapter.learn_only` lets a warm start skip the
+prediction entirely.
+
+For the patched model there is an exact fast variant, `DenStreamPatchedFast`
+(`benchmark/algorithms/denstream_fast.py`), registered as
+`"DenStreamPatchedFast"` next to `"DenStreamPatched"`. It is a separate class
+under its own name; `DenStream` and `DenStreamPatched` are unchanged. It is
+`DenStreamPatched` (BUG-7 and BUG-8 fixed) with an incremental offline phase:
+
+- Per micro-cluster object, it keeps the two distance conditions of
+  `_is_directly_density_reachable`. In this river, centre and `calc_radius`
+  ignore the timestamp.
+- It recomputes only the row of a p-micro-cluster that is new or whose
+  `(N, last_edit_time)` changed. Each direction of a pair is evaluated in the
+  argument order upstream uses and stored separately, because
+  `euclidean_distance_dict` is not bit-symmetric when two centres order their
+  keys differently.
+- It re-evaluates the weights on every call. It finds components by traversing
+  the cached edges between heavy p-micro-clusters, over as many hops as a chain
+  needs.
+- It fills the `_center` memo of the same micro-clusters the reference's scan
+  fills: every heavy one when at least two are heavy, and no light one. It
+  reads any other centre through a copy. After each call the live
+  micro-clusters equal the reference's, memo slot included.
+- It rebuilds a merged cluster, with the inherited
+  `_generate_clusters_for_labels`, only when one of these changed: the
+  component's member tuple, a member's `(N, last_edit_time)`, the merged
+  cluster's own `N`, or the first member's `x`. The `x` check exists because of
+  BUG-3: a micro-cluster's `x` is the caller's input dict, which can change
+  without `N` moving. A reused merged cluster has its centre memo dropped,
+  because `centers` hands that dict out and the reference would have built a
+  fresh one.
+- It tracks objects by identity, never by dict key, because `denstream.py:223`
+  and `:231` can reuse the key of a live micro-cluster after a deletion.
+
+It matches `DenStreamPatched` exactly. `tests/test_denstream_fast.py` compares,
+with `==` after every step, the return value, `n_clusters`, every merged
+cluster (`x` and key order included), and every live p- and o-micro-cluster,
+centre memo included. The comparisons cover:
+
+- synthetic streams that exercise merged components, pruning, o->p promotion,
+  the key overwrite, light p-micro-clusters, `stream_speed=1`, predict-only and
+  learn-only bursts, and shuffled key order;
+- crafted chains that need two to four hops from their first member (BUG-8's
+  path), and a chain cut and rejoined at a middle link that turns light and
+  then heavy again. No natural stream in the suite formed such a chain, and
+  neither did 88k randomly fuzzed predictions, so only these fixtures cover
+  multi-hop labelling;
+- crafted boundaries: edge direction under asymmetric distances; identical
+  centres with radius 0; members swapped or reordered while their stamps stay
+  the same; a caller editing an input after `learn_one`, inserting into
+  `clusters[k]`, or editing a centre that `centers` returned;
+- `adapter.process_one`, and `run_once` (identical predictions and scores);
+- Bananas, and INSECTS and covtype slices. On INSECTS and covtype with every
+  feature, the norm-based radius is 0 (BUG-8), so no pair is ever linked and
+  those runs are smoke tests. One- and two-feature projections of both datasets
+  do link pairs and merge components;
+- pickle, `clone` and `deepcopy`.
+
+Through the registry, `tests/test_algorithms.py` checks that a `run_once` of
+`"DenStreamPatchedFast"` scores exactly what `"DenStreamPatched"` scores. In the
+clusterer-check matrix of `tests/test_clusterer_checks.py` (GAP-1) it fails
+only the cell `DenStreamPatched` fails, the inherited BUG-3 aliasing, with the
+same exception type (and, when measured, at the same line).
+
+One thing is not covered. A caller who edits the sums or times of
+`clusters[k]` in place without changing its `N` gets the edited object back on
+the next call, because merged clusters are reused while the reference builds
+fresh ones. Edits to its `N` or `x`, and to a centre returned by `centers`, are
+caught.
+
+It is **not** identical to upstream `DenStream`. BUG-8 makes upstream's
+labelling a different function, and BUG-7 makes its predictions mutate state,
+so caching upstream would change its results. This variant therefore cannot be
+used to time upstream DenStream. A speed number from it describes
+`DenStreamPatched`.
+
+Measured on 2026-10-06 against vendored river `873fa6e0`, on a shared machine:
+
+- **Test count.** `DenStream` and `DenStreamPatched` both do exactly P*(P-1)
+  reachability tests per `predict_one`. The fast variant does P*(P-1) once
+  after the initial DBSCAN. After that it does at most 2*(P-1) per
+  test-then-train prediction, and none for a repeated prediction.
+- **Per `predict_one`**, at P 45-52 on a synthetic 1-D stream: 1.07-1.18 ms
+  against 0.075-0.089 ms, a speed-up of 12.9-14.4x. About 0.008 ms of the fast
+  time comes from dropping the centre memo of reused merged clusters, because
+  `_get_closest_cluster_key` then recomputes those centres, as it does for the
+  reference's fresh clusters.
+
+End-to-end `run_once` (predict + learn), with identical predictions in every
+case:
+
+| stream | speed-up | peak model memory |
+|---|---|---|
+| synthetic, P≈50, 3000 samples | 14.2-14.5x | +27% |
+| Bananas, `epsilon=0.05`, mean P 37, 5300 samples | 8.7-9.5x | +26% |
+| INSECTS abrupt_balanced, `epsilon=0.1`, P≈7, 6000 samples | 2.3-2.4x | +0% |
+
+The memory column is the cache, which memory probes count. Speed-up was
+measured only up to P≈53.
+
+Two consequences of registering it:
+
+- Choosing the variant is explicit, and it replaces nothing. A default
+  `run_benchmark.py` run (`algorithms_for()`) includes it next to
+  `DenStreamPatched`: identical predictions under two names, and the cost paid
+  twice. Pass `--algorithms` to run one of them.
+- BUG-6's sentinel count covers it. Until 2026-10-06 `adapter.SENTINEL_LABELS`
+  was looked up by the exact class name `"DenStream"`, so on the BUG-6 repro,
+  where all three classes return `-1` twice in 200 predictions, the adapter
+  counted 2, 0 and 0. `adapter.sentinel_labels` now walks the class's MRO;
+  `tests/test_sentinel_predictions.py` checks all three. No shipped result used
+  `DenStreamPatched` before the change.
 
 ---
 
@@ -781,8 +1126,11 @@ The online/offline split that lets an analyst ask for clusters over an arbitrary
 past horizon *is* the CluStream contribution (VLDB 2003, Sec. 3.1). River
 implements the online micro-cluster maintenance and an offline k-means over the
 **current** micro-clusters only. Benchmarking `river.cluster.CluStream` and
-describing it as CluStream therefore overstates what was measured, and any
-statement about horizon queries is untestable here.
+describing it as CluStream therefore overstates what was measured, and the
+benchmark runner never passes a horizon, so a row for either `CluStream` or
+`CluStreamPyramidal` measures clustering over the current micro-cluster set
+only. Horizon queries can be tested here only through `CluStreamPyramidal`'s
+own methods (see Workaround here).
 
 ### Suggested upstream fix
 
@@ -792,8 +1140,114 @@ the frame is a larger change and would add `alpha` and `l` to the signature.
 
 ### Workaround here
 
-Documentation only: the benchmark says that River's CluStream has no pyramidal
-time frame, and makes no horizon claims.
+`benchmark/algorithms/clustream_pyramidal.py` adds the frame in a subclass,
+`CluStreamPyramidal(river.cluster.CluStream)`. It is registered as
+`"CluStreamPyramidal"` next to `"CluStream"`, so `"CluStream"` stays River's
+class exactly as shipped (AGENTS.md rule 1.3).
+
+* **The online phase is River's code.** `learn_one` and
+  `_maintain_micro_clusters` call `super()` and only observe which key River
+  replaced or merged into, to keep id lists. A lockstep test over 3,000 samples
+  (48 deletions, 445 merges, horizon queries interleaved) finds identical
+  micro-cluster statistics, macro-centres and `predict_one(x)` labels. It runs
+  twice: with unit weights, as the framework learns, and with sample weights
+  drawn from {0.5, 1, 2, 3}, which River accepts. The counters `n_deletions` and
+  `n_merges` follow River's two maintenance paths, checked against River's
+  relevance-stamp rule. With `max_micro_clusters=1`, River's merge path adds the
+  one micro-cluster to itself and replaces it; that counts as a merge.
+* **New parameters:** `alpha` (int >= 2), `l` (int >= 1) and
+  `snapshot_interval` (learned samples per clock tick). The defaults 2, 1 and
+  100 are runnable placeholders picked for a small store, not tuned values.
+* **Snapshots.** Every tick stores `(tick, order, {key: (frozenset(ids), copies
+  of var_x and var_time)})`. Retention follows the paper: for each order `i`,
+  keep the last `alpha**l + 1` ticks divisible by `alpha**i`, and store the
+  union once. This is checked at every one of 1,200 ticks, for four
+  `(alpha, l)` pairs, against an independent reference.
+* **Horizon queries.** `micro_clusters_for_horizon(h)` subtracts the last stored
+  snapshot at or before `t_c - h` through id lists. It returns the horizon
+  micro-clusters, as the caller's own copies, together with `covered`
+  (`t_c - t_s`), `snapshot_time` and `whole_stream`, so the approximation is
+  visible. `predict_one(x, horizon=h)` labels the nearest horizon micro-cluster
+  with a k-means built like River's offline phase: a fresh
+  `KMeans(n_macro_clusters, seed, **kwargs)`, unweighted, one pass over the
+  horizon centres. The horizon k-means is fitted on demand. River fits its own
+  only at `time_gap` boundaries, and not before the first boundary after
+  initialisation; until then River answers 0. A test with a KMeans option that
+  changes the labels (`sigma=0.3`) checks the following for a horizon that
+  reaches past the stream start:
+  - it reproduces River's labels at every `time_gap` boundary once River has
+    fitted (10 of 10 boundaries);
+  - it already gives several labels while River still answers 0;
+  - it can differ in between, where River's k-means is stale.
+
+  `predict_one(x)` without a horizon is River's.
+* **Lemma.** On the tick clock, `t_c - t_s <= (1 + 1/alpha**(l-1)) * h` for
+  every horizon of at least one tick. Off the tick grid it holds strictly for
+  `h >= snapshot_interval * alpha**(l-1)`; below that only
+  `t_c - t_s < h + snapshot_interval` holds. This is checked exhaustively over
+  every `(t_c, h)` up to `t_c = 240`.
+* **Exactness.** A test-side ledger records the points each live micro-cluster
+  holds, with their weights and the timestamp River wrote into `var_time`. River
+  stamps every point of its initialisation branch with
+  `max_micro_clusters - 1`. Against the ledger, the horizon micro-clusters hold
+  exactly the points learned after `t_s`, merged micro-clusters included:
+  - weight exact;
+  - per-feature mean: relative error <= 4e-14 (unit weights) and <= 3e-13
+    (weighted); per-feature variance <= 2.5e-9;
+  - mean and variance of the timestamps, which `relevance_stamp` reads:
+    relative error <= 1e-14 and <= 1.5e-9.
+
+  Snapshots taken inside River's initialisation branch are checked separately,
+  at every horizon of every sample of a short stream, past the end of
+  initialisation and through merges. River's `Var.__isub__` often leaves a
+  second moment slightly below zero, in `var_time` as in `var_x`. When one point
+  remains, `Var.get()` hides it. With two identical points remaining, `radius`
+  raises in `math.sqrt`. Such values are clamped to 0, and the tests check the
+  stored second moment, not only `get()`.
+* **Behaviour, and the condition it depends on.** The stream is 6,000 regime-A
+  samples, then 2,000 regime-B samples. With `l=3` the horizon of 2,000 is
+  covered exactly; with `l=1` it covers 3,200. A horizon only differs from the
+  current set while that set still holds the old regime, so the effect depends
+  on `time_window`:
+  - With `time_window` longer than the stream (no deletions), the horizon
+    weight equals the covered span, and only `covered - h` of it lies near A.
+    On held-out B points, ARI with the horizon is at least ARI without it on 5
+    of 5 seeds, and higher on 3 (+0.57, +0.57, +0.39).
+  - With `time_window=3000` the gains are 0, 0, +0.46, +0.12 and 0.
+  - At River's default `time_window=1000`, River's own deletions have removed
+    every regime-A micro-cluster by the end of the stream on 5 of 5 seeds.
+    Nothing is subtracted, the horizon micro-clusters are the current ones, and
+    both predictions are identical (gain 0).
+
+  Tests pin the no-deletion case and the default case.
+
+**Not implemented:**
+
+- horizons that end before `t_c` (the paper's evolution analysis);
+- the paper's weighted offline k-means;
+- the paper's disk-resident snapshot store.
+
+The runner calls `predict_one(x)` without a horizon. A benchmark row for
+`CluStreamPyramidal` therefore measures River's CluStream clustering plus the
+snapshot cost; any claim about horizons needs explicit
+`micro_clusters_for_horizon(h)` or `predict_one(x, horizon=h)` calls. Through
+the registry, `tests/test_algorithms.py` checks that a `run_once` of
+`"CluStreamPyramidal"` scores exactly what `"CluStream"` scores. In the
+clusterer-check matrix of `tests/test_clusterer_checks.py` (GAP-1) it fails
+only the two cells `CluStream` fails, BUG-3 aliasing and BUG-4 emerging
+features, with the same exception types (and, when measured, at the same
+lines).
+
+**Cost** is given as orders of magnitude, not a benchmark: three runs over two
+synthetic Gaussian streams, CPython 3.13, a shared machine, placeholder
+defaults. With 30,000 samples of 54 features there are 12 snapshots and
+14.7-15.7 MB, against 1.8 MB for `CluStream`, and learning is 6-16% slower. Id
+lists shrink only through deletions. With a `time_window` longer than the
+stream they hold every id ever issued: about 24,800 ids after 30,000 samples of
+10 features, in a 14.2 MB model against 0.3 MB.
+
+Tests: `tests/test_clustream_pyramidal.py`, run with `PYTHONHASHSEED=0`. Its
+upstream test asserts that the gap is still present in the vendored tree.
 
 ---
 
@@ -860,10 +1314,13 @@ BUG-8 below, which is the only reason it has not shown up in the matrices.
 
 ### Workaround here
 
-None registered yet: with BUG-8 in place the path is almost never taken, and a
-`DenStream` subclass overriding `_generate_clusters_for_labels` would have to
-be registered under its own name (AGENTS.md rule 1.3) and benchmarked against
-the untouched one. `conf_pipeline` records `n_macro_clusters` next to
+`DenStreamPatched` (`benchmark/algorithms/denstream_patched.py`, registered
+under its own name per AGENTS.md rule 1.3) overrides
+`_generate_clusters_for_labels` to deep-copy the first member before merging.
+`tests/test_denstream_patched.py` shows that upstream `DenStream` mutates a live
+p-micro-cluster and the subclass does not. Upstream stays registered as
+`DenStream`, untouched, so the two can be benchmarked against each other;
+`DenStreamPatchedFast` (GAP-3) builds on the subclass. `conf_pipeline` records `n_macro_clusters` next to
 `n_pred_labels` per window, which is where a run that did take the path would
 show.
 
@@ -914,5 +1371,91 @@ per-dimension variance one that CluStream uses.
 
 ### Workaround here
 
-None: reported, not patched. `conf_pipeline` and the HPO matrix both carry
+`DenStreamPatched` overrides `predict_one` with the seed expansion fixed
+(`if labels[neighbor] is None`); `tests/test_denstream_patched.py` shows a
+density-reachable chain becoming one cluster in the subclass and several
+upstream. The `calc_radius` question is left as upstream has it. `conf_pipeline`
+and the HPO matrix both carry
 `n_pred_labels`/`n_macro_clusters` per window so the reading is visible.
+
+---
+
+## GAP-5 — the k-means inside `CluStream` and `STREAMKMeans` starts its centres at N(0, 1), whatever the data's scale
+
+**Severity:** high for any benchmark that does not standardise its streams —
+the macro phase of River's CluStream then reports one cluster, and the
+algorithm reads as broken when its micro-cluster phase is fine.
+**Status:** measured on unmodified river.
+**Location:** [`river/cluster/k_means.py:90-101`](../river/river/cluster/k_means.py)
+(centres drawn lazily from `gauss(mu, sigma)`, defaults `mu=0`, `sigma=1`),
+used by [`clustream.py:257`](../river/river/cluster/clustream.py) and
+[`streamkmeans.py:84,101`](../river/river/cluster/streamkmeans.py).
+
+### Symptom
+
+Three well-separated Gaussian blobs, the same layout multiplied by `scale`,
+3 000 points learned and 900 held-out points predicted, `seed=1`:
+
+| | scale | `sigma` | labels | ARI |
+|---|---|---|---|---|
+| `CluStream(n_macro_clusters=3, max_micro_clusters=30)` | 0.25 | default (1) | 1 | 0.000 |
+| | 0.25 | 0.025 | 3 | 1.000 |
+| | 1 | default | 2 | 0.571 |
+| | 1 | 0.1 | 3 | 1.000 |
+| | 4 | default | 2 | 0.571 |
+| | 4 | 0.4 | 3 | 1.000 |
+| `STREAMKMeans(n_clusters=3, chunk_size=100)` | 0.25 | default | 1 | 0.000 |
+| | 0.25 | 0.025 | 2 | 0.571 |
+
+With `sigma` proportional to the data's scale, CluStream recovers the blobs at
+every scale; at River's default it collapses below scale 1. STREAMKMeans is
+lifted off the single label but stays at two on this layout, which is a second,
+separate limit of its chunked k-means and is not claimed fixed here.
+
+### Root cause
+
+`KMeans.learn_one` moves only the closest centre, by `halflife` of the way to
+the point. The centres start at N(`mu`, `sigma`) in absolute units, so when
+the data's spread is small against `sigma`, or the data sit far from `mu`, one
+centre is the nearest to every point, absorbs all of them, and the others never
+move. CluStream's offline phase is exactly this `KMeans` run over the
+micro-cluster centres every `time_gap` samples, and STREAMKMeans runs it per
+chunk and over the chunk centres. Neither signature exposes `mu` or `sigma`;
+both reach the inner `KMeans` only through `**kwargs`.
+
+### What it costs a benchmark
+
+In the OTB pilot (2026-10-01, no scaler, by protocol) CluStream at River
+defaults gave a lagged ARI of 0.001 on `k_drift` while the common reclusterer
+on its own micro-clusters (Table A, k-means) read 0.994: the online phase was
+fine and the macro phase put everything in one cluster. On the last third of
+`scale_drift`, where the features are multiplied by 0.25, every CluStream
+configuration the arms ran collapsed: mean lagged ARI 0.002 to 0.014 per arm
+there, against 0.68 to 0.92 for the tuned arms on the first two thirds of the
+same stream, because none of them could set `sigma`.
+
+### Suggested upstream fix
+
+Initialise the centres from the data, for example from the first
+`n_clusters` distinct points seen (or k-means++ over a first buffer), instead
+of N(`mu`, `sigma`). Failing that, document in CluStream and STREAMKMeans that
+`mu`/`sigma` must match the data's scale and expose them in their signatures.
+
+### Workaround here
+
+`conf_pipeline/spaces.py` tunes `sigma` for CluStream and STREAMKMeans as a
+`scaled` parameter, 0.01 to 1 times `s` on a log scale, so it follows the
+stream's spread like every other distance parameter. The start stays River's
+`sigma=1`, so the `default` arm is unchanged.
+`tests/test_conf_pipeline.py::test_sigma_in_units_of_s_lifts_clustream_off_a_single_label_at_small_scale`
+shows River's default giving one label and the middle of the range recovering
+the blobs.
+
+Measured limits of that workaround, on windows of the pilot folds (probe, not a
+test): on `scale_drift` and `k_drift` `sigma` between 0.05 and 0.5 times `s`
+works and 1 to 2 times `s` collapses again, which is why the range stops at 1.
+On raw `covtype` and INSECTS no scalar `mu` or `sigma` helps: their features
+sit on scales two to four orders of magnitude apart, and every coordinate is
+drawn from the same N(`mu`, `sigma`). The protocol does not rescale streams, so
+those cells keep the collapse and are read as such, not as a property of the
+online phase.
