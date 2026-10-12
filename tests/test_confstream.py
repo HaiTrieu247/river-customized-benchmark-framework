@@ -223,12 +223,37 @@ def test_the_incumbent_is_never_the_victim():
         assert 1 not in {m.id for m in ens.active}
 
 
-def test_reset_probability_one_gives_every_child_the_initial_width():
+def _narrow_every_parent(ens, sigma=1e-12):
+    for m in ens.active:
+        m.state.sigma = {name: sigma for name in m.state.sigma}
+
+
+def test_reset_probability_one_draws_every_child_at_the_initial_width():
+    # Parents narrowed to nothing: a child drawn at its parent's width lands on
+    # the parent. A reset child is drawn at the initial width (paper, Sec. 3;
+    # MOA's NumericalParameter resets before it samples), so it moves away, and
+    # its own width then shrinks like any child's.
     ens = _ensemble(e_size=2, e_test=3, p_reset=1.0)
     ens.initialise(_blob_window(40, seed=0), window_index=0)
+    _narrow_every_parent(ens)
     r1 = ens.process_window(_blob_window(40, seed=1), window_index=1)
+    parent = {m.id: m for m in ens.active}
     assert r1.n_reset == 3
-    assert all(m.state.sigma == {"n_clusters": 0.5, "halflife": 0.5} for m in ens.test)
+    for child in ens.test:
+        assert abs(child.u["halflife"] - parent[child.parent_id].u["halflife"]) > 1e-6
+        assert child.state.sigma == pytest.approx({"n_clusters": 0.5 * 2 ** -0.05,
+                                                   "halflife": 0.5 * 2 ** -0.05})
+
+
+def test_a_child_that_is_not_reset_is_drawn_at_its_parents_width():
+    ens = _ensemble(e_size=2, e_test=3, p_reset=0.0)
+    ens.initialise(_blob_window(40, seed=0), window_index=0)
+    _narrow_every_parent(ens)
+    r1 = ens.process_window(_blob_window(40, seed=1), window_index=1)
+    parent = {m.id: m for m in ens.active}
+    assert r1.n_reset == 0
+    for child in ens.test:
+        assert child.u["halflife"] == pytest.approx(parent[child.parent_id].u["halflife"], abs=1e-9)
 
 
 def test_children_shrink_sigma_when_not_reset():

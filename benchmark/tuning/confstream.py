@@ -436,10 +436,14 @@ class ConfStreamEnsemble:
             else:
                 parent = self.active[int(self.rng.choice(len(self.active), p=parent_w))]
                 parent_id = parent.id
-                child_u, child_state = parent.state.offspring(parent.u, self.rng, self.cfg.lam)
+                # A reset child is drawn at the initial width, not just given
+                # it for its own offspring (paper, Sec. 3; MOA resets before
+                # it samples).
+                state = parent.state
                 if self.rng.random() < self.cfg.p_reset:
-                    child_state = child_state.reset(self.space)
+                    state = state.reset(self.space)
                     n_reset += 1
+                child_u, child_state = state.offspring(parent.u, self.rng, self.cfg.lam)
             params = self._resolve(child_u)
             self.test.append(self._new_member(
                 child_u, params, child_state, parent_id, window_index, buffer,
