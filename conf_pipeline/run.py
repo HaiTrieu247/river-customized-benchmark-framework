@@ -86,6 +86,20 @@ def _make_adapter_factory(algo: str, h: int):
     return make
 
 
+def external_defined(o: WindowOutcome) -> bool:
+    """Whether the window ``o`` was scored on has enough true classes
+    (``_common.MIN_TRUE_CLASSES``) for its external metrics to read anything;
+    True when the window's classes are unknown."""
+    return o.n_true_classes is None or o.n_true_classes >= C.MIN_TRUE_CLASSES
+
+
+def _external(o: WindowOutcome) -> dict:
+    """``o``'s per-window external metrics as ``{name_win: value}``, None on a
+    window without enough true classes (``external_defined``)."""
+    ok = external_defined(o)
+    return {f"{k}_win": (v if ok else None) for k, v in o.window_metrics.items()}
+
+
 def _incumbent_fields(o: WindowOutcome, prefix: str = "") -> dict:
     return {
         f"{prefix}member_id": o.member_id,
@@ -101,7 +115,7 @@ def _incumbent_fields(o: WindowOutcome, prefix: str = "") -> dict:
         f"{prefix}n_sentinel": o.n_sentinel,
         f"{prefix}n_fallback": o.n_fallback,
         f"{prefix}error": o.error,
-        **{f"{prefix}{k}_win": v for k, v in o.window_metrics.items()},
+        **{f"{prefix}{k}": v for k, v in _external(o).items()},
     }
 
 
@@ -136,6 +150,9 @@ def _table_a_fields(lag_member, lag: WindowOutcome | None, buffer: WindowBuffer,
                 )
             except Exception as exc:
                 error = f"{type(exc).__name__}: {exc}"
+    if lag is not None and not external_defined(lag):
+        # the centres and their SSQ need no labels; the ARIs of a one-class window read nothing
+        table_a.update(ari_A_kmeans=None, ari_A_dbscan=None)
     return {**{f"lag_{k}": v for k, v in table_a.items()}, "lag_table_a_error": error}
 
 
@@ -179,7 +196,7 @@ def arm_config(arm: str, cfg: EnsembleConfig, freeze_after_window: int | None) -
     elif arm == "frozen_prefix":
         over = dict(freeze_after_window=freeze_after_window)
     else:
-        raise ValueError(f"unknown arm {arm!r}; arms: {C.ARMS + C.EXTRA_ARMS}")
+        raise ValueError(f"unknown arm {arm!r}; arms: {C.ARMS + C.OPTIONAL_ARMS + C.EXTRA_ARMS}")
     return EnsembleConfig(**{**cfg.__dict__, **over})
 
 
@@ -273,7 +290,7 @@ def run_ensemble(
         if member_log is None:
             return
         for o in report.outcomes:
-            C.append_jsonl(member_log, {**base, **o.to_dict()})
+            C.append_jsonl(member_log, {**base, **o.to_dict(), **_external(o)})
 
     for x, y in dataset:
         if n_samples is not None and n_seen >= n_samples:
@@ -349,6 +366,7 @@ def run_ensemble(
             **table_a_fields,
             "n_true_classes": inc.n_true_classes,
             "majority_class_share": inc.majority_class_share,
+            "external_defined": external_defined(inc),
             "n_active": report.n_active, "n_feasible": report.n_feasible,
             "n_tested": report.n_tested, "n_accepted": report.n_accepted,
             "n_discarded": report.n_discarded, "n_spawned": report.n_spawned,
@@ -424,6 +442,10 @@ def run_ensemble(
         ),
         **{f"lag_{k}_cumulative": v for k, v in lag_cum.items()},
         "lag_n_scored": len(lag_y),
+        #: Windows behind the lagged means: a window with one true class has no reading.
+        "lag_ari_n_windows": sum(1 for r in window_rows if r.get("lag_ari_win") is not None),
+        "lag_ari_n_windows_tail": sum(1 for r in tail if r.get("lag_ari_win") is not None),
+        "n_single_class_windows": sum(1 for r in window_rows if not r["external_defined"]),
         "lag_undefined_share": (
             sum(1 for r in lag_rows if not r["lag_defined"]) / len(lag_rows) if lag_rows else None
         ),
@@ -568,7 +590,7 @@ def main() -> None:
     parser.add_argument("--folds", default=",".join(C.FOLDS))
     parser.add_argument("--seeds", default=",".join(map(str, C.SEEDS)))
     parser.add_argument("--arms", default=",".join(C.ARMS),
-                        help=f"comma-separated, from {C.ARMS + ('oracle_static',)}")
+                        help=f"comma-separated, from {C.ARMS + C.OPTIONAL_ARMS + ('oracle_static',)}")
     parser.add_argument("--n-samples", type=int, default=C.N_SAMPLES_CAP, help="0 = whole stream")
     parser.add_argument("--freeze-after-window", type=int, default=C.FREEZE_AFTER_WINDOW,
                         help="window where frozen_prefix stops tuning; every arm's tail starts there")
@@ -606,7 +628,7 @@ def main() -> None:
     if unknown:
         raise SystemExit(f"no search space for {unknown}; known: {sorted(SPACES)}")
     arms = _csv(args.arms)
-    runnable = C.ARMS + ("oracle_static",)
+    runnable = C.ARMS + C.OPTIONAL_ARMS + ("oracle_static",)
     bad = [a for a in arms if a not in runnable]
     if bad:
         raise SystemExit(

@@ -57,7 +57,7 @@ FRIEDMAN_COLS = ["arm", "n_folds", "k", "statistic", "pvalue", "cd"]
 IMPL_COLS = ["variant", "reference", "arm", "fold", "reference_value", "variant_value", "delta",
              "rank_reference", "rank_variant", "rank_change"]
 #: Protocol order of the arms, for tables and colours; anything else follows, sorted.
-ARM_ORDER: tuple[str, ...] = C.ARMS + C.EXTRA_ARMS
+ARM_ORDER: tuple[str, ...] = C.ARMS + C.OPTIONAL_ARMS + C.EXTRA_ARMS
 #: Float slack on the noise-band comparison (0.6 - 0.55 is 0.04999999999999993).
 _EPS = 1e-12
 

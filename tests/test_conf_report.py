@@ -198,6 +198,21 @@ def test_summary_table_averages_the_cost_ratios_and_the_table_a_errors(out_dir):
     assert "lag_table_a_first_error_sd" not in table
 
 
+def test_summary_table_carries_how_many_windows_the_means_rest_on(out_dir):
+    # kdd99-like: most windows hold one true class and have no external reading
+    rows = _read_jsonl(out_dir / "runs.jsonl")
+    for r in rows:
+        if (r["algo"], r["fold"], r["arm"]) == ("DenStream", "covtype", "confstream"):
+            r.update(n_single_class_windows=10 + r["seed"], lag_ari_n_windows=8, lag_ari_n_windows_tail=3)
+    _write_jsonl(out_dir / "runs.jsonl", rows)
+    den = report.summary_table(out_dir).set_index(["algo", "fold", "arm"]).loc[("DenStream", "covtype", "confstream")]
+    assert den["n_single_class_windows"] == pytest.approx(11.5)
+    assert den["lag_ari_n_windows"] == 8 and den["lag_ari_n_windows_tail"] == 3
+    report.write_report(out_dir)
+    section = (out_dir / "report" / "report.md").read_text().split("## Summary (mean over seeds)")[1].split("\n## ")[0]
+    assert "lag_ari_n_windows_tail" in section and "n_single_class_windows" in section
+
+
 def test_summary_table_flags_a_cell_missing_a_seed_of_its_arm(out_dir):
     t = report.summary_table(out_dir).set_index(["algo", "fold", "arm"])
     den = t.loc[("DenStream", "covtype", "confstream")]
@@ -282,6 +297,19 @@ def test_headroom_gates_on_gain_and_noise(out_dir):
     hp = h.loc[("HPStream", "covtype")]
     assert not hp["tunable"]   # gain below 0.05
     assert hp["headroom_confstream"] is None and hp["evolution_value"] is None
+
+
+def test_headroom_reads_random_online_only_when_it_ran(out_dir):
+    # random_online is no longer a protocol arm: without its runs the table has neither its
+    # headroom column nor evolution_value; the fixture's run brings both back
+    h = report.headroom_table(out_dir)
+    assert {"headroom_random_online", "evolution_value"} <= set(h.columns)
+    rows = [r for r in _read_jsonl(out_dir / "runs.jsonl") if r["arm"] != "random_online"]
+    _write_jsonl(out_dir / "runs.jsonl", rows)
+    h = report.headroom_table(out_dir)
+    assert "headroom_random_online" not in h and "evolution_value" not in h
+    assert {"headroom_confstream", "headroom_frozen_prefix", "headroom_oracle_static"} <= set(h.columns)
+    assert "evolution_value" not in report.headroom_table(out_dir.parent / "nothing_here")
 
 
 def test_headroom_gate_uses_the_default_standard_error(out_dir):
@@ -575,8 +603,7 @@ def test_new_tables_are_empty_frames_on_an_empty_out_dir(tmp_path):
     for fn, cols in (
         (report.gain_table, {"algo", "fold", "arm", "gain_tail", "gain_all", "throughput_ratio"}),
         (report.oracle_table, {"algo", "fold", "ceiling", "ceiling_source"}),
-        (report.headroom_table, {"algo", "fold", "default", "ceiling", "gain", "default_se", "tunable",
-                                 "evolution_value"}),
+        (report.headroom_table, {"algo", "fold", "default", "ceiling", "gain", "default_se", "tunable"}),
         (report.regret_table, {"algo", "fold", "arm", "R_lag", "R_proxy", "R_search", "a_lag", "a_inc",
                                "a_star", "A_static", "note"}),
         (report.drift_table, {"algo", "fold", "arm", "drift_point", "window", "pre", "drop_depth",

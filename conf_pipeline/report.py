@@ -53,6 +53,7 @@ SUMMARY_FIELDS = (
     "lag_ari_A_kmeans_tail_mean", "lag_ari_A_dbscan_tail_mean",
     "lag_ssq_micro_mean", "lag_n_micro_centers_mean", "frozen_at_window",
     "tuning_overhead", "switch_cost", "lag_table_a_error_share", "lag_table_a_first_error",
+    "lag_ari_n_windows", "lag_ari_n_windows_tail", "n_single_class_windows",
 )
 #: Fields of ``SUMMARY_FIELDS`` that are text: the lowest seed's value, no mean and no sd.
 SUMMARY_TEXT_FIELDS = ("lag_table_a_first_error",)
@@ -61,10 +62,12 @@ GROUP = ["algo", "fold", "arm"]
 #: The evaluation region every arm shares (windows >= ``tail_from``) and the whole stream.
 TAIL = "lag_ari_win_tail_mean"
 WHOLE = "lag_ari_win_mean"
-#: Arms that tune online: the regret decomposition and ``evolution_value`` are theirs.
-ONLINE_ARMS: tuple[str, ...] = tuple(a for a in C.ARMS if a != "default")
-#: Arms given a ``headroom_<arm>`` column even when absent from the runs.
-HEADROOM_ARMS: tuple[str, ...] = ONLINE_ARMS + ("oracle_static",)
+#: Arms that tune online, the optional ones included so older runs still read: the regret
+#: decomposition and the silhouette table are theirs.
+ONLINE_ARMS: tuple[str, ...] = tuple(a for a in C.ARMS + C.OPTIONAL_ARMS if a != "default")
+#: Arms given a ``headroom_<arm>`` column even when absent from the runs: the protocol's.
+#: Any other arm that ran gets one too.
+HEADROOM_ARMS: tuple[str, ...] = tuple(a for a in C.ARMS if a != "default") + ("oracle_static",)
 #: One-sided 95% z: the ceiling gain must clear this many standard errors of the default.
 Z_GATE = 1.645
 #: Windows in a row the lagged reading must stay within ``delta`` of its reference.
@@ -105,7 +108,8 @@ def _headroom_cols(arms=HEADROOM_ARMS) -> list[str]:
     return (
         ["algo", "fold", "metric", "default", "default_se", "n_seeds_default", "ceiling",
          "ceiling_source", "gain", "tunable"]
-        + [f"headroom_{a}" for a in arms] + ["evolution_value", "note"]
+        + [f"headroom_{a}" for a in arms]
+        + (["evolution_value"] if {"confstream", "random_online"} <= set(arms) else []) + ["note"]
     )
 
 
@@ -499,7 +503,8 @@ def headroom_table(out_dir: Path, min_gain: float = C.MIN_CEILING_GAIN) -> pd.Da
     ``tunable = gain >= min_gain and gain > 1.645 * default_se``. Only a tunable
     fold gets ``headroom_<arm> = (arm - default) / gain``; the others read None
     and say why in ``note`` ("not tunable by ARI"), rather than a ratio of noise.
-    ``evolution_value = headroom_confstream - headroom_random_online``.
+    ``evolution_value = headroom_confstream - headroom_random_online``, a column only
+    when ``random_online`` ran (it is optional since 2026-10-12).
     """
     runs = current_runs(out_dir)
     oracle = oracle_table(out_dir)
@@ -539,8 +544,9 @@ def headroom_table(out_dir: Path, min_gain: float = C.MIN_CEILING_GAIN) -> pd.Da
         for arm in arms:
             a = stats.get((algo, fold, arm))
             row[f"headroom_{arm}"] = (a[0] - default) / gain if tunable and a else None
-        hc, hr = row.get("headroom_confstream"), row.get("headroom_random_online")
-        row["evolution_value"] = hc - hr if hc is not None and hr is not None else None
+        if "evolution_value" in cols:
+            hc, hr = row.get("headroom_confstream"), row.get("headroom_random_online")
+            row["evolution_value"] = hc - hr if hc is not None and hr is not None else None
         if ceiling is None:
             row["note"] = (
                 f"no ceiling: sweep produced no ok point for {algo}/{fold}" if (algo, fold) in no_ok_point
@@ -1036,12 +1042,16 @@ def write_report(out_dir: Path) -> list[Path]:
         "(-1 when undefined); `ari_win` is the ARI inside the window; "
         "`lag_ari_cumulative` is the ARI over the whole stream of lagged incumbents. "
         "`*_tail_*` columns cover the windows from `tail_from` (the freeze window) on, "
-        "the region every arm shares; they are the headline numbers."
+        "the region every arm shares; they are the headline numbers. A window with a single "
+        "true class has no external reading (ARI would only say whether the prediction had one "
+        "label) and is left out of every mean: `n_single_class_windows` counts them and "
+        "`lag_ari_n_windows` / `lag_ari_n_windows_tail` count the windows the lagged ARI rests on."
     )
     lines += ["", "## Summary (mean over seeds)", ""]
     if not table.empty:
         cols = ["algo", "fold", "arm", "n_seeds", "lag_ari_win_tail_mean", "lag_ari_win_tail_sd",
-                "lag_ari_win_mean", "lag_ari_win_sd", "lag_score_mean", "lag_ari_cumulative",
+                "lag_ari_n_windows_tail", "lag_ari_win_mean", "lag_ari_win_sd", "lag_ari_n_windows",
+                "n_single_class_windows", "lag_score_mean", "lag_ari_cumulative",
                 "incumbent_throughput_sps", "ensemble_runtime_s", "tuning_overhead", "lag_memory_mb_peak",
                 "lag_n_pred_labels_mean", "n_switches", "switch_cost", "lag_undefined_share",
                 "single_class_window_share", "frozen_at_window"]
@@ -1060,7 +1070,8 @@ def write_report(out_dir: Path) -> list[Path]:
         "The ceiling is the static oracle's lagged ARI (its reruns, else the sweep's best "
         "point). `headroom_<arm> = (arm - default) / (ceiling - default)`, reported only when "
         f"the fold is tunable: `ceiling - default >= {C.MIN_CEILING_GAIN}` and "
-        f"`> {Z_GATE} * se(default)`. `evolution_value = headroom_confstream - headroom_random_online`."
+        f"`> {Z_GATE} * se(default)`. `evolution_value = headroom_confstream - headroom_random_online` "
+        "appears only when the optional `random_online` arm ran."
     )
     lines.append("")
     if not oracle.empty:

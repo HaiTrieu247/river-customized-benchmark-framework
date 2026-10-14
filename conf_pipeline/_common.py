@@ -74,12 +74,16 @@ SYNTH_FOLDS: tuple[str, ...] = (
     "static_overlap", "incremental_drift", "evolving",
 )
 FOLDS: tuple[str, ...] = REAL_FOLDS + SYNTH_FOLDS
-#: Seeds of every arm. Three, the same for all four arms, so every comparison
+#: Seeds of every arm. Three, the same for every arm, so every comparison
 #: between arms sees the same seed noise (decided 2026-10-07 after the pilot,
 #: for budget: five seeds cost 900-1 600 CPU-h).
 SEEDS: tuple[int, ...] = (1, 2, 3)
 #: The tuning regimes every (algo, fold, seed) is run under.
-ARMS: tuple[str, ...] = ("default", "confstream", "random_online", "frozen_prefix")
+ARMS: tuple[str, ...] = ("default", "confstream", "frozen_prefix")
+#: Arms the driver still runs on request (``--arms``) and the report still reads, but that
+#: the protocol no longer includes. ``random_online`` left it on 2026-10-12: it cost about
+#: half the full budget, and CluStream's runs of it risked the 12 h timeout.
+OPTIONAL_ARMS: tuple[str, ...] = ("random_online",)
 #: Single-configuration arms driven by a file: the sweep's points and its winner.
 EXTRA_ARMS: tuple[str, ...] = ("oracle_static", "sweep")
 #: Every fold is cut at this many samples (the driver caps; loaders never see it).
@@ -101,6 +105,12 @@ SYNTH_N_SAMPLES = 120_000
 #: only unit in play (HPStream normalises internally; that is the algorithm's).
 SCALER = "none"
 EXTERNAL_METRICS = ("ari", "nmi", "purity")
+#: A window needs this many true classes for an external metric to say anything. With one,
+#: ARI is 1 for a one-label prediction and 0 for any other, NMI likewise, and purity is 1
+#: whatever the prediction: the reading measures "did it output one label", not quality,
+#: and rewards a broken configuration. Such a window's external readings are recorded as
+#: undefined (None) and so drop out of every mean. A definition, not a tunable.
+MIN_TRUE_CLASSES = 2
 #: Table A's DBSCAN eps over the lagged member's micro-cluster centres, as a
 #: fraction of the calibration window's distance unit ``s_online`` -- the same
 #: unit DenStream's own ``epsilon`` is read in, so the two DBSCANs are

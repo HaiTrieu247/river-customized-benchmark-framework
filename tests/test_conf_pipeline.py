@@ -62,8 +62,11 @@ def test_load_fold_knows_the_protocol_folds_and_the_synthetic_ones():
         _common.load_fold("no_such_fold")
 
 
-def test_protocol_lists_eight_algorithms_eighteen_folds_four_arms():
-    assert len(_common.ALGOS) == 8 and len(_common.FOLDS) == 18 and _common.ARMS == ("default","confstream","random_online","frozen_prefix")
+def test_protocol_lists_eight_algorithms_eighteen_folds_three_arms():
+    # random_online left the protocol on 2026-10-12; it stays runnable on request
+    assert len(_common.ALGOS) == 8 and len(_common.FOLDS) == 18
+    assert _common.ARMS == ("default", "confstream", "frozen_prefix")
+    assert _common.OPTIONAL_ARMS == ("random_online",)
     assert _common.SEEDS == (1, 2, 3) and _common.N_SAMPLES_CAP == 100_000
 
 
@@ -292,6 +295,46 @@ def test_window_rows_carry_table_a_readings_for_the_lagged_member():
     assert summary["lag_n_micro_centers_mean"] is not None
     assert summary["lag_ari_A_kmeans_mean"] is not None and summary["lag_ari_A_dbscan_mean"] is not None
     assert summary["lag_table_a_error_share"] == 0.0 and summary["lag_table_a_first_error"] is None
+
+
+def _one_class_window_run(tmp_path):
+    """The toy stream with window 3 (samples 900-1199) relabelled to a single true class."""
+    data = [(x, 0 if 900 <= i < 1200 else y)
+            for i, (x, y) in enumerate(make_scenario("static_easy", n_samples=1500, n_features=2,
+                                                     n_clusters=3, seed=3))]
+    cfg = EnsembleConfig(e_size=3, e_test=1, lam=0.1, p_reset=0.0)
+    log = tmp_path / "members.jsonl"
+    rows = run_ensemble(
+        algo="KMeans", space=TOY, start=[{"n_clusters": 2, "halflife": 0.5}], dataset=data,
+        fold="toy", seed=1, arm="confstream", cfg=cfg, h=300, n_samples=1500, member_log=log,
+    )
+    return rows, [json.loads(line) for line in log.read_text().splitlines()]
+
+
+def test_a_single_class_window_has_no_external_reading(tmp_path):
+    # With one true class, ARI is 1 for a one-label prediction and 0 for any other, and
+    # purity is 1 whatever the prediction: none of them says how well the window clustered.
+    rows, members = _one_class_window_run(tmp_path)
+    wins = {r["window"]: r for r in rows if r["kind"] == "window"}
+    w3 = wins[3]
+    assert w3["n_true_classes"] == 1 and w3["external_defined"] is False
+    for key in ("ari_win", "nmi_win", "purity_win", "lag_ari_win", "lag_nmi_win", "lag_purity_win",
+                "lag_ari_A_kmeans", "lag_ari_A_dbscan"):
+        assert w3[key] is None, key
+    assert w3["lag_score"] is not None and w3["lag_ssq_micro"] is not None   # no labels in either
+    assert wins[2]["external_defined"] is True and wins[2]["lag_ari_win"] is not None
+    assert all(m["ari_win"] is None and m["purity_win"] is None for m in members if m["window"] == 3)
+    assert all(m["ari_win"] is not None for m in members if m["window"] == 2)
+
+
+def test_the_summary_leaves_single_class_windows_out_and_counts_them(tmp_path):
+    rows, _ = _one_class_window_run(tmp_path)
+    wins = {r["window"]: r for r in rows if r["kind"] == "window"}
+    (summary,) = [r for r in rows if r["kind"] == "run"]
+    # window 1 has no lagged reading yet, window 3 has one class: windows 2 and 4 remain
+    assert summary["lag_ari_win_mean"] == pytest.approx((wins[2]["lag_ari_win"] + wins[4]["lag_ari_win"]) / 2)
+    assert summary["lag_ari_n_windows"] == 2 and summary["n_single_class_windows"] == 1
+    assert summary["lag_ari_n_windows_tail"] == 0     # the tail starts at window 20
 
 
 def test_table_a_errors_are_counted_on_the_summary_with_the_first_message(monkeypatch):
@@ -532,7 +575,15 @@ def _cli(*args, env=None):
 def test_cli_dry_run_lists_the_full_protocol_by_default(tmp_path):
     proc = _cli("--dry-run", "--out-dir", str(tmp_path))
     assert proc.returncode == 0, proc.stderr
-    assert "1728 jobs" in proc.stdout   # 8 algos x 18 folds x 3 seeds x 4 arms
+    assert "1296 jobs" in proc.stdout   # 8 algos x 18 folds x 3 seeds x 3 arms
+    assert "random_online" not in proc.stdout
+
+
+def test_cli_still_runs_random_online_when_asked(tmp_path):
+    proc = _cli("--algos", "DenStream", "--folds", "static_easy", "--seeds", "1", "--arms", "random_online",
+                "--out-dir", str(tmp_path), "--dry-run")
+    assert proc.returncode == 0, proc.stderr
+    assert "1 jobs" in proc.stdout and "arm=random_online" in proc.stdout
 
 
 def test_cli_oracle_arm_without_an_oracle_entry_is_skipped_not_run(tmp_path):
