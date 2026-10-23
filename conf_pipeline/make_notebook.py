@@ -63,7 +63,7 @@ if not (REPO / "conf_pipeline").is_dir():
 if str(REPO) not in sys.path:
     sys.path.insert(0, str(REPO))
 
-from conf_pipeline import _common as C, analyze, report  # noqa: E402
+from conf_pipeline import _common as C, analyze, report, robustness  # noqa: E402
 
 # Every algorithm run is a child process with the hash seed pinned (CluStream replays only then).
 ENV = {**os.environ, "PYTHONHASHSEED": C.PYTHONHASHSEED}
@@ -169,11 +169,14 @@ RETRY_FAILED = False
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 COMMON_ARGS = ["--algos", ",".join(ALGOS), "--folds", ",".join(FOLDS), "--n-samples", N_SAMPLES,
                "--h", H, "--workers", WORKERS, "--timeout", TIMEOUT_S]
+# The protocol of out/full: one job seed drives the tuner and the models (docs/SEED_RULES.md).
+COMMON_ARGS += ["--seed-policy", "shared"]
 COMMON_ARGS += ["--retry-failed"] if RETRY_FAILED else []
 DRIVER_ARGS = ["--e-size", E_SIZE, "--e-test", E_TEST, "--freeze-after-window", FREEZE_AFTER_WINDOW]
 RUN_ARGS = [*COMMON_ARGS, *DRIVER_ARGS, "--seeds", ",".join(map(str, SEEDS)), "--arms", ",".join(ARMS)]
 RUN_ARGS += ["--log-members"] if LOG_MEMBERS else []
-SWEEP_ARGS = [*COMMON_ARGS, "--n-points", SWEEP_N_POINTS, "--seed", 1, "--incumbents"]
+SWEEP_ARGS = [*COMMON_ARGS, "--n-points", SWEEP_N_POINTS, "--seed", 1, "--incumbents",
+              "--freeze-after-window", FREEZE_AFTER_WINDOW]
 ORACLE_ARGS = [*COMMON_ARGS, *DRIVER_ARGS, "--seeds", ",".join(map(str, ORACLE_SEEDS)),
                "--arms", "oracle_static"]
 
@@ -308,8 +311,28 @@ for path in written:
         display(Image(filename=str(path)))
 """
 
+ROBUSTNESS_MD = r"""
+## 8. Độ vững của kết luận (A1–A5)
+
+Cell dưới kiểm tra các kết luận ở trên phụ thuộc bao nhiêu vào độ đo, vào cấu hình tham chiếu và vào số seed, mà không chạy thêm lượt tune nào. Trước hết nó chạy `conf_pipeline.label_reach`: trên từng cửa sổ của từng luồng, k-means và Ward được cho biết số lớp thật, còn DBSCAN được chọn bán kính theo ARI, mỗi phương pháp chạy trên dữ liệu thô và trên dữ liệu chuẩn hoá bằng thống kê của chính cửa sổ đó. Kết quả là một mức tham khảo cho biết nhãn lớp đạt được tới đâu khi được biết trước số lớp. Đây không phải cận trên: các phương pháp này chỉ thấy một cửa sổ và (trừ DBSCAN) dùng đúng số cụm bằng số lớp, nên một thuật toán luồng giữ nhiều cụm hơn hoặc dùng lịch sử của các cửa sổ trước vẫn có thể vượt nó. Sau đó `robustness.write_robustness` đọc các log đã có và ghi `robustness.md` cùng các CSV trong `report/robustness/`. Các bảng gồm: tỉ lệ thu được và hai phần mất mát theo nhóm luồng kèm khoảng tin cậy bootstrap (lấy lại luồng trong từng nhóm, rồi lấy lại seed trong từng cặp); mức đồng thuận của thứ hạng thuật toán dưới ARI, NMI và purity; cấu hình tham chiếu chọn trên các cửa sổ chẵn của phần đuôi và đọc trên các cửa sổ lẻ; kiểm định Wilcoxon theo từng thuật toán có hiệu chỉnh Holm; số cửa sổ một lớp bị loại và thứ hạng khi bỏ KDD99; và bảng cho biết nhãn của luồng nào đủ dùng để chấm phân cụm. `N_BOOT` là số lần lấy mẫu lại. Hai ngưỡng của bảng cuối chỉ là giá trị tạm, đổi được bằng tham số của `write_robustness`. Preset `tiny` chạy trên một luồng không thuộc nhóm luồng nào của giao thức, nên cell bỏ qua.
+"""
+
+ROBUSTNESS = r"""
+N_BOOT = 2000
+
+unknown = [f for f in FOLDS if f not in C.FOLDS]
+if unknown:
+    print(f"Bỏ qua: các luồng {unknown} không thuộc nhóm luồng nào của giao thức.")
+else:
+    rc = run_cli("conf_pipeline.label_reach", OUT_DIR, "--folds", ",".join(FOLDS), "--n-samples", N_SAMPLES,
+                 "--h", H, "--workers", WORKERS)
+    written = robustness.write_robustness(OUT_DIR, n_boot=N_BOOT)
+    print(f"Đã ghi {len(written)} file vào {OUT_DIR / 'report'}")
+    display(Markdown((OUT_DIR / "report" / "robustness.md").read_text(encoding="utf-8")))
+"""
+
 BUDGET_MD = r"""
-## 8. Ngân sách thời gian
+## 9. Ngân sách thời gian
 
 Cell dưới đọc `runs.jsonl`, đếm job theo arm và trạng thái, rồi tính `wall_s` trung bình của các job `ok` theo (thuật toán, arm) và ngoại suy ra preset `full` (các thuật toán của nó × 18 luồng × 3 seed × 3 arm, cộng lượt quét, các incumbent chạy lại và lần chạy lại oracle), với giả định luôn có `WORKERS` job chạy song song. Thời gian của một job tăng gần tuyến tính theo số cửa sổ, nên preset chạy ít mẫu hơn mức cắt 100 000 (`smoke`: 25 000) được nhân lên theo tỉ lệ đó. Arm mà preset hiện tại không chạy (`frozen_prefix` ở `smoke`) được ước từ tỉ lệ chi phí của nó so với `confstream`, đo ở `conf_pipeline/out/pilot` nếu có, nếu không thì dùng tỉ lệ đã đo ở pilot ngày 01/10. Bảng theo thuật toán cho biết thuật toán nào chiếm phần lớn ngân sách, và bảng cuối liệt kê các job mà thời gian ngoại suy vượt `TIMEOUT_S` của `full`: những job đó sẽ chiếm một worker tới khi hết giờ rồi ghi `timeout`. Mọi con số ở đây là ước lượng thô; với `tiny` chúng chỉ để kiểm tra cách tính.
 """
@@ -397,7 +420,7 @@ else:
 """
 
 NOTES = r"""
-## 9. Ghi chú: cách đọc từng bảng
+## 10. Ghi chú: cách đọc từng bảng
 
 **Tóm tắt.** Mỗi dòng là một bộ (thuật toán, luồng, arm), lấy trung bình qua các seed đã chạy xong (`n_seeds`), và cột `_sd` là độ lệch chuẩn giữa các seed. Mọi cột chất lượng là ARI lagged, tức cấu hình đương nhiệm sau cửa sổ t−1 được chấm trên cửa sổ t, nên không con số nào là điểm của một cấu hình trên chính cửa sổ đã chọn ra nó. Cột có `tail` chỉ lấy các cửa sổ từ `FREEZE_AFTER_WINDOW` trở đi (20 ở `pilot` và `full`, 1 ở `tiny`), vùng mà mọi arm cùng có và `frozen_prefix` đã thôi tune, nên đây là con số chính để so các arm; cột không có `tail` lấy toàn luồng, gồm cả giai đoạn đầu khi ensemble còn đang dò. `incumbent_throughput_sps` là thông lượng (mẫu mỗi giây) của riêng cấu hình đương nhiệm, khác với chi phí của cả ensemble ở `ensemble_runtime_s`. Cửa sổ nào chỉ chứa một lớp thật thì không có ARI, NMI hay purity: ở đó ARI bằng 1 nếu thuật toán trả về đúng một nhóm và bằng 0 trong mọi trường hợp khác, còn purity luôn bằng 1, nên con số chỉ cho biết thuật toán có trả về một nhóm hay không. Các cửa sổ này bị bỏ khỏi mọi phép trung bình; `n_single_class_windows` đếm chúng, còn `lag_ari_n_windows` và `lag_ari_n_windows_tail` là số cửa sổ mà ARI lagged trên toàn luồng và trên đuôi thực sự dựa vào (kdd99 chỉ còn khoảng 23 trên 80 cửa sổ đuôi).
 
@@ -437,6 +460,8 @@ CELLS: list[tuple[str, str]] = [
     ("code", REPORT),
     ("markdown", ANALYSIS_MD),
     ("code", ANALYSIS),
+    ("markdown", ROBUSTNESS_MD),
+    ("code", ROBUSTNESS),
     ("markdown", BUDGET_MD),
     ("code", BUDGET),
     ("markdown", NOTES),

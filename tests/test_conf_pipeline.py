@@ -66,7 +66,7 @@ def test_protocol_lists_eight_algorithms_eighteen_folds_three_arms():
     # random_online left the protocol on 2026-10-12; it stays runnable on request
     assert len(_common.ALGOS) == 8 and len(_common.FOLDS) == 18
     assert _common.ARMS == ("default", "confstream", "frozen_prefix")
-    assert _common.OPTIONAL_ARMS == ("random_online",)
+    assert _common.OPTIONAL_ARMS[0] == "random_online"  # then the signal arms, also on request
     assert _common.SEEDS == (1, 2, 3) and _common.N_SAMPLES_CAP == 100_000
 
 
@@ -257,9 +257,9 @@ TOY = ParamSpace(
 )
 
 
-def _toy_run(arm="confstream", n_samples=1500, h=300, seed=1, log=None, **kw):
+def _toy_run(arm="confstream", n_samples=1500, h=300, seed=1, log=None, runtime_factor=30.0, **kw):
     ds = make_scenario("static_easy", n_samples=n_samples, n_features=2, n_clusters=3, seed=3)
-    cfg = EnsembleConfig(e_size=3, e_test=1, lam=0.1, p_reset=0.0)
+    cfg = EnsembleConfig(e_size=3, e_test=1, lam=0.1, p_reset=0.0, runtime_factor=runtime_factor)
     return run_ensemble(
         algo="KMeans", space=TOY, start=[{"n_clusters": 2, "halflife": 0.5}],
         dataset=ds, fold="toy", seed=seed, arm=arm, cfg=cfg, h=h, n_samples=n_samples,
@@ -380,6 +380,33 @@ def test_summary_reports_tuning_overhead_and_switch_cost():
     (d,) = [r for r in _toy_run(arm="default") if r["kind"] == "run"]
     assert d["tuning_overhead"] == pytest.approx(1.0)
     assert d["switch_cost"] is None                  # one member never switches
+
+
+def test_the_summary_splits_the_wall_time_into_its_parts(tmp_path):
+    rows = _toy_run(log=tmp_path / "m.jsonl")
+    windows = [r for r in rows if r["kind"] == "window"]
+    (s,) = [r for r in rows if r["kind"] == "run"]
+    parts = ("scoring_runtime_s", "spawn_runtime_s", "table_a_runtime_s", "log_runtime_s")
+    for part in parts:
+        assert all(w[part] >= 0 for w in windows), part
+        assert s[part] == pytest.approx(sum(w[part] for w in windows)), part
+    assert s["calibration_runtime_s"] > 0 and s["log_runtime_s"] > 0
+    assert s["ensemble_runtime_s"] + s["scoring_runtime_s"] + s["spawn_runtime_s"] <= s["wall_s"]
+
+
+def test_window_rows_carry_the_hash_of_the_incumbents_and_the_lagged_members_predictions():
+    windows = [r for r in _toy_run() if r["kind"] == "window"]
+    assert all(len(w["pred_sha"]) == 16 for w in windows)
+    assert windows[0]["lag_pred_sha"] is None and all(len(w["lag_pred_sha"]) == 16 for w in windows[1:])
+    again = [r for r in _toy_run() if r["kind"] == "window"]
+    assert [w["pred_sha"] for w in again] == [w["pred_sha"] for w in windows]
+
+
+def test_a_run_without_the_runtime_gate_records_it_and_sheds_nobody_for_time():
+    rows = _toy_run(runtime_factor=None)
+    (s,) = [r for r in rows if r["kind"] == "run"]
+    assert s["runtime_factor"] is None
+    assert all(r.get("feasible_reason") != "runtime" for r in rows if r["kind"] == "window")
 
 
 def test_drift_points_are_reported_on_the_summary_row():
@@ -565,6 +592,9 @@ def test_params_override_and_unit_override_are_exclusive():
 
 
 def _cli(*args, env=None):
+    # these tests exercise the job seeds of the shared policy, the runs made before the seed split
+    if "--seed-policy" not in args and not {"--tuner-seeds", "--model-seed", "--fixed-model-seeds"} & set(args):
+        args = (*args, "--seed-policy", "shared")
     return subprocess.run(
         [sys.executable, "-m", "conf_pipeline.run", *args],
         capture_output=True, text=True, cwd=str(REPO),
@@ -573,6 +603,7 @@ def _cli(*args, env=None):
 
 
 def test_cli_dry_run_lists_the_full_protocol_by_default(tmp_path):
+    # the shared policy (added by _cli); the split policy's count: test_conf_seeds
     proc = _cli("--dry-run", "--out-dir", str(tmp_path))
     assert proc.returncode == 0, proc.stderr
     assert "1296 jobs" in proc.stdout   # 8 algos x 18 folds x 3 seeds x 3 arms
@@ -671,9 +702,10 @@ def test_resume_counts_an_errored_attempt_as_done_until_retry_failed(tmp_path):
         "error": "boom",
     }
     (tmp_path / "runs.jsonl").write_text(json.dumps(row) + "\n")
+    # a hand-written row has no manifest: adopt it, as a resume into a pre-manifest dir must
     common = ["--algos", "DenStream", "--folds", "static_easy", "--seeds", "1",
               "--arms", "default", "--n-samples", "900", "--h", "300",
-              "--out-dir", str(tmp_path), "--dry-run"]
+              "--out-dir", str(tmp_path), "--dry-run", "--adopt-legacy"]
 
     proc = _cli(*common)
     assert proc.returncode == 0, proc.stderr
@@ -696,7 +728,7 @@ def test_retry_failed_does_not_rerun_a_key_that_later_succeeded(tmp_path):
     (tmp_path / "runs.jsonl").write_text(json.dumps(error_row) + "\n" + json.dumps(ok_row) + "\n")
     proc = _cli("--algos", "DenStream", "--folds", "static_easy", "--seeds", "1",
                 "--arms", "default", "--n-samples", "900", "--h", "300",
-                "--out-dir", str(tmp_path), "--dry-run", "--retry-failed")
+                "--out-dir", str(tmp_path), "--dry-run", "--retry-failed", "--adopt-legacy")
     assert proc.returncode == 0, proc.stderr
     assert "0 to run" in proc.stdout
 
@@ -758,3 +790,225 @@ def test_lock_pair_releases_the_first_lock_when_the_second_is_held(tmp_path):
         with run.JsonlLockPair(runs, windows):
             pass
     assert not (tmp_path / "runs.jsonl.lock").exists()
+
+
+def test_signal_arms_select_by_their_signal_and_stay_out_of_the_protocol():
+    base = EnsembleConfig(e_size=20, e_test=10)
+    assert _common.ARMS == ("default", "confstream", "frozen_prefix")
+    assert set(_common.SIGNAL_ARMS) <= set(_common.OPTIONAL_ARMS)
+    assert "confstream_silhouette" not in _common.SIGNAL_ARMS
+    for arm in _common.SIGNAL_ARMS:
+        cfg = run.arm_config(arm, base, 20)
+        assert cfg.selection_signal == arm.removeprefix("confstream_") and cfg.e_size == 20
+    assert run.arm_config("confstream", base, 20).selection_signal == "silhouette"
+
+
+def test_a_signal_arm_and_logged_signals_run_end_to_end(tmp_path):
+    log = tmp_path / "members.jsonl"
+    ds = make_scenario("static_easy", n_samples=900, n_features=2, n_clusters=3, seed=3)
+    cfg = EnsembleConfig(e_size=2, e_test=1, lam=0.1, p_reset=0.0, log_signals=("silhouette_std", "dbcv"))
+    rows = run_ensemble(
+        algo="DenStream", space=spaces.SPACES["DenStream"],
+        start=[spaces.start_params("DenStream", h=300, d=2)], dataset=ds, fold="static_easy",
+        seed=1, arm="confstream_silhouette_std", cfg=cfg, h=300, n_samples=900, member_log=log,
+    )
+    (s,) = [r for r in rows if r["kind"] == "run"]
+    assert s["status"] == "ok" and s["selection_signal"] == "silhouette_std"
+    assert s["log_signals"] == ["silhouette_std", "dbcv"]
+    assert s["signals_runtime_s"] > 0 and all(w["signals_runtime_s"] >= 0 for w in rows if w["kind"] == "window")
+    plain = _toy_run(arm="confstream")
+    assert [r for r in plain if r["kind"] == "run"][0]["signals_runtime_s"] == 0
+    members = [json.loads(line) for line in log.read_text().splitlines()]
+    assert members and all("sig_silhouette_std" in m and "sig_dbcv" in m for m in members)
+
+
+def test_cli_refuses_signals_it_could_not_write(tmp_path):
+    proc = _cli("--algos", "DenStream", "--folds", "static_easy", "--seeds", "1", "--arms", "confstream",
+                "--n-samples", "900", "--h", "300", "--out-dir", str(tmp_path), "--signals", "dbcv")
+    assert proc.returncode != 0 and "--signals needs --log-members" in (proc.stderr + proc.stdout)
+
+
+def test_frozen_reinit_arm_freezes_the_parameters_but_keeps_renewing_the_model():
+    cfg = run.arm_config("frozen_reinit", EnsembleConfig(e_size=20, e_test=10), 20)
+    assert cfg.freeze_after_window == 20 and cfg.reinit_after_freeze and cfg.e_test == 10
+    assert "frozen_reinit" in _common.OPTIONAL_ARMS and "frozen_reinit" not in _common.ARMS
+    rows = _toy_run(arm="frozen_reinit", freeze_after_window=2)
+    wins = [r for r in rows if r["kind"] == "window"]
+    (s,) = [r for r in rows if r["kind"] == "run"]
+    assert s["status"] == "ok" and s["reinit_after_freeze"] and s["frozen_at_window"] == 2
+    after = [w for w in wins if w["window"] > 2]
+    assert after and all(w["params"] == s["frozen_params"] and w["n_spawned"] == 1 for w in after)
+
+
+def test_the_stability_pass_leaves_the_model_as_it_was():
+    # DenStream's predict_one changes a live micro-cluster (RIVER_BUGS.md BUG-7): a second
+    # prediction pass on the real model would change the run, so it runs on a copy.
+    import pickle
+
+    from benchmark.algorithms.registry import get_algorithm
+    from benchmark.tuning.confstream import ConfStreamEnsemble
+    from benchmark.tuning.window import WindowBuffer
+
+    ds = list(make_scenario("static_easy", n_samples=900, n_features=2, n_clusters=3, seed=3))
+    params = spaces.start_params("DenStream", h=300, d=2)
+    model = get_algorithm("DenStream", **params)
+    buf = WindowBuffer(300)
+    for x, y in ds[:300]:
+        model.process_one(dict(x))
+        buf.push(x, y)
+    state = pickle.dumps(model.model)
+    again = ConfStreamEnsemble._repredict(model, buf)
+    assert len(again) == 300 and any(lab is not None for lab in again)
+    assert pickle.dumps(model.model) == state
+    # the guard is needed: the same pass on the model itself does change it
+    for x in buf.xs:
+        model.predict_one(dict(x))
+    assert pickle.dumps(model.model) != state
+
+
+def test_two_runs_of_one_seed_name_the_same_incumbents():
+    # with the runtime tie-break, six runs of this job named three different incumbent sequences
+    def go():
+        ds = make_scenario("static_easy", n_samples=1500, n_features=2, n_clusters=3, seed=3)
+        cfg = EnsembleConfig(e_size=3, e_test=1, lam=0.1, p_reset=0.0)
+        rows = run_ensemble(
+            algo="DenStream", space=spaces.SPACES["DenStream"],
+            start=[spaces.start_params("DenStream", h=300, d=2)], dataset=ds, fold="static_easy",
+            seed=1, arm="confstream", cfg=cfg, h=300, n_samples=1500,
+        )
+        (s,) = [r for r in rows if r["kind"] == "run"]
+        assert s["tie_break"] == "micro_clusters"
+        return [(w["window"], w["incumbent_id"], w.get("lag_ari_win")) for w in rows if w["kind"] == "window"]
+    first = go()
+    assert all(go() == first for _ in range(4))
+
+
+def test_runs_carry_the_lagged_cmm_and_no_cmm_leaves_it_out(tmp_path):
+    import subprocess
+    import sys
+
+    repo = Path(__file__).resolve().parent.parent
+    env = {"PYTHONHASHSEED": "0", "PATH": "/usr/bin:/bin"}
+    rows = {}
+    for name, extra in (("with", []), ("without", ["--no-cmm"])):
+        out = tmp_path / name
+        proc = subprocess.run(
+            [sys.executable, "-m", "conf_pipeline.run", "--algos", "DenStream", "--folds", "static_easy",
+             "--seed-policy", "shared", "--seeds", "1", "--arms", "default", "--n-samples", "1200", "--h", "300",
+             "--freeze-after-window", "1", "--out-dir", str(out), *extra],
+            cwd=repo, env=env, capture_output=True, text=True)
+        assert proc.returncode == 0, proc.stderr
+        (rows[name],) = [json.loads(l) for l in (out / "runs.jsonl").read_text().splitlines()]
+        windows = [json.loads(l) for l in (out / "windows.jsonl").read_text().splitlines()]
+        rows[name + "_windows"] = windows
+    run, win = rows["with"], rows["with_windows"]
+    assert run["lag_cmm_win_mean"] is not None and 0 <= run["lag_cmm_win_mean"] <= 1
+    assert run["lag_cmm_strict_win_mean"] is not None and run["lag_cmm_error_share"] == 0
+    assert run["cmm_runtime_s"] > 0 and run["cmm_ca_separability_mean"] is not None
+    assert "lag_cmm_cumulative" not in run and all("cmm_ca_model" in w for w in win)
+    off = rows["without"]
+    assert off["lag_cmm_win_mean"] is None and off["cmm_runtime_s"] == 0
+    assert off["lag_ari_win_mean"] == run["lag_ari_win_mean"]            # reading CMM changes nothing else
+
+
+# --- E1: River's defaults with their distances in units of the data ------------------------------
+
+def test_the_distance_parameters_are_the_scaled_dimensions_of_each_space():
+    from conf_pipeline.spaces import distance_params
+
+    assert distance_params("DenStream") == ("epsilon",)
+    assert distance_params("DBSTREAM") == ("clustering_threshold",)
+    assert distance_params("SOStream") == ("merge_threshold",)
+    assert distance_params("BIRCH") == ("threshold",)
+    assert distance_params("CluStream") == distance_params("STREAMKMeans") == ("sigma",)
+    assert distance_params("HPStream") == distance_params("RepStream") == ()
+
+
+def test_kmeans_sigmas_start_is_the_default_river_kmeans_actually_uses():
+    import inspect
+
+    from river import cluster
+
+    from conf_pipeline.spaces import START_OVERRIDES
+
+    kmeans_sigma = inspect.signature(cluster.KMeans.__init__).parameters["sigma"].default
+    assert START_OVERRIDES["CluStream"]["sigma"] == START_OVERRIDES["STREAMKMeans"]["sigma"] == kmeans_sigma
+
+
+def test_scaled_defaults_multiply_only_the_distance_parameters_by_s():
+    from conf_pipeline.spaces import scaled_defaults
+
+    start = spaces.start_params("DenStream", 1000)
+    params, record = scaled_defaults("DenStream", start, s=250.0)
+    assert params["epsilon"] == pytest.approx(start["epsilon"] * 250.0)
+    assert {k: v for k, v in params.items() if k != "epsilon"} == {k: v for k, v in start.items() if k != "epsilon"}
+    assert record == {"epsilon": {"default": start["epsilon"], "s": 250.0, "value": start["epsilon"] * 250.0}}
+
+
+def test_birchs_zero_threshold_stays_zero_when_scaled():
+    from conf_pipeline.spaces import scaled_defaults
+
+    params, record = scaled_defaults("BIRCH", spaces.start_params("BIRCH", 1000), s=50.0)
+    assert params["threshold"] == 0.0 and record["threshold"]["value"] == 0.0
+
+
+def test_an_algorithm_without_a_distance_parameter_has_nothing_to_scale():
+    from conf_pipeline.spaces import scaled_defaults
+
+    start = spaces.start_params("RepStream", 1000)
+    assert scaled_defaults("RepStream", start, s=50.0) == (start, {})
+
+
+def test_the_scaled_default_arm_runs_one_member_at_rivers_defaults_times_s():
+    from conf_pipeline.spaces import SPACES as REAL
+
+    ds = make_scenario("static_easy", n_samples=1200, n_features=2, n_clusters=3, seed=3)
+    cfg = EnsembleConfig(e_size=4, e_test=2, lam=0.1, p_reset=0.0)
+    start = spaces.start_params("DenStream", 300)
+    rows = run_ensemble(algo="DenStream", space=REAL["DenStream"], start=[start], dataset=ds,
+                        fold="toy", seed=1, arm="scaled_default", cfg=cfg, h=300, n_samples=1200)
+    (s,) = [r for r in rows if r["kind"] == "run"]
+    assert s["status"] == "ok" and s["e_size"] == 1 and s["e_test"] == 0
+    assert s["start_params"]["epsilon"] == pytest.approx(start["epsilon"] * s["s_online"])
+    assert s["scaled_params"]["epsilon"]["default"] == start["epsilon"]
+    windows = [r for r in rows if r["kind"] == "window"]
+    assert all(w["params"]["epsilon"] == s["start_params"]["epsilon"] for w in windows)
+
+
+def test_scaled_default_is_a_fixed_configuration_in_the_reports():
+    from conf_pipeline import report
+
+    assert "scaled_default" in _common.OPTIONAL_ARMS and "scaled_default" in _common.FIXED_ARMS
+    assert "scaled_default" not in report.ONLINE_ARMS
+    cfg = run.arm_config("scaled_default", EnsembleConfig(), 20)
+    assert cfg.e_size == 1 and cfg.e_test == 0
+
+
+def test_the_cli_writes_down_an_algorithm_without_a_distance_parameter_instead_of_rerunning_its_default(tmp_path):
+    proc = _cli("--algos", "RepStream,DenStream", "--folds", "static_easy", "--seeds", "1",
+                "--arms", "scaled_default", "--n-samples", "900", "--h", "300", "--out-dir", str(tmp_path),
+                "--workers", "1")
+    assert proc.returncode == 0, proc.stderr
+    runs = {r["algo"]: r for r in map(json.loads, (tmp_path / "runs.jsonl").read_text().splitlines())}
+    assert runs["RepStream"]["status"] == "skipped"
+    assert "no absolute-distance parameter" in runs["RepStream"]["error"]
+    assert runs["DenStream"]["status"] == "ok" and "epsilon" in runs["DenStream"]["scaled_params"]
+
+
+def test_the_oracle_arms_are_diagnostic_runnable_and_out_of_the_deployable_lists():
+    from conf_pipeline import report
+
+    assert set(_common.DIAGNOSTIC_ARMS) == {"confstream_ari_oracle", "confstream_ari_oracle_constrained"}
+    for arm in _common.DIAGNOSTIC_ARMS:
+        assert arm not in _common.ARMS + _common.OPTIONAL_ARMS and arm not in report.ONLINE_ARMS
+        assert run.arm_config(arm, EnsembleConfig(), 20).selection_signal == arm.removeprefix("confstream_")
+    proc = _cli("--algos", "DenStream", "--folds", "static_easy", "--seeds", "1",
+                "--arms", "confstream_ari_oracle", "--out-dir", "/tmp/never-written", "--dry-run")
+    assert proc.returncode == 0, proc.stderr and "arm=confstream_ari_oracle" in proc.stdout
+
+
+def test_the_job_count_names_why_jobs_are_skipped(tmp_path):
+    proc = _cli("--algos", "RepStream", "--folds", "static_easy", "--seeds", "1,2", "--arms", "scaled_default",
+                "--out-dir", str(tmp_path), "--dry-run")
+    assert proc.returncode == 0, proc.stderr
+    assert "2 skipped (2 no absolute-distance parameter)" in proc.stdout and "no oracle point" not in proc.stdout

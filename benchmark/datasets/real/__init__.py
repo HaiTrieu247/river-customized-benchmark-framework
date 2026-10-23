@@ -15,6 +15,9 @@ Which streams are here, and why each one earns its place:
 * ``sms_spam`` — **text**, for the clusterers that consume token counts rather
   than coordinate vectors (TextClust).
 * ``kddcup98`` — regression-flavoured RFM data, kept from the original repo.
+* ``rialto``, ``sensor`` and the imbalanced incremental INSECTS variants
+  (``drift_streams``) — real streams with natural drift that River does not
+  ship, for checking that findings hold on drift nobody designed.
 
 Note that KDDCup99 and CoverType both arrive in long same-class blocks. That is
 not a reason to drop them, but it is a reason to read
@@ -24,6 +27,7 @@ not a reason to drop them, but it is a reason to read
 from __future__ import annotations
 
 from .covtype import COVTYPE_QUANTITATIVE, load_covtype
+from .drift_streams import INSECTS_EXTRA_VARIANTS, load_insects_extra, load_rialto, load_sensor
 from .kdd import load_kddcup98, load_kddcup99
 from .river_streams import (
     INSECTS_VARIANTS,
@@ -47,4 +51,8 @@ __all__ = [
     "load_keystroke",
     "load_sms_spam",
     "load_electricity",
+    "load_rialto",
+    "load_sensor",
+    "load_insects_extra",
+    "INSECTS_EXTRA_VARIANTS",
 ]

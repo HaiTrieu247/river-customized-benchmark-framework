@@ -86,3 +86,11 @@ def test_smoke_covers_every_cell_of_full_on_a_short_stream(tmp_path, monkeypatch
     assert smoke["ALGOS"] == full["ALGOS"] and smoke["FOLDS"] == full["FOLDS"]
     assert smoke["SEEDS"] == [1] and smoke["N_SAMPLES"] < full["N_SAMPLES"]
     assert smoke["E_SIZE"] == full["E_SIZE"] and smoke["E_TEST"] == full["E_TEST"]
+
+
+@pytest.mark.parametrize("preset", ["tiny", "smoke", "pilot", "full"])
+def test_the_sweep_reads_the_tail_the_arms_are_read_on(preset, tmp_path, monkeypatch):
+    # the out dir's manifest refuses a sweep under another t0 than the arms'
+    ns = _panel(preset, tmp_path, monkeypatch)
+    args = [str(a) for a in ns["SWEEP_ARGS"]]
+    assert args[args.index("--freeze-after-window") + 1] == str(ns["FREEZE_AFTER_WINDOW"])

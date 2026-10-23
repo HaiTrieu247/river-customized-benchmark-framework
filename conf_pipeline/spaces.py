@@ -165,6 +165,32 @@ def start_params(algo: str, h: int, d: int | None = None) -> dict:
     return {k: v for k, v in params.items() if k in space.names or k in space.fixed}
 
 
+def distance_params(algo: str) -> tuple[str, ...]:
+    """The parameters of ``algo`` read as an absolute distance: the space's ``scaled`` dimensions
+    (see the module docstring for the six; HPStream and RepStream have none)."""
+    return tuple(p.name for p in SPACES[algo].params if p.kind == "scaled")
+
+
+def scaled_defaults(algo: str, params: dict, s: float) -> tuple[dict, dict]:
+    """``params`` (a start, see ``start_params``) with every distance parameter multiplied by the
+    distance unit ``s``, everything else as given; and what was changed, per parameter, as
+    ``{"default", "s", "value"}``.
+
+    The control of E1 (``run.py --arms scaled_default``): River's defaults are absolute, so on
+    data whose spread is far from 1 they can fail for their units alone; read in units of ``s``
+    they ask whether the defaults' failures are units or the rest of the configuration. A zero
+    default stays zero (BIRCH's ``threshold``): nothing is added to make the control better.
+    A single ``s`` changes neither a feature's scale relative to another nor a translation
+    (KMeans' ``mu``).
+    """
+    out, record = dict(params), {}
+    for name in distance_params(algo):
+        if name in out and out[name] is not None:
+            out[name] = out[name] * s
+            record[name] = {"default": params[name], "s": s, "value": out[name]}
+    return out, record
+
+
 def clamp_init_buffers(algo: str, params: dict, h: int) -> dict:
     """``params`` with every initialisation buffer (``INIT_BUFFER_PARAMS``)
     that exceeds the window ``h`` brought back within it; a new dict.

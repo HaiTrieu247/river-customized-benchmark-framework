@@ -24,6 +24,8 @@ from benchmark.algorithms.adapter import build_river_path  # noqa: E402
 
 build_river_path()
 
+from benchmark.tuning.signals import SELECTABLE  # noqa: E402
+
 # --- artifacts -----------------------------------------------------------------
 OUT = PIPELINE_ROOT / "out"
 WINDOWS_JSONL = OUT / "windows.jsonl"
@@ -74,18 +76,95 @@ SYNTH_FOLDS: tuple[str, ...] = (
     "static_overlap", "incremental_drift", "evolving",
 )
 FOLDS: tuple[str, ...] = REAL_FOLDS + SYNTH_FOLDS
+#: Synthetic folds whose best parameters change at known points: the scale of every
+#: coordinate, the cluster radius, the number of clusters, or the last two together.
+PARAM_DRIFT_FOLDS: tuple[str, ...] = ("scale_drift", "density_drift", "k_drift", "mixed_drift")
+#: The three groups results are reported by: their attainable gains differ by an order of
+#: magnitude, so a figure pooled over all folds is dominated by the synthetic ones.
+STREAM_GROUPS: tuple[str, ...] = ("real", "param_drift", "other_synth")
+#: Streams for checking that the findings do not hang on drift the study designed (X7), run
+#: with ``--folds`` into an out dir of their own; ``FOLDS``, what the full run ran, leaves
+#: them out. Real streams with natural drift (``benchmark.datasets.real.drift_streams``)...
+NATURAL_DRIFT_FOLDS: tuple[str, ...] = (
+    "rialto", "sensor", "insects_incremental_imbalanced", "insects_incremental_reoccurring_imbalanced",
+)
+#: ... and variants of the parameter-drift design: a smaller and a larger scale jump, changes
+#: at random points, a gradual change (``param_drift.DRIFT_VARIANT_SCENARIOS``).
+DRIFT_VARIANT_FOLDS: tuple[str, ...] = (
+    "scale_drift_x1_5", "scale_drift_x8", "random_drift", "scale_drift_gradual",
+)
+X7_FOLDS: tuple[str, ...] = NATURAL_DRIFT_FOLDS + DRIFT_VARIANT_FOLDS
+
+
+def stream_group(fold: str) -> str:
+    """``real``, ``param_drift`` or ``other_synth``; a fold in none of the lists raises,
+    so a new stream is assigned its group explicitly rather than by a guess. The natural-drift
+    streams are real ones; the drift variants change their best parameters as the
+    parameter-drift folds do."""
+    if fold in REAL_FOLDS or fold in NATURAL_DRIFT_FOLDS:
+        return "real"
+    if fold in PARAM_DRIFT_FOLDS or fold in DRIFT_VARIANT_FOLDS:
+        return "param_drift"
+    if fold in SYNTH_FOLDS:
+        return "other_synth"
+    raise ValueError(f"fold {fold!r} has no stream group: add it to REAL_FOLDS or SYNTH_FOLDS")
+
+
+#: Drift variants that only change a parameter of one design keep that design's block.
+_VARIANT_OF: dict[str, str] = {
+    "scale_drift_x1_5": "scale_drift", "scale_drift_x8": "scale_drift", "scale_drift_gradual": "scale_drift",
+}
+
+
+def source_block(fold: str) -> str:
+    """The independent source a fold comes from, the unit a bootstrap or a leave-one-out
+    resamples: every INSECTS variant is one recording campaign (``"insects"``), a drift
+    variant that changes one parameter of a design is that design, any other fold is its
+    own. A fold without a stream group raises, as in ``stream_group``."""
+    stream_group(fold)
+    if fold.startswith("insects_"):
+        return "insects"
+    return _VARIANT_OF.get(fold, fold)
+
 #: Seeds of every arm. Three, the same for every arm, so every comparison
 #: between arms sees the same seed noise (decided 2026-10-07 after the pilot,
 #: for budget: five seeds cost 900-1 600 CPU-h).
 SEEDS: tuple[int, ...] = (1, 2, 3)
+#: How a job's randomness is seeded (docs/SEED_RULES.md). ``split``, the default since 2026-10-24:
+#: the tuner, the models and the calibration of the distance unit each have a seed of their own.
+#: ``shared``: one job seed drives all three, as in every run made before; kept to run beside them.
+SEED_POLICIES: tuple[str, ...] = ("split", "shared")
+#: The split policy's seeds (placeholders, every one a flag): the tuner's, repeated per online run;
+#: the models' of the online arms, one per out dir; the calibration's, a constant, so every arm and
+#: every tuner seed reads the stream in the same distance unit. Another range than the shared
+#: policy's 1-3, so a row says which policy it comes from at a glance.
+TUNER_SEEDS: tuple[int, ...] = (101, 102, 103)
+MODEL_SEED = 201
+CALIBRATION_SEED = 0
 #: The tuning regimes every (algo, fold, seed) is run under.
 ARMS: tuple[str, ...] = ("default", "confstream", "frozen_prefix")
+#: The online tuner selecting by another label-free signal than the silhouette
+#: (``benchmark.tuning.signals``): one arm per signal, e.g. ``confstream_dbcv``.
+SIGNAL_ARMS: tuple[str, ...] = tuple(f"confstream_{s}" for s in SELECTABLE if s != "silhouette")
 #: Arms the driver still runs on request (``--arms``) and the report still reads, but that
-#: the protocol no longer includes. ``random_online`` left it on 2026-10-12: it cost about
+#: the protocol does not include. ``random_online`` left it on 2026-10-12: it cost about
 #: half the full budget, and CluStream's runs of it risked the 12 h timeout.
-OPTIONAL_ARMS: tuple[str, ...] = ("random_online",)
+#: ``frozen_reinit`` freezes the parameters at ``FREEZE_AFTER_WINDOW`` like ``frozen_prefix``
+#: but keeps renewing the model as the tuner does (fresh warm-started copies competing by
+#: silhouette), which separates new models from new parameters after a drift. The signal
+#: arms test candidate replacements for the silhouette.
+#: ``scaled_default`` (E1) runs River's defaults with every absolute-distance parameter
+#: multiplied by the distance unit ``s`` (``spaces.scaled_defaults``): one fixed configuration,
+#: never tuned, which tells failures of units from failures of the configuration.
+OPTIONAL_ARMS: tuple[str, ...] = ("random_online", "frozen_reinit", "scaled_default") + SIGNAL_ARMS
 #: Single-configuration arms driven by a file: the sweep's points and its winner.
 EXTRA_ARMS: tuple[str, ...] = ("oracle_static", "sweep")
+#: Diagnostic arms (E4), never deployable and in no report's default list: the tuner with its
+#: selection score replaced by the ARI of the window just processed
+#: (``benchmark.tuning.confstream.ORACLE_SIGNALS``), with and without the silhouette's gate.
+DIAGNOSTIC_ARMS: tuple[str, ...] = ("confstream_ari_oracle", "confstream_ari_oracle_constrained")
+#: Arms that run one configuration, never challenged: no tuning happens in them.
+FIXED_ARMS: tuple[str, ...] = ("default", "scaled_default") + EXTRA_ARMS
 #: Every fold is cut at this many samples (the driver caps; loaders never see it).
 N_SAMPLES_CAP = 100_000
 #: ``frozen_prefix`` stops tuning after this window; every arm's tail metrics
@@ -100,11 +179,19 @@ ORACLE_METRICS: tuple[str, ...] = ("lag_ari_win_tail_mean", "lag_ari_win_mean")
 MIN_CEILING_GAIN = 0.05
 #: Length of a synthetic fold when no cap is given.
 SYNTH_N_SAMPLES = 120_000
+#: Seed of every synthetic generator, apart from the tuner's and the models' seeds: what
+#: every synthetic stream of the full run was drawn with. One per out dir (``--data-seed``),
+#: so the reports, which key runs by (algo, fold, seed, arm), never mix two draws of a stream.
+DATA_SEED = 42
 
 #: No preprocessing: the algorithms see the data's raw units, and ``s`` is the
 #: only unit in play (HPStream normalises internally; that is the algorithm's).
 SCALER = "none"
-EXTERNAL_METRICS = ("ari", "nmi", "purity")
+#: ``cmm`` is MOA's CMM (``benchmark.evaluation.cmm``) and ``cmm_strict`` the same without
+#: MOA's class merging and sphere excuse (``confstream.CMM_VARIANTS``); both read the points of
+#: a window, not its labels alone, so they have no cumulative form. ``--no-cmm`` leaves them out.
+EXTERNAL_METRICS = ("ari", "nmi", "purity", "cmm", "cmm_strict")
+CMM_METRICS = ("cmm", "cmm_strict")
 #: A window needs this many true classes for an external metric to say anything. With one,
 #: ARI is 1 for a one-label prediction and 0 for any other, NMI likewise, and purity is 1
 #: whatever the prediction: the reading measures "did it output one label", not quality,
@@ -175,11 +262,12 @@ def river_defaults(algo: str) -> dict:
     }
 
 
-def load_fold(name: str, n_samples: int | None = None):
+def load_fold(name: str, n_samples: int | None = None, data_seed: int = DATA_SEED):
     """The protocol folds in their natural order, plus the synthetic scenarios.
 
     Real loaders get the whole stream (the driver cuts it at ``n_samples``);
-    synthetic streams are generated at ``n_samples``, or ``SYNTH_N_SAMPLES``.
+    synthetic streams are generated at ``n_samples``, or ``SYNTH_N_SAMPLES``, from
+    ``data_seed``. ``fold_source`` describes the same branches for the manifest.
     """
     from benchmark.datasets import (
         PARAM_DRIFT_SCENARIOS, SCENARIOS, load_covtype, load_electricity, load_insects,
@@ -194,16 +282,68 @@ def load_fold(name: str, n_samples: int | None = None):
         return load_shuttle()
     if name == "electricity":
         return load_electricity()
+    if name in ("rialto", "sensor") or name.removeprefix("insects_") in _insects_extra():
+        from benchmark.datasets.real.drift_streams import load_insects_extra, load_rialto, load_sensor
+
+        if name == "rialto":
+            return load_rialto()
+        if name == "sensor":
+            return load_sensor()
+        return load_insects_extra(variant=name.removeprefix("insects_"))
     if name.startswith("insects_"):
         return load_insects(variant=name[len("insects_"):])
     if name in PARAM_DRIFT_SCENARIOS:
-        return make_param_drift(name, n_samples=n_samples or SYNTH_N_SAMPLES)
+        return make_param_drift(name, n_samples=n_samples or SYNTH_N_SAMPLES, seed=data_seed)
     if name in SCENARIOS:
-        return make_scenario(name, seed=42, n_samples=n_samples or SYNTH_N_SAMPLES)
+        return make_scenario(name, seed=data_seed, n_samples=n_samples or SYNTH_N_SAMPLES)
     raise KeyError(
         f"unknown fold {name!r}; protocol folds: {FOLDS}; "
         f"synthetic: {sorted(SCENARIOS) + sorted(PARAM_DRIFT_SCENARIOS)}"
     )
+
+
+def is_synthetic(name: str) -> bool:
+    """Whether ``name`` is drawn by a generator, so that a data seed reaches it."""
+    from benchmark.datasets import PARAM_DRIFT_SCENARIOS, SCENARIOS
+
+    return name in PARAM_DRIFT_SCENARIOS or name in SCENARIOS
+
+
+def fold_source(name: str) -> dict:
+    """What ``load_fold(name)`` reads: the loader and its arguments, for the manifest.
+
+    Kept beside ``load_fold``, branch for branch; the manifest also records a hash of the
+    content each run consumed, which catches what a description cannot (a data file
+    replaced under the same loader).
+    """
+    real = {
+        "covtype": ("load_covtype", {"quantitative_only": True}),
+        "kdd99": ("load_kddcup99", {"n_samples": None}),
+        "shuttle": ("load_shuttle", {}),
+        "electricity": ("load_electricity", {}),
+        "rialto": ("load_rialto", {}),
+        "sensor": ("load_sensor", {}),
+    }
+    if name in real:
+        loader, kwargs = real[name]
+        return {"loader": loader, "kwargs": kwargs}
+    if name.removeprefix("insects_") in _insects_extra():
+        return {"loader": "load_insects_extra", "kwargs": {"variant": name.removeprefix("insects_")}}
+    if name.startswith("insects_"):
+        return {"loader": "load_insects", "kwargs": {"variant": name[len("insects_"):]}}
+    from benchmark.datasets import PARAM_DRIFT_SCENARIOS, SCENARIOS
+
+    if name in PARAM_DRIFT_SCENARIOS:
+        return {"loader": "make_param_drift", "kwargs": {"name": name}}
+    if name in SCENARIOS:
+        return {"loader": "make_scenario", "kwargs": {"name": name}}
+    raise KeyError(f"unknown fold {name!r}")
+
+
+def _insects_extra() -> dict:
+    from benchmark.datasets.real.drift_streams import INSECTS_EXTRA_VARIANTS
+
+    return INSECTS_EXTRA_VARIANTS
 
 
 def drift_points(fold: str, n_samples: int | None) -> tuple[int, ...]:
@@ -218,17 +358,49 @@ def drift_points(fold: str, n_samples: int | None) -> tuple[int, ...]:
 def best_static(rows, metrics: tuple[str, ...] = ORACLE_METRICS) -> tuple[dict, str] | None:
     """The winning fixed configuration among one (algo, fold)'s sweep rows, and the metric it won on.
 
-    The first of ``metrics`` that some ``ok`` row has a reading of decides; a row
-    without that reading never wins. Ties go to the smaller ``config_id`` (the
-    earlier, cheaper point). None when no ``ok`` row has any of ``metrics``.
+    A configuration swept on several seeds competes with its mean over them
+    (``seed_means``). The first of ``metrics`` that some configuration has a
+    reading of decides; one without that reading never wins. Ties go to the
+    smaller ``config_id`` (the earlier, cheaper point). None when no configuration
+    has any of ``metrics``. With one seed per configuration this is the plain
+    maximum over the ``ok`` rows.
     """
-    ok = [r for r in rows if r.get("status") == "ok"]
     for metric in metrics:
-        cands = [r for r in ok if _reading(r.get(metric)) is not None]
+        cands = seed_means(rows, metric, also=metrics)
         if cands:
-            best = max(cands, key=lambda r: (_reading(r[metric]), -(r.get("config_id") or 0)))
+            best = max(cands, key=lambda r: (r[metric], -(r.get("config_id") or 0)))
             return best, metric
     return None
+
+
+def seed_means(rows, metric: str, also: tuple[str, ...] = ()) -> list[dict]:
+    """One row per configuration of one (algo, fold) that has ``metric`` on every seed swept.
+
+    The seeds swept are those any row of the (algo, fold) ran on. A configuration
+    that failed, or read nothing, on one of them is left out rather than judged on
+    its luckier seeds: a maximum over configurations averaged on different numbers
+    of seeds favours the noisiest. Each row is the configuration's row of its first
+    seed with ``metric`` replaced by the mean, plus ``n_seeds``, ``seeds`` and
+    ``<metric>_sd`` (None on one seed); every reading in ``also`` is replaced by its
+    mean too, or None unless every seed has it.
+    """
+    seeds = sorted({r.get("seed") for r in rows})
+    by_config: dict = {}
+    for r in rows:
+        if r.get("status") == "ok" and _reading(r.get(metric)) is not None:
+            by_config.setdefault(r.get("config_id"), {}).setdefault(r.get("seed"), r)
+    out = []
+    for per_seed in by_config.values():
+        if sorted(per_seed) != seeds:
+            continue
+        row = {**per_seed[seeds[0]], "n_seeds": len(seeds), "seeds": seeds}
+        for m in dict.fromkeys((*also, metric)):
+            vals = [_reading(per_seed[s].get(m)) for s in seeds]
+            row[m] = float(np.mean(vals)) if None not in vals else None
+        vals = [_reading(per_seed[s][metric]) for s in seeds]
+        row[f"{metric}_sd"] = float(np.std(vals, ddof=1)) if len(vals) > 1 else None
+        out.append(row)
+    return out
 
 
 def _reading(v) -> float | None:
@@ -245,6 +417,23 @@ def _reading(v) -> float | None:
 def child_env() -> dict:
     """The parent's environment with the hash seed and the thread counts pinned."""
     return {**os.environ, "PYTHONHASHSEED": PYTHONHASHSEED, **THREAD_PINS}
+
+
+# --- where a run was made ------------------------------------------------------------
+#: One record per command that ran jobs into an out dir: when, which command, and the machine
+#: and library versions (``benchmark.reports.capture_environment``), so the cost a report
+#: prints can be told apart by the machine it was measured on.
+ENVIRONMENT_JSONL = OUT / "environment.jsonl"
+
+
+def record_environment(out_dir: Path, command: str, argv=None) -> dict:
+    """Append this process's environment to ``<out_dir>/environment.jsonl`` and return it."""
+    from benchmark.reports.environment import capture_environment
+
+    row = {"time": time.strftime("%Y-%m-%dT%H:%M:%S"), "command": command,
+           "argv": list(sys.argv[1:] if argv is None else argv), **capture_environment()}
+    append_jsonl(Path(out_dir) / ENVIRONMENT_JSONL.name, row)
+    return row
 
 
 # --- files -------------------------------------------------------------------------

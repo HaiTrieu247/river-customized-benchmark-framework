@@ -321,10 +321,25 @@ def test_process_window_keeps_the_previous_incumbents_predictions():
     assert all(o.predictions is None for o in others)
 
 
-def test_incumbent_tie_breaks_on_runtime_then_id():
+def test_runtime_tie_break_is_kept_for_comparisons_with_earlier_runs():
     outs = [_outcome(3, 2.0, score=0.7), _outcome(1, 1.0, score=0.7), _outcome(2, 1.0, score=0.7)]
     ens = _ensemble(e_size=1, e_test=0)
-    assert ens.pick_incumbent(outs).member_id == 1
+    assert ens.pick_incumbent(outs, tie_break="runtime").member_id == 1
+
+
+def test_incumbent_ties_go_to_fewer_micro_clusters_then_the_incumbent_then_the_oldest():
+    # the measured runtime varies between two runs of the same seed; the tie-break must not
+    outs = [_outcome(3, 0.1, score=0.7, n_micro=5), _outcome(1, 9.0, score=0.7, n_micro=8),
+            _outcome(2, 5.0, score=0.7, n_micro=5)]
+    assert ConfStreamEnsemble.pick_incumbent(outs).member_id == 2
+    assert ConfStreamEnsemble.pick_incumbent(outs, last_incumbent_id=3).member_id == 3
+    assert ConfStreamEnsemble.pick_incumbent(outs, last_incumbent_id=1).member_id == 2
+
+
+def test_the_tie_break_is_a_setting_and_defaults_to_the_deterministic_one():
+    assert EnsembleConfig().tie_break == "micro_clusters"
+    with pytest.raises(ValueError, match="tie_break"):
+        EnsembleConfig(tie_break="coin")
 
 
 def test_undefined_ties_keep_the_previous_incumbent_not_the_fastest():
@@ -466,3 +481,290 @@ def test_freeze_collapses_onto_the_incumbent_and_stops_spawning():
 def test_find_returns_the_live_member():
     ens = _ensemble(); ens.initialise(_blob_window(60, 0), 0)
     assert ens.find(ens.active[0].id) is ens.active[0] and ens.find(999) is None
+
+
+# --- other selection signals ------------------------------------------------------------
+
+
+def test_logged_signals_are_read_for_every_member_and_written_in_the_member_row():
+    ens = _ensemble(e_size=3, e_test=1, log_signals=("silhouette_std", "dbcv", "rank_agg"))
+    ens.initialise(_blob_window(40, seed=0), window_index=0)
+    ens.process_window(_blob_window(40, seed=1), window_index=1)
+    report = ens.process_window(_blob_window(40, seed=2), window_index=2)
+    for o in report.outcomes:
+        assert set(o.signals) >= {"silhouette_std", "dbcv", "rank_agg"}
+        row = o.to_dict()
+        assert "sig_silhouette_std" in row and "sig_rank_agg" in row
+    # logging a signal never changes what the ensemble selects: a twin without logging,
+    # on the same seed, names the same incumbents with the same scores
+    twin = _ensemble(e_size=3, e_test=1)
+    twin.initialise(_blob_window(40, seed=0), window_index=0)
+    twin.process_window(_blob_window(40, seed=1), window_index=1)
+    twin_report = twin.process_window(_blob_window(40, seed=2), window_index=2)
+    assert twin_report.incumbent.member_id == report.incumbent.member_id
+    assert [o.score for o in twin_report.outcomes] == pytest.approx([o.score for o in report.outcomes])
+
+
+def test_without_logged_signals_no_reading_is_computed():
+    ens = _ensemble(e_size=2, e_test=1)
+    ens.initialise(_blob_window(40, seed=0), window_index=0)
+    report = ens.process_window(_blob_window(40, seed=1), window_index=1)
+    assert all(o.signals == {} for o in report.outcomes)
+    assert not any(k.startswith("sig_") for k in report.outcomes[0].to_dict())
+
+
+@pytest.mark.parametrize("signal", ["silhouette_std", "dbcv", "rank_agg"])
+def test_an_ensemble_selects_by_the_signal_it_is_given(signal):
+    ens = _ensemble(e_size=4, e_test=2, selection_signal=signal,
+                    start=[START, {"n_clusters": 5, "halflife": 0.3}])
+    ens.initialise(_blob_window(60, seed=0), window_index=0)
+    ens.process_window(_blob_window(60, seed=1), window_index=1)
+    report = ens.process_window(_blob_window(60, seed=2), window_index=2)
+    for o in report.outcomes:
+        if o.feasible and o.defined:
+            assert o.score == pytest.approx(o.signals[signal])
+        else:
+            assert o.score == UNDEFINED_SCORE
+    active = {m.id for m in ens.active}
+    best = max((o for o in report.outcomes if o.member_id in active), key=lambda o: o.score)
+    assert report.incumbent.score == pytest.approx(best.score)
+
+
+def test_a_signal_that_cannot_select_is_refused():
+    with pytest.raises(ValueError, match="selection_signal"):
+        EnsembleConfig(selection_signal="davies_bouldin_std")
+    with pytest.raises(ValueError, match="unknown signal"):
+        EnsembleConfig(log_signals=("entropy",))
+
+
+def test_stability_is_read_on_a_copy_after_the_member_learned_the_window():
+    ens = _ensemble(e_size=3, e_test=1, log_signals=("stability",))
+    ens.initialise(_blob_window(60, seed=0), window_index=0)
+    ens.process_window(_blob_window(60, seed=1), window_index=1)
+    report = ens.process_window(_blob_window(60, seed=2), window_index=2)
+    defined = [o for o in report.outcomes if o.defined]
+    assert defined and all(o.signals["stability"] > 0.9 for o in defined)
+    assert all(o.signals_runtime_s > 0 for o in defined)
+
+
+def test_reinit_after_freeze_keeps_spawning_fresh_copies_of_the_frozen_configuration():
+    ens = _ensemble(e_size=3, e_test=2, freeze_after_window=1, reinit_after_freeze=True)
+    ens.initialise(_blob_window(40, seed=0), window_index=0)
+    r1 = ens.process_window(_blob_window(40, seed=1), window_index=1)
+    frozen = r1.incumbent.params
+    assert r1.frozen and len(ens.active) == 1 and r1.n_spawned == 2
+    assert all(m.params == frozen and m.adapter._n_seen == 40 for m in ens.test)
+    for w in range(2, 5):
+        r = ens.process_window(_blob_window(40, seed=w), window_index=w)
+    assert len(ens.active) == 3                       # the copies fill the ensemble back up
+    assert all(m.params == frozen for m in ens.active + ens.test)
+    assert r.n_spawned == 2 and r.n_tested == 2
+
+
+def test_reinit_needs_a_freezing_point():
+    with pytest.raises(ValueError, match="freeze_after_window"):
+        EnsembleConfig(reinit_after_freeze=True)
+
+
+# --- CMM among the external readings -----------------------------------------------------
+
+def test_cmm_is_read_for_every_member_against_one_ground_truth_analysis_per_window(monkeypatch):
+    from benchmark.evaluation.cmm import CMMWindow
+    from benchmark.tuning import confstream as CS
+
+    scored = []
+    real = CS._CMMState.score_into
+
+    def spy(self, outcome, preds, noise_labels):
+        scored.append(list(preds))
+        return real(self, outcome, preds, noise_labels)
+
+    monkeypatch.setattr(CS._CMMState, "score_into", spy)
+    ens = _ensemble(external_metrics=("ari", "cmm", "cmm_strict"))
+    ens.initialise(_blob_window(60, 0), window_index=0)
+    buf = _blob_window(60, 1)
+    rep = ens.process_window(buf, 1)
+    keys = sorted(buf.xs[0])
+    X = np.array([[x[k] for k in keys] for x in buf.xs])
+    for o in rep.outcomes:
+        assert set(o.window_metrics) == {"ari", "cmm", "cmm_strict"} and o.cmm_error is None
+    assert len(scored) == len(rep.outcomes)
+    moa = CMMWindow.build(X, buf.ys)
+    strict = CMMWindow.build(X, buf.ys, enable_class_merge=False, enable_model_error=False)
+    for o, preds in zip(rep.outcomes, scored):                  # the window's test-then-train predictions
+        assert o.window_metrics["cmm"] == pytest.approx(moa.score(preds))
+        assert o.window_metrics["cmm_strict"] == pytest.approx(strict.score(preds))
+    built = sum(1 for o in rep.outcomes if o.cmm_runtime_s > 0)
+    assert built == len(rep.outcomes)                                   # every score timed...
+    assert max(o.cmm_runtime_s for o in rep.outcomes) == rep.outcomes[0].cmm_runtime_s  # ...the build once
+    assert set(rep.cmm_window) == {"ca_separability", "ca_noise", "ca_model"}
+    assert rep.cmm_runtime_s == pytest.approx(sum(o.cmm_runtime_s for o in rep.outcomes))
+
+
+def test_without_cmm_in_the_external_metrics_nothing_is_read_or_timed():
+    ens = _ensemble(external_metrics=("ari",))
+    ens.initialise(_blob_window(60, 0), window_index=0)
+    rep = ens.process_window(_blob_window(60, 1), 1)
+    assert all("cmm" not in o.window_metrics and o.cmm_runtime_s == 0.0 for o in rep.outcomes)
+    assert rep.cmm_window == {}
+
+
+def test_a_cmm_failure_reads_none_and_says_why_without_stopping_the_window(monkeypatch):
+    from benchmark.evaluation import cmm as CMM
+
+    def boom(*a, **k):
+        raise ValueError("no sphere")
+
+    monkeypatch.setattr(CMM.CMMWindow, "build", classmethod(lambda cls, *a, **k: boom()))
+    ens = _ensemble(external_metrics=("ari", "cmm"))
+    ens.initialise(_blob_window(60, 0), window_index=0)
+    rep = ens.process_window(_blob_window(60, 1), 1)
+    assert all(o.window_metrics["cmm"] is None and "no sphere" in o.cmm_error for o in rep.outcomes)
+    assert all(o.window_metrics["ari"] is not None for o in rep.outcomes)
+
+
+def test_a_river_sentinel_counts_as_a_point_no_cluster_took(monkeypatch):
+    from benchmark.tuning import confstream as CS
+
+    seen = []
+    real = CS._CMMState.score_into
+
+    def spy(self, outcome, preds, noise_labels):
+        seen.append(noise_labels)
+        return real(self, outcome, preds, noise_labels)
+
+    monkeypatch.setattr(CS._CMMState, "score_into", spy)
+    monkeypatch.setattr(CS, "sentinel_labels", lambda model: (-1,))
+    ens = _ensemble(external_metrics=("cmm",))
+    ens.initialise(_blob_window(60, 0), window_index=0)
+    ens.process_window(_blob_window(60, 1), 1)
+    assert seen and all(n == frozenset({-1}) for n in seen)
+
+
+# --- repeatability: the runtime gate, the partition's identity, the time split ------------------
+
+def test_without_a_runtime_factor_no_member_is_shed_for_its_runtime():
+    cfg = EnsembleConfig(runtime_factor=None, max_memory_mb=10.0)
+    outs = [_outcome(0, 1.0), _outcome(1, 50.0), _outcome(2, 1.0, memory_mb=11.0)]
+    apply_feasibility(outs, cfg)
+    assert [o.feasible for o in outs] == [True, True, False]
+    assert outs[1].score == 0.5 and outs[2].feasible_reason == "memory"
+
+
+def test_every_outcome_records_its_runtime_against_the_fastest_defined_member_gate_or_not():
+    for factor in (3.0, None):
+        outs = [_outcome(0, 2.0), _outcome(1, 5.0), _outcome(2, 1e-4, defined=False), _outcome(3, 1.0, error="x")]
+        apply_feasibility(outs, EnsembleConfig(runtime_factor=factor))
+        assert [o.runtime_ratio for o in outs] == [1.0, 2.5, None, None]
+    outs = [_outcome(0, 1.0, defined=False)]
+    apply_feasibility(outs, EnsembleConfig())
+    assert outs[0].runtime_ratio is None                    # no defined member, no reference
+
+
+def test_a_member_row_carries_a_hash_of_its_predictions_and_its_runtime_ratio():
+    ens = _ensemble(e_size=2, e_test=1)
+    ens.initialise(_blob_window(200, 0), window_index=0)
+    rep = ens.process_window(_blob_window(200, 1), window_index=1)
+    rows = [o.to_dict() for o in rep.outcomes]
+    assert all(len(r["pred_sha"]) == 16 for r in rows)
+    assert all("runtime_ratio" in r and r["scoring_runtime_s"] >= 0 for r in rows)
+    again = _ensemble(e_size=2, e_test=1)
+    again.initialise(_blob_window(200, 0), window_index=0)
+    rep2 = again.process_window(_blob_window(200, 1), window_index=1)
+    assert [o.pred_sha for o in rep.outcomes] == [o.pred_sha for o in rep2.outcomes]
+
+
+def test_the_window_report_times_scoring_and_spawning_apart_from_the_models():
+    ens = _ensemble(e_size=3, e_test=2)
+    ens.initialise(_blob_window(200, 0), window_index=0)
+    rep = ens.process_window(_blob_window(200, 1), window_index=1)
+    assert rep.scoring_runtime_s > 0 and rep.spawn_runtime_s > 0
+    assert rep.scoring_runtime_s == pytest.approx(sum(o.scoring_runtime_s for o in rep.outcomes))
+    frozen = _ensemble(e_size=1, e_test=0)
+    frozen.initialise(_blob_window(200, 0), window_index=0)
+    assert frozen.process_window(_blob_window(200, 1), window_index=1).spawn_runtime_s == 0.0
+
+
+# --- E4: the label-driven diagnostic tuner ------------------------------------------------------
+
+def _one_class_window(h: int, seed: int) -> WindowBuffer:
+    rng = random.Random(seed)
+    buf = WindowBuffer(h)
+    for i in range(h):
+        c = i % 2
+        buf.push({"a": 5.0 * c + rng.gauss(0, 0.1), "b": rng.gauss(0, 0.1)}, 0)
+    return buf
+
+
+def test_the_oracle_ranks_every_member_by_its_ari_on_the_window_just_processed():
+    ens = _ensemble(e_size=4, e_test=2, selection_signal="ari_oracle",
+                    start=[{"n_clusters": k, "halflife": 0.5} for k in (2, 3, 5, 8)])
+    ens.initialise(_blob_window(300, 0), window_index=0)
+    rep = ens.process_window(_blob_window(300, 1), window_index=1)
+    for o in rep.outcomes:
+        assert o.score == pytest.approx(o.window_metrics["ari"]) and o.defined
+        assert o.signals["silhouette"] is not None          # the silhouette is still logged beside it
+    active = {m.id for m in ens.active}
+    assert rep.incumbent.score == max(o.score for o in rep.outcomes if o.member_id in active)
+
+
+def test_on_a_one_class_window_the_oracle_has_no_reading_and_the_incumbent_stays():
+    ens = _ensemble(e_size=3, e_test=1, selection_signal="ari_oracle")
+    ens.initialise(_blob_window(200, 0), window_index=0)
+    first = ens.process_window(_blob_window(200, 1), window_index=1).incumbent.member_id
+    rep = ens.process_window(_one_class_window(200, 2), window_index=2)
+    assert all(not o.defined and o.score == UNDEFINED_SCORE for o in rep.outcomes)
+    assert rep.incumbent.member_id == first
+
+
+def test_a_one_label_member_is_never_the_oracles_runtime_reference():
+    fast_nothing = _outcome(0, 1e-5, score=0.0)
+    fast_nothing.partitioned = False                         # one label: ARI 0, defined, no partition
+    slow_real = _outcome(1, 1e-2, score=0.6)
+    apply_feasibility([fast_nothing, slow_real], EnsembleConfig(runtime_factor=30.0))
+    assert slow_real.feasible and slow_real.runtime_ratio == 1.0
+
+
+def test_the_constrained_oracle_keeps_the_silhouettes_gate():
+    ens = _ensemble(e_size=2, e_test=0, selection_signal="ari_oracle_constrained",
+                    start=[{"n_clusters": 2, "halflife": 0.5}, {"n_clusters": 3, "halflife": 0.5}])
+    ens.initialise(_blob_window(200, 0), window_index=0)
+    rep = ens.process_window(_blob_window(200, 1), window_index=1)
+    assert all(o.defined == (o.partitioned and o.window_metrics["ari"] is not None) for o in rep.outcomes)
+
+
+def test_the_oracle_needs_ari_among_the_external_metrics():
+    with pytest.raises(ValueError, match="ari"):
+        EnsembleConfig(selection_signal="ari_oracle", external_metrics=("nmi",))
+
+
+def test_the_signal_noise_policy_reaches_every_reading_with_the_models_own_sentinels(monkeypatch):
+    from benchmark.tuning import confstream as CS
+
+    seen = []
+    real = CS.SIG.member_signals
+
+    def spy(window, labels, names, **kw):
+        seen.append(kw)
+        return real(window, labels, names, **kw)
+
+    monkeypatch.setattr(CS.SIG, "member_signals", spy)
+    monkeypatch.setattr(CS, "sentinel_labels", lambda model: (-7,))
+    ens = _ensemble(e_size=2, e_test=0, log_signals=("silhouette_std",), signal_noise="drop")
+    ens.initialise(_blob_window(200, 0), window_index=0)
+    ens.process_window(_blob_window(200, 1), window_index=1)
+    assert seen and all(kw == {"noise": "drop", "noise_labels": (-7,)} for kw in seen)
+
+
+def test_an_unknown_signal_noise_policy_is_refused_and_the_default_is_the_old_reading():
+    assert EnsembleConfig().signal_noise == "label"
+    with pytest.raises(ValueError):
+        EnsembleConfig(signal_noise="ignore")
+
+
+def test_the_oracle_keeps_the_silhouette_beside_other_logged_signals():
+    ens = _ensemble(e_size=2, e_test=0, selection_signal="ari_oracle", log_signals=("silhouette_std",),
+                    start=[{"n_clusters": 2, "halflife": 0.5}, {"n_clusters": 3, "halflife": 0.5}])
+    ens.initialise(_blob_window(200, 0), window_index=0)
+    rep = ens.process_window(_blob_window(200, 1), window_index=1)
+    assert all(o.signals.get("silhouette") is not None and "silhouette_std" in o.signals for o in rep.outcomes)

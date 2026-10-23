@@ -54,6 +54,8 @@ SUMMARY_FIELDS = (
     "lag_ssq_micro_mean", "lag_n_micro_centers_mean", "frozen_at_window",
     "tuning_overhead", "switch_cost", "lag_table_a_error_share", "lag_table_a_first_error",
     "lag_ari_n_windows", "lag_ari_n_windows_tail", "n_single_class_windows",
+    "lag_cmm_win_mean", "lag_cmm_win_tail_mean", "lag_cmm_strict_win_mean", "lag_cmm_strict_win_tail_mean",
+    "cmm_ca_separability_mean", "cmm_ca_model_mean", "lag_cmm_error_share", "cmm_runtime_s",
 )
 #: Fields of ``SUMMARY_FIELDS`` that are text: the lowest seed's value, no mean and no sd.
 SUMMARY_TEXT_FIELDS = ("lag_table_a_first_error",)
@@ -64,7 +66,7 @@ TAIL = "lag_ari_win_tail_mean"
 WHOLE = "lag_ari_win_mean"
 #: Arms that tune online, the optional ones included so older runs still read: the regret
 #: decomposition and the silhouette table are theirs.
-ONLINE_ARMS: tuple[str, ...] = tuple(a for a in C.ARMS + C.OPTIONAL_ARMS if a != "default")
+ONLINE_ARMS: tuple[str, ...] = tuple(a for a in C.ARMS + C.OPTIONAL_ARMS if a not in C.FIXED_ARMS)
 #: Arms given a ``headroom_<arm>`` column even when absent from the runs: the protocol's.
 #: Any other arm that ran gets one too.
 HEADROOM_ARMS: tuple[str, ...] = tuple(a for a in C.ARMS if a != "default") + ("oracle_static",)
@@ -115,8 +117,12 @@ def _headroom_cols(arms=HEADROOM_ARMS) -> list[str]:
 
 # --- loading -------------------------------------------------------------------------------
 
-def current_runs(out_dir: Path) -> pd.DataFrame:
+def current_runs(out_dir: Path, diagnostic: bool = False) -> pd.DataFrame:
     """``runs.jsonl`` without the rows a later result made obsolete.
+
+    Rows of the diagnostic arms (``_common.DIAGNOSTIC_ARMS``, a tuner selecting by labels) are
+    left out unless ``diagnostic``: every default table, ranking and normalisation reads the
+    deployable regimes only, and a reader that wants the diagnostic ones names them.
 
     - ``oracle_static`` rows of a configuration that is no longer the one
       ``oracle_static.json`` names for their (algo, fold). Without that file
@@ -125,7 +131,8 @@ def current_runs(out_dir: Path) -> pd.DataFrame:
       skips that record the missing oracle).
     - ``skipped`` rows of a job that also has an ``ok`` row.
     """
-    rows = list(C.read_jsonl(Path(out_dir) / "runs.jsonl"))
+    rows = [r for r in C.read_jsonl(Path(out_dir) / "runs.jsonl")
+            if diagnostic or r.get("arm") not in C.DIAGNOSTIC_ARMS]
     oracle = _read_oracle(out_dir)
     rows = [r for r in rows if _is_current(r, oracle)]
     ok = {_job(r) for r in rows if r.get("status") == "ok"}
@@ -135,8 +142,53 @@ def current_runs(out_dir: Path) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def load_windows(out_dir: Path) -> pd.DataFrame:
-    rows = list(C.read_jsonl(Path(out_dir) / "windows.jsonl"))
+def _seed_key(v):
+    """A seed as a lookup key: None for a run without one (None or NaN alike)."""
+    return None if v is None or (isinstance(v, float) and v != v) else int(v)
+
+
+def is_split(runs: pd.DataFrame) -> bool:
+    """Whether ``runs`` were made under the split seed policy (a row without ``seed_policy`` predates it:
+    one job seed drove the tuner and the models)."""
+    return "seed_policy" in runs and bool((runs["seed_policy"] == "split").any())
+
+
+def replicate_view(values: pd.DataFrame, value_cols=("value",), split: bool = True,
+                   keys=("algo", "fold"), extra_keys=()) -> pd.DataFrame:
+    """``values`` (one row per run: ``algo, fold, arm, seed`` and ``value_cols``) as readers that pair
+    arms by seed number expect it, without reading a run made once as several observations.
+
+    Under the split seed policy a fixed configuration (``_common.FIXED_ARMS``) draws nothing from a
+    tuner: a deterministic one ran once, a seeded one once per model seed, and its ``seed`` is not a
+    tuner seed. Its rows are replaced by their mean over its runs, set beside every tuner seed the
+    online arms of the same (algo, fold) ran on (the dir's, when that pair has none), with
+    ``broadcast`` True and ``n_runs`` the runs behind the mean. Online rows keep their seed, with
+    ``n_runs`` 1. Under the shared policy (``split=False``) nothing changes. ``extra_keys`` are kept
+    apart (a window, a half), as ``keys`` are.
+    """
+    out = values.copy()
+    out["broadcast"], out["n_runs"] = False, 1
+    if not split or out.empty:
+        return out
+    fixed = out["arm"].isin(list(C.FIXED_ARMS))
+    online = out[~fixed]
+    pair_seeds = {k: sorted({int(s) for s in g["seed"].dropna()}) for k, g in online.groupby(list(keys))}
+    dir_seeds = sorted({int(s) for s in online["seed"].dropna()})
+    group = [*keys, "arm", *extra_keys]
+    rows = []
+    for k, g in out[fixed].groupby(group, sort=True, dropna=False):
+        key = dict(zip(group, k))
+        means = {c: float(pd.to_numeric(g[c], errors="coerce").mean()) for c in value_cols}
+        for seed in pair_seeds.get(tuple(key[c] for c in keys)) or dir_seeds or [None]:
+            rows.append({**key, "seed": seed, **means, "broadcast": True, "n_runs": int(len(g))})
+    broadcast = pd.DataFrame(rows, columns=list(out.columns)) if rows else out.iloc[0:0]
+    return pd.concat([online, broadcast], ignore_index=True)[list(out.columns)]
+
+
+def load_windows(out_dir: Path, diagnostic: bool = False) -> pd.DataFrame:
+    """``windows.jsonl``; the diagnostic arms' rows only with ``diagnostic`` (see ``current_runs``)."""
+    rows = [r for r in C.read_jsonl(Path(out_dir) / "windows.jsonl")
+            if diagnostic or r.get("arm") not in C.DIAGNOSTIC_ARMS]
     if not rows:
         return pd.DataFrame(columns=["algo", "fold", "seed", "arm", "window"])
     return pd.DataFrame(rows)
@@ -349,15 +401,24 @@ def summary_table(out_dir: Path) -> pd.DataFrame:
     runs = current_runs(out_dir)
     if runs.empty:
         return pd.DataFrame(columns=GROUP)
-    expected = runs[runs["arm"] != "sweep"].groupby("arm")["seed"].nunique().to_dict()
+    split = is_split(runs)
+    # Under the split policy a deterministic fixed configuration runs once (no seed of its own): its cells
+    # expect one run, apart from the arm's seeded cells.
+    kind = runs["seed"].isna() if split else pd.Series(False, index=runs.index)
+    expected = runs[runs["arm"] != "sweep"].assign(_once=kind).groupby(["arm", "_once"])["seed"].nunique().to_dict()
     out = []
     for key, grp in runs.groupby(GROUP, sort=True):
         good = grp[grp["status"] == "ok"]
         bad = grp[grp["status"] != "ok"]
         row = dict(zip(GROUP, key))
+        once = bool(split and grp["seed"].isna().all())
         row["n_seeds"] = int(len(good))
-        row["n_expected"] = int(expected.get(key[2], 0))
+        row["n_expected"] = 1 if once else int(expected.get((key[2], False), 0))
         row["all_seeds_ok"] = row["n_seeds"] == row["n_expected"]
+        #: What the runs of this cell vary in, and how many there are (a cell of a run made once is one).
+        row["n_runs"] = int(len(good))
+        row["replicates"] = (("none: deterministic, run once" if once else "model seeds" if key[2] in C.FIXED_ARMS
+                              else "tuner seeds") if split else "job seeds (tuner and model)")
         row["n_failed"] = int(len(bad))
         row["failed_status"] = ",".join(sorted(set(bad["status"]))) if len(bad) else None
         for f in SUMMARY_FIELDS:
@@ -427,7 +488,7 @@ def oracle_table(out_dir: Path) -> pd.DataFrame:
     ``oracle_static.json`` currently names (stale reruns are ignored), averaged
     over seeds, on ``lag_ari_win_tail_mean`` when those rows carry it and
     ``lag_ari_win_mean`` otherwise (``ceiling_metric`` says which). Fallback:
-    the sweep's winning point (one seed), picked and read on the tail when the
+    the sweep's winning point (its mean over the seeds swept), picked and read on the tail when the
     sweep has one and on the whole stream otherwise, as ``sweep.select_oracle``
     picks it; ``ceiling_source = "sweep"``. ``ceiling_all`` is always the same
     configuration's whole-stream reading, the one the regret decomposition's
@@ -479,7 +540,7 @@ def oracle_table(out_dir: Path) -> pd.DataFrame:
             if best is not None:
                 point, metric = best
                 row.update(ceiling=_num(point[metric]), ceiling_all=_num(point.get(WHOLE)),
-                           ceiling_metric=metric, ceiling_source="sweep", n_seeds=1,
+                           ceiling_metric=metric, ceiling_source="sweep", n_seeds=int(point.get("n_seeds") or 1),
                            config_id=_cid(point.get("config_id")))
         row["config_source"] = config_source(row["config_id"])
         out.append(row)
@@ -751,7 +812,10 @@ def _a_star_lag(g: pd.DataFrame, picks: dict[int, dict] | None) -> pd.Series | N
     return pd.Series([one(w) for w in g["window"]], index=g.index, dtype=float)
 
 
-def _regret_job(g: pd.DataFrame, readings: dict | None) -> dict | None:
+def _regret_series(g: pd.DataFrame, readings: dict | None) -> pd.DataFrame:
+    """Per window of one job: the four readings of the regret decomposition, and
+    ``used``, the windows ``_regret_job`` averages over. ``a_star`` / ``a_star_lag``
+    are NaN throughout when the member log cannot give them on any usable window."""
     g = g.drop_duplicates("window", keep="last")
     lag = pd.to_numeric(g["lag_ari_win"], errors="coerce")
     inc = pd.to_numeric(g["ari_win"], errors="coerce")
@@ -768,13 +832,63 @@ def _regret_job(g: pd.DataFrame, readings: dict | None) -> dict | None:
             mask = mask & sl.notna()
         else:
             sl = None
-    if not mask.any():
+    nan = np.full(len(g), np.nan)
+    return pd.DataFrame({
+        "window": g["window"].to_numpy(), "lag_ari_win": lag.to_numpy(dtype=float),
+        "ari_win": inc.to_numpy(dtype=float),
+        "a_star": s.to_numpy(dtype=float) if s is not None else nan,
+        "a_star_lag": sl.to_numpy(dtype=float) if sl is not None else nan,
+        "used": mask.to_numpy(dtype=bool),
+    })
+
+
+def _regret_job(g: pd.DataFrame, readings: dict | None) -> dict | None:
+    used = _regret_series(g, readings)
+    used = used[used["used"]]
+    if used.empty:
         return None
+
+    def mean(col):  # a reading the log gives on every used window, or on none of them
+        return float(used[col].mean()) if used[col].notna().all() else None
+
     return {
-        "n": int(mask.sum()), "a_lag": float(lag[mask].mean()), "a_inc": float(inc[mask].mean()),
-        "a_star": float(s[mask].mean()) if s is not None else None,
-        "a_star_lag": float(sl[mask].mean()) if sl is not None else None,
+        "n": int(len(used)), "a_lag": mean("lag_ari_win"), "a_inc": mean("ari_win"),
+        "a_star": mean("a_star"), "a_star_lag": mean("a_star_lag"),
     }
+
+
+def regret_windows(out_dir: Path, arms=ONLINE_ARMS, region: str = "all") -> pd.DataFrame:
+    """Per window of every job of ``arms``: what ``regret_table`` averages, before averaging.
+
+    Columns ``algo, fold, seed, arm, window, tail_from`` and ``_regret_series``' readings;
+    ``used`` marks the windows a job's means rest on. ``region="tail"`` keeps the windows
+    from the job's ``tail_from`` on before ``used`` is decided, exactly as ``regret_table``
+    does for its tail rows, so a subset of the used windows (every other one, say) can be
+    averaged the same way the table averages all of them.
+    """
+    if region not in REGRET_REGIONS:
+        raise ValueError(f"region must be one of {REGRET_REGIONS}, got {region!r}")
+    cols = ["algo", "fold", "seed", "arm", "window", "tail_from", "lag_ari_win", "ari_win",
+            "a_star", "a_star_lag", "used"]
+    win = load_windows(out_dir)
+    if win.empty or "lag_ari_win" not in win or "ari_win" not in win:
+        return pd.DataFrame(columns=cols)
+    win = win[win["arm"].isin(list(arms))]
+    if win.empty:
+        return pd.DataFrame(columns=cols)
+    readings, _ = member_readings(out_dir, arms=set(arms))
+    tail_from = _tail_from_by_job(current_runs(out_dir))
+    frames = []
+    for (algo, fold, arm, seed), g in win.groupby(GROUP + ["seed"], sort=True):
+        start = tail_from.get((algo, fold, seed, arm), C.FREEZE_AFTER_WINDOW)
+        if region == "tail":
+            g = g[pd.to_numeric(g["window"], errors="coerce") >= start]
+        ser = _regret_series(g, readings.get((algo, fold, seed, arm, None)))
+        ser.insert(0, "tail_from", start)
+        for col, value in (("arm", arm), ("seed", seed), ("fold", fold), ("algo", algo)):
+            ser.insert(0, col, value)
+        frames.append(ser)
+    return pd.concat(frames, ignore_index=True)[cols] if frames else pd.DataFrame(columns=cols)
 
 
 # --- silhouette against ARI --------------------------------------------------------------------
@@ -874,12 +988,14 @@ def drift_table(out_dir: Path, delta: float = 0.05, horizon: int = 10) -> pd.Dat
     win = load_windows(out_dir)
     if win.empty or "lag_ari_win" not in win:
         return _frame([], DRIFT_COLS)
-    groups = dict(tuple(win.groupby(["algo", "fold", "seed", "arm"], sort=False)))
+    # A run made once has no seed of its own (split seed policy): a missing seed is one key, never dropped.
+    groups = {(a, f, _seed_key(s), arm): g
+              for (a, f, s, arm), g in win.groupby(["algo", "fold", "seed", "arm"], sort=False, dropna=False)}
     best, _ = best_active_members(out_dir, folds={row["fold"] for row, _ in jobs})
     per: dict[tuple, list[dict]] = {}
     for row, points in jobs:
         algo, fold, seed, arm = row["algo"], row["fold"], row["seed"], row["arm"]
-        g = groups.get((algo, fold, seed, arm))
+        g = groups.get((algo, fold, _seed_key(seed), arm))
         if g is None:
             continue
         cid = _cid(row.get("config_id"))
@@ -1161,6 +1277,19 @@ def write_report(out_dir: Path) -> list[Path]:
                                ["algo", "fold", "arm", "n_seeds", "lag_table_a_error_share",
                                 "lag_table_a_first_error"]))
 
+    env = environment_table(out_dir)
+    lines += ["", "## Where the jobs ran", ""]
+    if env.empty:
+        lines.append(f"no {C.ENVIRONMENT_JSONL.name} (results made before the environment was recorded)")
+    else:
+        p = rep / "environment.csv"
+        env.to_csv(p, index=False)
+        written.append(p)
+        lines.append("One row per machine and software stack the commands that ran jobs into this "
+                     "directory were started on; runtimes measured on two rows are not comparable.")
+        lines.append("")
+        lines.append(_md_table(env, list(env.columns)))
+
     failed = runs[runs["status"] != "ok"] if not runs.empty else runs
     lines += ["", "## Runs that did not finish", ""]
     if len(failed):
@@ -1175,6 +1304,29 @@ def write_report(out_dir: Path) -> list[Path]:
 
     written += _plots(out_dir, rep)
     return written
+
+
+#: What tells two machines or software stacks apart in ``environment.jsonl``.
+ENVIRONMENT_KEYS = ("cpu_model", "cpu_count_physical", "cpu_count_logical", "ram_total_gb", "os",
+                    "python", "river_version", "river_git_head", "python_hash_seed")
+
+
+def environment_table(out_dir: Path) -> pd.DataFrame:
+    """The distinct environments of ``<out_dir>/environment.jsonl``, with the first and last
+    time a command started on each and how many did."""
+    rows = list(C.read_jsonl(Path(out_dir) / C.ENVIRONMENT_JSONL.name))
+    if not rows:
+        return pd.DataFrame()
+    df = pd.DataFrame(rows)
+    for k in ENVIRONMENT_KEYS:
+        if k not in df:
+            df[k] = None
+    df["sklearn"] = [(lib or {}).get("scikit-learn") if isinstance(lib, dict) else None
+                     for lib in df.get("libraries", pd.Series([None] * len(df)))]
+    keys = [*ENVIRONMENT_KEYS, "sklearn"]
+    g = df.astype({k: str for k in keys}).groupby(keys, sort=False, dropna=False)["time"]
+    out = g.agg(first="min", last="max", n_commands="count").reset_index()
+    return out.sort_values("first").reset_index(drop=True)
 
 
 def _plots(out_dir: Path, rep: Path) -> list[Path]:

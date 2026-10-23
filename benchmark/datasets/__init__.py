@@ -4,14 +4,18 @@ from __future__ import annotations
 
 from .base import Dataset, IterableDataset
 from .real import (
+    INSECTS_EXTRA_VARIANTS,
     INSECTS_VARIANTS,
     from_river_dataset,
     load_covtype,
     load_electricity,
     load_insects,
+    load_insects_extra,
     load_kddcup98,
     load_kddcup99,
     load_keystroke,
+    load_rialto,
+    load_sensor,
     load_shuttle,
     load_sms_spam,
 )
@@ -75,4 +79,8 @@ __all__ = [
     "load_keystroke",
     "load_electricity",
     "from_river_dataset",
+    "load_rialto",
+    "load_sensor",
+    "load_insects_extra",
+    "INSECTS_EXTRA_VARIANTS",
 ]

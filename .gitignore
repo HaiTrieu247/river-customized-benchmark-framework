@@ -36,6 +36,7 @@ reports_out/
 *.png
 *.svg
 *.json
+!tests/fixtures/*.json
 results.json
 
 # Editor / IDE / tooling

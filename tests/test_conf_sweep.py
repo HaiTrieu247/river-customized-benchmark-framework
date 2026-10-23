@@ -7,6 +7,10 @@ import subprocess
 import sys
 from pathlib import Path
 
+import numpy as np
+import pytest
+
+from conf_pipeline import _common as C
 from conf_pipeline import sweep
 from conf_pipeline.spaces import SPACES
 
@@ -142,14 +146,16 @@ def test_the_cli_reruns_an_incumbent_oracle_with_its_parameters(tmp_path):
     env = {"PYTHONHASHSEED": "0", "PATH": "/usr/bin:/bin"}
 
     def cli(module, *args):
-        proc = subprocess.run([sys.executable, "-m", module, *common, *args], cwd=repo, env=env,
-                              capture_output=True, text=True)
+        # the shared policy's job seeds (--seeds, --seed), as before the seed split
+        proc = subprocess.run([sys.executable, "-m", module, *common, *args, "--seed-policy", "shared"], cwd=repo,
+                              env=env, capture_output=True, text=True)
         assert proc.returncode == 0, proc.stderr
         return proc.stdout
 
     cli("conf_pipeline.run", "--seeds", "1", "--arms", "confstream", "--e-size", "2", "--e-test", "1",
         "--freeze-after-window", "1")
-    out = cli("conf_pipeline.sweep", "--n-points", "1", "--incumbents")
+    # the sweep and the reference's rerun read the same tail as the arms (the manifest refuses another t0)
+    out = cli("conf_pipeline.sweep", "--n-points", "1", "--incumbents", "--freeze-after-window", "1")
     assert "incumbent" in out
     sweep_rows = [json.loads(l) for l in (tmp_path / "sweep.jsonl").read_text().splitlines()]
     inc = [r for r in sweep_rows if r["config_id"] >= sweep.INCUMBENT_ID_BASE]
@@ -163,9 +169,93 @@ def test_the_cli_reruns_an_incumbent_oracle_with_its_parameters(tmp_path):
         params_override=pick["params_override"], params=pick["final_params"],
     )
     path.write_text(json.dumps(oracle))
-    cli("conf_pipeline.run", "--seeds", "1", "--arms", "oracle_static")
+    cli("conf_pipeline.run", "--seeds", "1", "--arms", "oracle_static", "--freeze-after-window", "1")
     runs = [json.loads(l) for l in (tmp_path / "runs.jsonl").read_text().splitlines()]
     (o,) = [r for r in runs if r["arm"] == "oracle_static"]
     assert o["status"] == "ok" and o["config_id"] == pick["config_id"]
     assert o["start_params"] == pick["params_override"]
     assert o["lag_ari_win_mean"] == pick["lag_ari_win_mean"]      # same seed, same configuration
+
+
+# --- a reference picked on several seeds -----------------------------------------------------
+
+def _point(config_id, seed, tail, status="ok"):
+    return {"algo": "A", "fold": "f", "seed": seed, "config_id": config_id, "status": status,
+            "lag_ari_win_mean": tail, "lag_ari_win_tail_mean": tail,
+            "unit_override": {"x": config_id / 10}, "final_params": {"x": config_id}}
+
+
+def test_a_config_swept_on_several_seeds_competes_with_its_mean(tmp_path):
+    # config 1 has the best single run (0.9) but the worse mean; config 2 wins on the mean
+    rows = [_point(1, 1, 0.9), _point(1, 2, 0.1), _point(2, 1, 0.6), _point(2, 2, 0.5)]
+    (tmp_path / "sweep.jsonl").write_text("\n".join(json.dumps(r) for r in rows) + "\n")
+    entry = sweep.select_oracle(tmp_path)["A"]["f"]
+    assert entry["config_id"] == 2 and entry["select_seeds"] == [1, 2]
+    assert entry["lag_ari_win_tail_mean"] == pytest.approx(0.55)
+    assert entry["lag_ari_win_mean"] == pytest.approx(0.55)
+    assert entry["select_sd"] == pytest.approx(np.std([0.6, 0.5], ddof=1))
+    assert entry["n_ok"] == 2 and entry["n_error"] == 0
+
+
+def test_a_config_missing_a_seed_is_not_judged_on_its_luckier_seeds(tmp_path):
+    rows = [_point(1, 1, 0.9), _point(1, 2, None, status="error"),     # failed on seed 2
+            _point(2, 1, 0.4), _point(2, 2, 0.4),
+            _point(3, 1, 0.8)]                                         # never run on seed 2
+    (tmp_path / "sweep.jsonl").write_text("\n".join(json.dumps(r) for r in rows) + "\n")
+    entry = sweep.select_oracle(tmp_path)["A"]["f"]
+    assert entry["config_id"] == 2 and entry["n_ok"] == 1 and entry["n_error"] == 2
+
+
+def test_one_seed_reads_exactly_as_before():
+    rows = [_point(1, 1, 0.3), _point(2, 1, 0.4)]
+    best, metric = C.best_static(rows)
+    assert best["config_id"] == 2 and best["lag_ari_win_tail_mean"] == 0.4 and best["n_seeds"] == 1
+    assert best["lag_ari_win_tail_mean_sd"] is None and metric == "lag_ari_win_tail_mean"
+
+
+def test_run_seeds_expand_only_the_algorithms_that_take_a_seed():
+    jobs = sweep.build_sweep_jobs(["CluStream", "DenStream"], ["static_easy"], n_points=2, seed=1,
+                                  n_samples=900, h=300, run_seeds=(1, 2, 3))
+    seeds = {a: sorted({j["seed"] for j in jobs if j["algo"] == a}) for a in ("CluStream", "DenStream")}
+    assert seeds == {"CluStream": [1, 2, 3], "DenStream": [1]}
+    clu = [j for j in jobs if j["algo"] == "CluStream"]
+    by_seed = {s: [j["unit_override"] for j in clu if j["seed"] == s] for s in (1, 2, 3)}
+    assert by_seed[1] == by_seed[2] == by_seed[3]                     # one design for every seed
+    assert len(jobs) == 3 * 3 + 3
+    assert sweep.build_sweep_jobs(["DenStream"], ["f"], 1, seed=5, n_samples=None, h=300)[0]["seed"] == 5
+
+
+def test_incumbent_jobs_follow_the_run_seeds(tmp_path):
+    rows = [_win("CluStream", "f", "confstream", 1, w, 3, P1) for w in range(3)]
+    rows += [_win("DenStream", "f", "confstream", 1, w, 3, P2) for w in range(3)]
+    _write_windows(tmp_path / "windows.jsonl", rows)
+    jobs = sweep.build_incumbent_jobs(tmp_path, ["CluStream", "DenStream"], ["f"], seed=1, n_samples=900,
+                                      h=300, run_seeds=(1, 2))
+    assert sorted((j["algo"], j["seed"]) for j in jobs) == [("CluStream", 1), ("CluStream", 2), ("DenStream", 1)]
+
+
+def test_the_cli_sweeps_on_several_seeds_and_reads_incumbents_from_another_dir(tmp_path):
+    repo = Path(__file__).resolve().parent.parent
+    arms_dir, ref_dir = tmp_path / "arms", tmp_path / "ref"
+    common = ["--folds", "static_easy", "--n-samples", "900", "--h", "300", "--workers", "2"]
+    env = {"PYTHONHASHSEED": "0", "PATH": "/usr/bin:/bin"}
+
+    def cli(module, *args):
+        # the shared policy's job seeds (--seeds, --seed), as before the seed split
+        proc = subprocess.run([sys.executable, "-m", module, *common, *args, "--seed-policy", "shared"], cwd=repo,
+                              env=env, capture_output=True, text=True)
+        assert proc.returncode == 0, proc.stderr
+        return proc.stdout
+
+    cli("conf_pipeline.run", "--algos", "STREAMKMeans", "--seeds", "1", "--arms", "confstream",
+        "--e-size", "2", "--e-test", "1", "--freeze-after-window", "1", "--out-dir", str(arms_dir))
+    out = cli("conf_pipeline.sweep", "--algos", "STREAMKMeans,DenStream", "--n-points", "1", "--seeds", "1,2",
+              "--incumbents", "--incumbents-from", str(arms_dir), "--out-dir", str(ref_dir))
+    assert str(arms_dir / "windows.jsonl") in out
+    rows = [json.loads(l) for l in (ref_dir / "sweep.jsonl").read_text().splitlines()]
+    seeds = {a: sorted({r["seed"] for r in rows if r["algo"] == a}) for a in ("STREAMKMeans", "DenStream")}
+    assert seeds == {"STREAMKMeans": [1, 2], "DenStream": [1]}
+    assert any(r["config_id"] >= sweep.INCUMBENT_ID_BASE for r in rows if r["algo"] == "STREAMKMeans")
+    oracle = json.loads((ref_dir / "oracle_static.json").read_text())
+    assert oracle["STREAMKMeans"]["static_easy"]["select_seeds"] == [1, 2]
+    assert oracle["DenStream"]["static_easy"]["select_seeds"] == [1]

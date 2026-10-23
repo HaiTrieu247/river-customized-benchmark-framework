@@ -22,13 +22,15 @@ from pathlib import Path
 import numpy as np
 
 from benchmark.algorithms.registry import accepts_seed, get_algorithm
-from benchmark.tuning.confstream import ConfStreamEnsemble, EnsembleConfig, WindowOutcome
+from benchmark.tuning.confstream import TIE_BREAKS, ConfStreamEnsemble, EnsembleConfig, WindowOutcome
 from benchmark.tuning.recluster import common_recluster, micro_centers
+from benchmark.tuning.signals import NOISE_POLICIES, SIGNALS, check_signals
 from benchmark.tuning.space import ParamSpace, SpaceContext
 from benchmark.tuning.window import WindowBuffer
 
 from . import _common as C
-from .spaces import SPACES, clamp_init_buffers, start_params
+from . import manifest as M
+from .spaces import SPACES, clamp_init_buffers, distance_params, scaled_defaults, start_params
 
 
 # --- the driver ---------------------------------------------------------------------
@@ -108,6 +110,8 @@ def _incumbent_fields(o: WindowOutcome, prefix: str = "") -> dict:
         f"{prefix}feasible": o.feasible,
         f"{prefix}feasible_reason": o.feasible_reason,
         f"{prefix}runtime_s": o.runtime_s,
+        f"{prefix}runtime_ratio": o.runtime_ratio,
+        f"{prefix}pred_sha": o.pred_sha,
         f"{prefix}memory_mb": o.memory_mb,
         f"{prefix}n_micro_clusters": o.n_micro_clusters,
         f"{prefix}n_macro_clusters": o.n_macro_clusters,
@@ -116,6 +120,7 @@ def _incumbent_fields(o: WindowOutcome, prefix: str = "") -> dict:
         f"{prefix}n_fallback": o.n_fallback,
         f"{prefix}error": o.error,
         **{f"{prefix}{k}": v for k, v in _external(o).items()},
+        f"{prefix}cmm_error": o.cmm_error,
     }
 
 
@@ -178,6 +183,20 @@ def switch_cost(window_rows: list[dict]) -> float | None:
     return float(np.mean(switched) - np.mean(kept))
 
 
+def job_config(job: dict) -> EnsembleConfig:
+    """The protocol's ensemble configuration of one job, before its arm changes it
+    (``arm_config``); a field the job leaves out (the sweep's jobs) takes the child's default."""
+    return EnsembleConfig(
+        e_size=job["e_size"], e_test=job["e_test"], p_reset=job["p_reset"],
+        runtime_factor=job["runtime_factor"], max_memory_mb=job["max_memory_mb"],
+        max_micro_clusters=job["max_micro_clusters"],
+        external_metrics=tuple(m for m in C.EXTERNAL_METRICS if m not in C.CMM_METRICS or job.get("cmm", True)),
+        log_signals=tuple(job.get("log_signals") or ()),
+        tie_break=job.get("tie_break") or "micro_clusters",
+        signal_noise=job.get("signal_noise") or "label",
+    )
+
+
 def arm_config(arm: str, cfg: EnsembleConfig, freeze_after_window: int | None) -> EnsembleConfig:
     """The ensemble configuration of one arm, derived from the protocol's ``cfg``.
 
@@ -187,16 +206,20 @@ def arm_config(arm: str, cfg: EnsembleConfig, freeze_after_window: int | None) -
     children uniformly from the space; ``frozen_prefix`` tunes until
     ``freeze_after_window`` and keeps its incumbent from then on.
     """
-    if arm in ("default", "oracle_static", "sweep"):
+    if arm in C.FIXED_ARMS:
         over = dict(e_size=1, e_test=0)
     elif arm == "confstream":
         over = {}
     elif arm == "random_online":
         over = dict(sampler="uniform")
+    elif arm == "frozen_reinit":
+        over = dict(freeze_after_window=freeze_after_window, reinit_after_freeze=True)
+    elif arm in C.SIGNAL_ARMS or arm in C.DIAGNOSTIC_ARMS:
+        over = dict(selection_signal=arm.removeprefix("confstream_"))
     elif arm == "frozen_prefix":
         over = dict(freeze_after_window=freeze_after_window)
     else:
-        raise ValueError(f"unknown arm {arm!r}; arms: {C.ARMS + C.OPTIONAL_ARMS + C.EXTRA_ARMS}")
+        raise ValueError(f"unknown arm {arm!r}; arms: {C.ARMS + C.OPTIONAL_ARMS + C.DIAGNOSTIC_ARMS + C.EXTRA_ARMS}")
     return EnsembleConfig(**{**cfg.__dict__, **over})
 
 
@@ -221,8 +244,18 @@ def run_ensemble(
     tail_from: int | None = None,
     config_id: int | None = None,
     params_override: dict | None = None,
+    model_seed: int | None = None,
+    calibration_seed: int | None = None,
+    seed_fields: dict | None = None,
 ) -> list[dict]:
     """Run one ensemble over ``dataset`` and return its window rows + summary row.
+
+    Randomness: ``seed`` seeds the tuner's generator (every draw of the search); ``model_seed``
+    is passed to every member's constructor (algorithms that take a seed), and is ``seed``
+    itself when None; ``calibration_seed`` seeds the subsample the distance unit is estimated
+    on, which draws from the tuner's generator when None. All three None-defaults together are
+    the ``shared`` seed policy of the runs made before 2026-10-24, one job seed for everything.
+    ``seed_fields`` is merged into every row (and member row), e.g. the policy and each seed.
 
     ``unit_override`` replaces the start by a point of the unit cube: a
     dimension it leaves out keeps the start's *unit* value --
@@ -254,6 +287,9 @@ def run_ensemble(
         if unknown:
             raise ValueError(f"unit_override names {unknown}, not dimensions of {space.names}")
     rng = np.random.default_rng(seed)
+    calibration_rng = rng if calibration_seed is None else np.random.default_rng(calibration_seed)
+    if model_seed is None:
+        model_seed = seed
 
     try:
         length = len(dataset)
@@ -267,7 +303,7 @@ def run_ensemble(
         lam = C.lambda_for(n_windows_total, half_life_frac)
     cfg = EnsembleConfig(**{**cfg.__dict__, "lam": lam})
 
-    base = {"algo": algo, "fold": fold, "seed": seed, "arm": arm, "config_id": config_id}
+    base = {"algo": algo, "fold": fold, "seed": seed, "arm": arm, "config_id": config_id, **(seed_fields or {})}
     ensemble: ConfStreamEnsemble | None = None
     calibration: list[WindowBuffer] = []
     s_online = 0.0
@@ -284,13 +320,18 @@ def run_ensemble(
     n_scored_lag = 0
     frozen_at_window: int | None = None
     frozen_idx: int | None = None
+    scaled_params: dict | None = None
+    calibration_s = 0.0
     win_t0 = time.perf_counter()
 
-    def log_members(report):
+    def log_members(report) -> float:
+        """Write the window's member rows; the seconds it took."""
         if member_log is None:
-            return
+            return 0.0
+        t0 = time.perf_counter()
         for o in report.outcomes:
             C.append_jsonl(member_log, {**base, **o.to_dict(), **_external(o)})
+        return time.perf_counter() - t0
 
     for x, y in dataset:
         if n_samples is not None and n_seen >= n_samples:
@@ -302,9 +343,10 @@ def run_ensemble(
 
         if ensemble is None:
             # Calibration: the distance unit, then the ensemble, then a replay.
+            t_cal = time.perf_counter()
             calibration.append(buffer)
             xs_all = [x for b in calibration for x in b.xs]
-            s_online = C.estimate_scale(xs_all, rng)
+            s_online = C.estimate_scale(xs_all, calibration_rng)
             d = len(buffer.xs[0])
             if s_online > 0 or len(calibration) >= scale_max_windows:
                 ctx = SpaceContext(s=s_online if s_online > 0 else None, d=d)
@@ -312,16 +354,20 @@ def run_ensemble(
                     start = [dict(params_override)]
                 elif unit_override:
                     start = [space.resolve({**space.unit_point(start[0], ctx), **unit_override}, ctx)]
+                elif arm == "scaled_default":
+                    scaled, scaled_params = scaled_defaults(algo, start[0], s_online)
+                    start = [scaled]
                 start = [clamp_init_buffers(algo, p, h) for p in start]
                 ensemble = ConfStreamEnsemble(
                     space=space, ctx=ctx, make_adapter=_make_adapter_factory(algo, h),
-                    start_params=start, config=cfg, rng=rng, seed=seed,
+                    start_params=start, config=cfg, rng=rng, seed=model_seed,
                     post_resolve=lambda params: clamp_init_buffers(algo, params, h),
                 )
                 ensemble.initialise(calibration[0], window_index=0)
                 for extra in calibration[1:]:
                     ensemble.replay(extra)
                 window_index = len(calibration) - 1
+            calibration_s += time.perf_counter() - t_cal
             buffer = WindowBuffer(h)
             window_index += 1
             win_t0 = time.perf_counter()
@@ -340,7 +386,7 @@ def run_ensemble(
         lag_member = ensemble.find(last_incumbent_id) if last_incumbent_id is not None else None
         report = ensemble.process_window(buffer, window_index)
         wall = time.perf_counter() - win_t0
-        log_members(report)
+        log_s = log_members(report)
         inc = report.incumbent
         if last_incumbent_id is not None and inc.member_id != last_incumbent_id:
             n_switches += 1
@@ -354,7 +400,9 @@ def run_ensemble(
                     lag_y.append(yy)
                     lag_pred.append(yp)
 
+        t_a = time.perf_counter()
         table_a_fields = _table_a_fields(lag_member, lag, buffer, C.TABLE_A_EPS_FACTOR * s_online)
+        table_a_s = time.perf_counter() - t_a
 
         row = {
             "kind": "window", **base, "window": window_index,
@@ -362,7 +410,7 @@ def run_ensemble(
             "incumbent_id": inc.member_id, "params": inc.params,
             **_incumbent_fields(inc),
             **(_incumbent_fields(lag, "lag_") if lag is not None else
-               {"lag_member_id": None, "lag_score": None, "lag_defined": None}),
+               {"lag_member_id": None, "lag_score": None, "lag_defined": None, "lag_pred_sha": None}),
             **table_a_fields,
             "n_true_classes": inc.n_true_classes,
             "majority_class_share": inc.majority_class_share,
@@ -372,6 +420,14 @@ def run_ensemble(
             "n_discarded": report.n_discarded, "n_spawned": report.n_spawned,
             "n_reset": report.n_reset,
             "ensemble_runtime_s": report.ensemble_runtime_s, "wall_s": wall,
+            "signals_runtime_s": report.signals_runtime_s,
+            "cmm_runtime_s": report.cmm_runtime_s,
+            #: The rest of the window's time, apart from the models' (``ensemble_runtime_s``):
+            #: the silhouettes, building and warm-starting the next test set, Table A and the
+            #: member log. ``wall_s`` ends before the last two.
+            "scoring_runtime_s": report.scoring_runtime_s, "spawn_runtime_s": report.spawn_runtime_s,
+            "table_a_runtime_s": table_a_s, "log_runtime_s": log_s,
+            **{f"cmm_{k}": v for k, v in report.cmm_window.items()},
             "frozen": report.frozen,
         }
         if report.frozen and frozen_at_window is None:
@@ -402,7 +458,7 @@ def run_ensemble(
     tail = [r for r in lag_rows if r["window"] >= tail_from]
     inc_runtime = sum(r["runtime_s"] for r in window_rows)
     ens_runtime = sum(r["ensemble_runtime_s"] for r in window_rows)
-    lag_cum = batch_external(lag_y, lag_pred, tuple(cfg.external_metrics))
+    lag_cum = batch_external(lag_y, lag_pred, tuple(m for m in cfg.external_metrics if m not in C.CMM_METRICS))
     summary = {
         "kind": "run", **base, "status": "ok",
         "n_samples": n_seen, "n_samples_cap": n_samples, "h": h, "n_windows": len(window_rows),
@@ -423,6 +479,16 @@ def run_ensemble(
         "lag_score_mean": _mean("lag_score"), "lag_score_median": _median("lag_score"),
         "lag_ari_win_mean": _mean("lag_ari_win"), "lag_ari_win_median": _median("lag_ari_win"),
         "lag_nmi_win_mean": _mean("lag_nmi_win"), "lag_purity_win_mean": _mean("lag_purity_win"),
+        "lag_cmm_win_mean": _mean("lag_cmm_win"), "lag_cmm_win_tail_mean": _mean("lag_cmm_win", tail),
+        "lag_cmm_strict_win_mean": _mean("lag_cmm_strict_win"),
+        "lag_cmm_strict_win_tail_mean": _mean("lag_cmm_strict_win", tail),
+        #: MOA's class analysis: merged classes over classes, and the points no other class's sphere holds.
+        "cmm_ca_separability_mean": _mean("cmm_ca_separability"), "cmm_ca_model_mean": _mean("cmm_ca_model"),
+        #: CMM never stops a run either; the lagged windows it failed on, and the first message.
+        "lag_cmm_error_share": (
+            sum(1 for r in lag_rows if r.get("lag_cmm_error") is not None) / len(lag_rows) if lag_rows else None
+        ),
+        "lag_cmm_first_error": next((r["lag_cmm_error"] for r in lag_rows if r.get("lag_cmm_error")), None),
         "tail_from": tail_from,
         "lag_ari_win_tail_mean": _mean("lag_ari_win", tail),
         "lag_score_tail_mean": _mean("lag_score", tail),
@@ -465,32 +531,101 @@ def run_ensemble(
             if window_rows else None
         ),
         "sampler": cfg.sampler,
+        "selection_signal": cfg.selection_signal,
+        "log_signals": list(cfg.log_signals),
+        #: Seconds spent on the signals beyond the silhouette, the cost of logging or selecting by them.
+        "signals_runtime_s": float(sum(r["signals_runtime_s"] for r in window_rows)),
+        #: Seconds spent on CMM over every member, part of ``wall_s`` and of no member's runtime.
+        "cmm_runtime_s": float(sum(r["cmm_runtime_s"] for r in window_rows)),
+        #: Where the rest of ``wall_s`` went: the calibration windows (distance unit, the first
+        #: members, their replay), the silhouettes, the test sets' builds and warm starts,
+        #: Table A and the member log (``signals_runtime_s`` and ``cmm_runtime_s`` above).
+        "calibration_runtime_s": calibration_s,
+        "scoring_runtime_s": float(sum(r["scoring_runtime_s"] for r in window_rows)),
+        "spawn_runtime_s": float(sum(r["spawn_runtime_s"] for r in window_rows)),
+        "table_a_runtime_s": float(sum(r["table_a_runtime_s"] for r in window_rows)),
+        "log_runtime_s": float(sum(r["log_runtime_s"] for r in window_rows)),
         "freeze_after_window": cfg.freeze_after_window,
+        "reinit_after_freeze": cfg.reinit_after_freeze,
+        "tie_break": cfg.tie_break,
         "frozen_at_window": frozen_at_window,
         "frozen_params": window_rows[frozen_idx]["params"] if frozen_idx is not None else None,
         "unit_override": unit_override,
         "params_override": params_override,
+        #: ``scaled_default``: each distance parameter's default, the unit and their product.
+        "scaled_params": scaled_params,
     }
     return [*window_rows, summary]
 
 
 # --- CLI: parent + child -------------------------------------------------------------
 
+def _accepts_seed(algo: str) -> bool:
+    try:
+        return accepts_seed(algo)
+    except KeyError:
+        return False
+
+
+def job_seeds(algo: str, arm: str, policy: str, seeds=(), tuner_seeds=(), model_seed: int | None = None,
+              fixed_model_seeds=()) -> list[dict]:
+    """The runs of (``algo``, ``arm``), one dict per run: ``seed`` (its index within the arm), ``tuner_seed``,
+    ``model_seed`` (docs/superpowers/specs/2026-10-24-seed-split-design.md, section 4).
+
+    ``shared``: one run per job seed, which seeds the tuner and, for an algorithm that takes one, the
+    model. ``split``: an arm that tunes runs once per tuner seed, its models on ``model_seed``; a fixed
+    configuration draws nothing from a tuner, so it runs once per fixed model seed when the algorithm
+    takes a seed, and once at all when it is deterministic (another run would repeat it exactly).
+    """
+    seeded = _accepts_seed(algo)
+    if policy == "shared":
+        return [{"seed": s, "tuner_seed": s, "model_seed": s if seeded else None} for s in seeds]
+    if policy != "split":
+        raise ValueError(f"seed policy must be one of {C.SEED_POLICIES}, got {policy!r}")
+    if arm in C.FIXED_ARMS:
+        if not seeded:
+            return [{"seed": None, "tuner_seed": None, "model_seed": None}]
+        return [{"seed": m, "tuner_seed": None, "model_seed": m} for m in fixed_model_seeds]
+    return [{"seed": t, "tuner_seed": t, "model_seed": model_seed if seeded else None} for t in tuner_seeds]
+
+
+def seed_fields(job: dict) -> dict:
+    """What a job's rows record about its randomness. A job dict that predates the split (the sweep's
+    under the shared policy, a hand-made one) reads as the shared policy."""
+    policy = job.get("seed_policy") or "shared"
+    if policy == "shared" and "tuner_seed" not in job:
+        return {"seed": job["seed"], "seed_policy": "shared", "tuner_seed": job["seed"],
+                "model_seed": job["seed"] if _accepts_seed(job["algo"]) else None, "calibration_seed": None}
+    return {"seed": job["seed"], "seed_policy": policy, "tuner_seed": job.get("tuner_seed"),
+            "model_seed": job.get("model_seed"), "calibration_seed": job.get("calibration_seed")}
+
+
+def _model_seed_of(d: dict):
+    """A job's or row's model seed; a row from before the split derives it as the shared policy did."""
+    if "model_seed" in d:
+        return d["model_seed"]
+    return d.get("seed") if _accepts_seed(d.get("algo", "")) else None
+
+
 def _member_log_path(out: Path, job: dict) -> str:
-    """Where one job's member outcomes go: its own file under ``<out>/members/``."""
-    name = f"{job['algo']}__{job['fold']}__seed{job['seed']}__{job['arm']}"
+    """Where one job's member outcomes go: its own file under ``<out>/members/``; a run without a seed
+    of its own (a deterministic fixed configuration under the split policy) is ``seedx``."""
+    seed = "x" if job["seed"] is None else job["seed"]
+    name = f"{job['algo']}__{job['fold']}__seed{seed}__{job['arm']}"
     if job.get("config_id") is not None:
         name += f"__cfg{job['config_id']}"
     return str(out / C.MEMBERS_DIR.name / f"{name}.jsonl")
 
 
 def _job_key(job: dict) -> tuple:
-    return (job["algo"], job["fold"], job["seed"], job["arm"], job["n_samples"], job.get("config_id"))
+    return (job["algo"], job["fold"], job["seed"], job["arm"], job["n_samples"], job.get("config_id"),
+            _model_seed_of(job))
 
 
 def _row_key(row: dict) -> tuple:
     """The job key of a ``runs.jsonl`` row (``config_id`` is None for protocol arms)."""
-    return (row["algo"], row["fold"], row["seed"], row["arm"], row.get("n_samples_cap"), row.get("config_id"))
+    return (row["algo"], row["fold"], row["seed"], row["arm"], row.get("n_samples_cap"), row.get("config_id"),
+            _model_seed_of(row))
 
 
 def _done_keys(runs_path: Path) -> set:
@@ -513,13 +648,12 @@ def _run_one_child() -> None:
     except (ImportError, ValueError, OSError):
         pass
     job = json.loads(sys.stdin.read())
+    # The code this child imported, against which the parent checks the manifest's.
+    code_sha = M.code_fingerprint()
     algo, fold = job["algo"], job["fold"]
-    dataset = C.load_fold(fold, n_samples=job["n_samples"])
-    cfg = EnsembleConfig(
-        e_size=job["e_size"], e_test=job["e_test"], p_reset=job["p_reset"],
-        runtime_factor=job["runtime_factor"], max_memory_mb=job["max_memory_mb"],
-        max_micro_clusters=job["max_micro_clusters"], external_metrics=tuple(C.EXTERNAL_METRICS),
-    )
+    data_seed = job.get("data_seed", C.DATA_SEED)
+    dataset = C.load_fold(fold, n_samples=job["n_samples"], data_seed=data_seed)
+    cfg = job_config(job)
     member_log = Path(job["member_log"]) if job.get("member_log") else None
     if member_log is not None:
         # A retried job (--retry-failed) reuses the same path a failed attempt
@@ -531,14 +665,27 @@ def _run_one_child() -> None:
     if d is None:
         first = next(iter(dataset))
         d = len(first[0])
+    # The samples the run consumes, hashed as it consumes them (the manifest's stream check).
+    stream = M.CappedStream(dataset, job["n_samples"])
+    fields = seed_fields(job)
+    if fields["seed_policy"] == "split":
+        # A fixed configuration draws nothing from the tuner, and a deterministic model reads no seed.
+        tuner = fields["tuner_seed"] if fields["tuner_seed"] is not None else 0
+        model = fields["model_seed"] if fields["model_seed"] is not None else 0
+        calibration = fields["calibration_seed"]
+    else:
+        tuner, model, calibration = job["seed"], None, None
     rows = run_ensemble(
         algo=algo, space=SPACES[algo], start=[start_params(algo, job["h"], d=d)],
-        dataset=dataset, fold=fold, seed=job["seed"], arm=job["arm"], cfg=cfg,
+        dataset=stream, fold=fold, seed=tuner, arm=job["arm"], cfg=cfg,
         h=job["h"], n_samples=job["n_samples"], half_life_frac=job["half_life_frac"],
         lam=job["lam"], member_log=member_log, unit_override=job.get("unit_override"),
         freeze_after_window=job.get("freeze_after_window"), config_id=job.get("config_id"),
-        params_override=job.get("params_override"),
+        params_override=job.get("params_override"), model_seed=model, calibration_seed=calibration,
+        seed_fields=fields,
     )
+    rows[-1].update(stream_sha256=stream.digest.hexdigest(), stream_n_samples=stream.digest.n, code_sha256=code_sha,
+                    data_seed=data_seed if C.is_synthetic(fold) else None)
     for row in rows:
         row["n_samples_cap"] = job["n_samples"]
         sys.stdout.write(json.dumps(row, default=C._json_default) + "\n")
@@ -546,7 +693,7 @@ def _run_one_child() -> None:
 
 def _failed_row(job: dict, status: str, error: str) -> dict:
     return {
-        "kind": "run", "algo": job["algo"], "fold": job["fold"], "seed": job["seed"],
+        "kind": "run", "algo": job["algo"], "fold": job["fold"], **seed_fields(job),
         "arm": job["arm"], "config_id": job.get("config_id"), "unit_override": job.get("unit_override"),
         "params_override": job.get("params_override"),
         "n_samples_cap": job["n_samples"], "status": status, "error": (error or "")[-500:],
@@ -588,9 +735,21 @@ def main() -> None:
     parser.add_argument("--run-one", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--algos", default=",".join(C.ALGOS))
     parser.add_argument("--folds", default=",".join(C.FOLDS))
-    parser.add_argument("--seeds", default=",".join(map(str, C.SEEDS)))
+    parser.add_argument("--seed-policy", default="split", choices=C.SEED_POLICIES,
+                        help="split (the default): tuner, model and calibration seeds apart; shared: one job "
+                             "seed for all three, as in the runs made before 2026-10-24")
+    parser.add_argument("--seeds", default=None,
+                        help=f"shared policy only: the job seeds (default {','.join(map(str, C.SEEDS))})")
+    parser.add_argument("--tuner-seeds", default=None,
+                        help=f"split policy: one online run per tuner seed (default {','.join(map(str, C.TUNER_SEEDS))})")
+    parser.add_argument("--model-seed", type=int, default=None,
+                        help=f"split policy: the online arms' model seed, one per out dir (default {C.MODEL_SEED})")
+    parser.add_argument("--fixed-model-seeds", default=None,
+                        help="split policy: the runs of a fixed configuration of an algorithm that takes a seed "
+                             "(default: the model seed); a deterministic one runs once")
     parser.add_argument("--arms", default=",".join(C.ARMS),
-                        help=f"comma-separated, from {C.ARMS + C.OPTIONAL_ARMS + ('oracle_static',)}")
+                        help=f"comma-separated, from {C.ARMS + C.OPTIONAL_ARMS + ('oracle_static',)}; "
+                             f"diagnostic, selecting by labels: {C.DIAGNOSTIC_ARMS}")
     parser.add_argument("--n-samples", type=int, default=C.N_SAMPLES_CAP, help="0 = whole stream")
     parser.add_argument("--freeze-after-window", type=int, default=C.FREEZE_AFTER_WINDOW,
                         help="window where frozen_prefix stops tuning; every arm's tail starts there")
@@ -604,6 +763,10 @@ def main() -> None:
     parser.add_argument("--half-life-frac", type=float, default=C.HALF_LIFE_FRAC)
     parser.add_argument("--lam", type=float, default=None, help="override the per-fold lambda")
     parser.add_argument("--runtime-factor", type=float, default=C.RUNTIME_FACTOR)
+    parser.add_argument("--no-runtime-gate", action="store_true",
+                        help="never shed a member for its measured runtime (repeatable selection); "
+                             "memory, micro-cluster and timeout limits still apply, and every member's "
+                             "runtime ratio is still logged")
     parser.add_argument("--max-memory-mb", type=float, default=C.MAX_MEMORY_MB)
     parser.add_argument("--max-micro-clusters", type=int, default=C.MAX_MICRO_CLUSTERS)
     parser.add_argument("--out-dir", default=str(C.OUT))
@@ -612,6 +775,26 @@ def main() -> None:
     parser.add_argument("--log-members", action="store_true",
                         help="also write every member's outcome per window, one file per job under "
                              f"<out-dir>/{C.MEMBERS_DIR.name}/")
+    parser.add_argument("--tie-break", default="micro_clusters", choices=TIE_BREAKS,
+                        help="how tied members are separated: micro_clusters (deterministic, the default) "
+                             "or runtime (the rule of the runs made before 2026-10-22)")
+    parser.add_argument("--signals", default="",
+                        help=f"comma-separated readings to log for every member, from {SIGNALS} "
+                             "(written to the member logs as sig_<name>; needs --log-members)")
+    parser.add_argument("--signal-noise", default="label", choices=NOISE_POLICIES,
+                        help="how the label-free signals read a model's sentinel label (DenStream's -1): as a "
+                             "cluster (label, the default), left out (drop), or one cluster per point (singleton)")
+    parser.add_argument("--no-cmm", action="store_true",
+                        help="leave CMM (cmm, cmm_strict) out of the per-window external readings")
+    parser.add_argument("--data-seed", type=int, default=C.DATA_SEED,
+                        help="seed of the synthetic streams' generators, one per out dir (real streams "
+                             "have none)")
+    parser.add_argument("--adopt-legacy", action="store_true",
+                        help="resume into an out dir that holds results but no manifest, recording that "
+                             "their protocol is unknown")
+    parser.add_argument("--allow-code-change", action="store_true",
+                        help="resume into an out dir made by other code (commit, diff or packages), "
+                             "recording the change in its manifest")
     parser.add_argument("--retry-failed", action="store_true")
     parser.add_argument("--force", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
@@ -628,7 +811,7 @@ def main() -> None:
     if unknown:
         raise SystemExit(f"no search space for {unknown}; known: {sorted(SPACES)}")
     arms = _csv(args.arms)
-    runnable = C.ARMS + C.OPTIONAL_ARMS + ("oracle_static",)
+    runnable = C.ARMS + C.OPTIONAL_ARMS + C.DIAGNOSTIC_ARMS + ("oracle_static",)
     bad = [a for a in arms if a not in runnable]
     if bad:
         raise SystemExit(
@@ -640,27 +823,60 @@ def main() -> None:
         if "oracle_static" in arms and oracle_file.exists() else {}
     )
     n_samples = args.n_samples or None
+    policy = args.seed_policy
+    split_flags = {"--tuner-seeds": args.tuner_seeds, "--model-seed": args.model_seed,
+                   "--fixed-model-seeds": args.fixed_model_seeds}
+    if policy == "split":
+        if args.seeds is not None:
+            raise SystemExit("--seeds is the shared policy's job seed; under the split policy give --tuner-seeds, "
+                             "--model-seed and --fixed-model-seeds (or pass --seed-policy shared)")
+        model_seed = C.MODEL_SEED if args.model_seed is None else args.model_seed
+        seed_kw = dict(tuner_seeds=[int(s) for s in _csv(args.tuner_seeds)] if args.tuner_seeds else list(C.TUNER_SEEDS),
+                       model_seed=model_seed,
+                       fixed_model_seeds=[int(s) for s in _csv(args.fixed_model_seeds)] if args.fixed_model_seeds
+                       else [model_seed])
+    else:
+        given = [flag for flag, v in split_flags.items() if v is not None]
+        if given:
+            raise SystemExit(f"{', '.join(given)} belong to the split policy; the shared policy takes --seeds")
+        model_seed = None
+        seed_kw = dict(seeds=[int(s) for s in _csv(args.seeds)] if args.seeds else list(C.SEEDS))
+    signals = list(check_signals(_csv(args.signals)))
+    if signals and not args.log_members:
+        raise SystemExit("--signals needs --log-members: the readings are written only to the member logs")
     jobs, skipped = [], []
-    for algo, fold, seed, arm in product(algos, _csv(args.folds), map(int, _csv(args.seeds)), arms):
+    picked = []
+    planned = [(algo, fold, arm, seeds_of) for algo, fold, arm in product(algos, _csv(args.folds), arms)
+               for seeds_of in job_seeds(algo, arm, policy, **seed_kw)]
+    for algo, fold, arm, seeds_of in planned:
         job = {
-            "algo": algo, "fold": fold, "seed": seed, "arm": arm, "n_samples": n_samples,
+            "algo": algo, "fold": fold, **seeds_of, "arm": arm, "n_samples": n_samples,
+            "seed_policy": policy, "online_model_seed": model_seed,
+            "calibration_seed": C.CALIBRATION_SEED if policy == "split" else None,
             "h": args.h, "e_size": args.e_size, "e_test": args.e_test, "p_reset": args.p_reset,
             "half_life_frac": args.half_life_frac, "lam": args.lam,
-            "runtime_factor": args.runtime_factor, "max_memory_mb": args.max_memory_mb,
-            "max_micro_clusters": args.max_micro_clusters,
+            "runtime_factor": None if args.no_runtime_gate else args.runtime_factor,
+            "max_memory_mb": args.max_memory_mb, "max_micro_clusters": args.max_micro_clusters,
             "freeze_after_window": args.freeze_after_window, "member_log": None,
             "config_id": None, "unit_override": None, "params_override": None,
+            "log_signals": signals, "tie_break": args.tie_break, "cmm": not args.no_cmm,
+            "data_seed": args.data_seed, "signal_noise": args.signal_noise,
         }
+        if arm == "scaled_default" and not distance_params(algo):
+            # Nothing to scale: the run would be the default arm's again, not a new reading.
+            skipped.append((job, _failed_row(
+                job, "skipped", f"no absolute-distance parameter: {algo}'s scaled default is its default")))
+            continue
         if arm == "oracle_static":
             # Never fall back to defaults: an (algo, fold) the sweep has not
             # settled is written down as skipped, with the reason.
             entry = (oracle.get(algo) or {}).get(fold)
             if entry is None:
-                skipped.append(_failed_row(job, "skipped", f"no oracle for {algo}/{fold} in {oracle_file}"))
+                skipped.append((job, _failed_row(job, "skipped", f"no oracle for {algo}/{fold} in {oracle_file}")))
                 continue
             # The sweep ran but every point failed: there is no configuration to rerun.
             if entry.get("config_id") is None:
-                skipped.append(_failed_row(job, "skipped", f"sweep produced no ok point for {algo}/{fold}"))
+                skipped.append((job, _failed_row(job, "skipped", f"sweep produced no ok point for {algo}/{fold}")))
                 continue
             # "unit" is a hard lookup: a well-formed entry always has the key,
             # `None` meaning "River default"; an entry missing it entirely is
@@ -675,10 +891,41 @@ def main() -> None:
             # Sobol point or the default carries its unit point.
             job["config_id"], job["unit_override"] = entry.get("config_id"), entry["unit"]
             job["params_override"] = entry.get("params_override")
+            # The reference is never read on a model seed that picked it (docs/SEED_RULES.md, rule 4).
+            if policy == "split" and job["model_seed"] is not None and job["model_seed"] in (entry.get("select_seeds") or []):
+                picked.append(f"{algo}/{fold} model seed {job['model_seed']}")
         if args.log_members:
             job["member_log"] = _member_log_path(out, job)
         jobs.append(job)
+    if picked:
+        raise SystemExit("the reference would be rerun on a model seed that picked it:\n  " + "\n  ".join(picked)
+                         + "\nGive --fixed-model-seeds other than the sweep's (oracle_static.json select_seeds).")
+    described = jobs + [j for j, _ in skipped]
+    if not described:
+        print("0 jobs")
+        return
+    # Before anything is read as done: a dir made under another protocol is never resumed.
+    history = {"workers": args.workers, "timeout": args.timeout, "memory_limit_bytes": C.MEMORY_LIMIT_BYTES}
+    if "oracle_static" in arms and oracle_file.exists():
+        history.update(oracle_file=str(oracle_file), oracle_sha256=M.fingerprint(oracle))
+    new_manifest = M.build(described)
+    guard = dict(adopt_legacy=args.adopt_legacy, allow_code_change=args.allow_code_change, **history)
+    session_manifest, event = M.check(out, new_manifest, "conf_pipeline.run", **guard)
     done = _done_keys(runs_path)
+    # A rerun of the reference is keyed by its config_id, which names a point only within one
+    # sweep: an oracle file from another design can name another point under the same id.
+    ran = {_row_key(r): r for r in C.read_jsonl(runs_path) if r.get("arm") == "oracle_static" and r.get("status") == "ok"}
+    clashes = [
+        f"{j['algo']}/{j['fold']} seed {j['seed']} config_id {j['config_id']}: on file "
+        f"{M.canonical([ran[_job_key(j)].get('unit_override'), ran[_job_key(j)].get('params_override')])}, "
+        f"now {M.canonical([j['unit_override'], j['params_override']])}"
+        for j in jobs if j["arm"] == "oracle_static" and _job_key(j) in ran
+        and M.canonical([ran[_job_key(j)].get("unit_override"), ran[_job_key(j)].get("params_override")])
+        != M.canonical([j["unit_override"], j["params_override"]])
+    ]
+    if clashes:
+        raise SystemExit(f"{oracle_file} names another configuration than the one already rerun here:\n  "
+                         + "\n  ".join(clashes) + "\nWrite into a new --out-dir.")
     if args.retry_failed:
         # Only a key whose *most recent* (or any) attempt is a real,
         # non-skipped failure is put back in play. A key can carry more than
@@ -694,21 +941,29 @@ def main() -> None:
     todo = [j for j in jobs if _job_key(j) not in done]
     # A skip already on file is not written again on resume.
     on_file = {_row_key(r) for r in C.read_jsonl(runs_path) if r.get("status") == "skipped"}
-    new_skips = [r for r in skipped if _row_key(r) not in on_file]
+    new_skips = [(j, r) for j, r in skipped if _row_key(r) not in on_file]
+    print(M.describe(event, session_manifest))
+    reasons: dict[str, int] = {}
+    for _, r in skipped:
+        why = ("no absolute-distance parameter" if r["error"].startswith("no absolute-distance") else "no oracle point")
+        reasons[why] = reasons.get(why, 0) + 1
     print(f"{len(jobs)} jobs, {len(jobs) - len(todo)} done, {len(todo)} to run"
-          + (f", {len(skipped)} skipped (no oracle point)" if skipped else ""))
+          + (f", {len(skipped)} skipped ({', '.join(f'{n} {w}' for w, n in reasons.items())})" if skipped else ""))
     if args.dry_run:
         for j in todo:
             print(f"  {j['algo']:10s} {j['fold']:28s} seed={j['seed']} arm={j['arm']}")
-        for r in skipped:
+        for _, r in skipped:
             print(f"  {r['algo']:10s} {r['fold']:28s} seed={r['seed']} arm={r['arm']} skipped: {r['error']}")
         return
     if not todo and not new_skips:
         return
 
-    with JsonlLockPair(runs_path, windows_path, force=args.force):
-        for row in new_skips:
-            C.append_jsonl(runs_path, row)
+    with M.locked_session(out, new_manifest, "conf_pipeline.run", force=args.force, **guard) as session, \
+            JsonlLockPair(runs_path, windows_path, force=args.force):
+        if todo:
+            C.record_environment(out, "conf_pipeline.run")
+        for job, row in new_skips:
+            C.append_jsonl(runs_path, session.stamp(job, row))
             print(f"[skipped] {row['algo']} {row['fold']} seed={row['seed']} arm={row['arm']}: {row['error']}",
                   flush=True)
         with ThreadPoolExecutor(max_workers=max(1, args.workers)) as pool:
@@ -716,6 +971,12 @@ def main() -> None:
             for fut in as_completed(futures):
                 job = futures[fut]
                 rows = fut.result()
+                try:
+                    session.accept(job, rows)
+                except SystemExit:
+                    pool.shutdown(wait=False, cancel_futures=True)
+                    print("stopping: the jobs still running finish, nothing more is written", file=sys.stderr)
+                    raise
                 for row in rows:
                     if row["kind"] == "window":
                         C.append_jsonl(windows_path, row)

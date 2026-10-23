@@ -682,3 +682,72 @@ def test_oracle_table_names_where_the_ceiling_configuration_came_from(out_dir):
                 else "incumbent" if c >= C.INCUMBENT_ID_BASE else "sobol" for c in o["config_id"]]
     assert o["config_source"].tolist() == expected
     assert report.config_source(C.INCUMBENT_ID_BASE + 7) == "incumbent"
+
+
+def test_regret_windows_are_the_readings_regret_table_averages(out_dir):
+    # per window and job, the readings regret_table means over: averaging the used windows
+    # of each seed, then the seeds, gives back the table's terms
+    win = report.regret_windows(out_dir, arms=("confstream",))
+    assert {"algo", "fold", "seed", "arm", "window", "tail_from", "lag_ari_win", "ari_win",
+            "a_star", "a_star_lag", "used"} <= set(win.columns)
+    g = win[(win.algo == "DenStream") & (win.fold == "covtype") & win.used]
+    per_seed = g.groupby("seed")[["lag_ari_win", "a_star", "a_star_lag"]].mean().mean()
+    r = _regret_row(out_dir, "DenStream", "covtype", "confstream")
+    assert per_seed["lag_ari_win"] == pytest.approx(r["a_lag"])
+    assert per_seed["a_star"] == pytest.approx(r["a_star"])
+    assert per_seed["a_star_lag"] == pytest.approx(r["a_star_lag"])
+    assert set(g["tail_from"]) == {20}  # the runs carry no tail_from: the protocol's default
+
+
+# --- where the jobs ran ---------------------------------------------------------------------
+
+def test_every_command_records_its_machine_and_the_report_lists_each_one_once(tmp_path, out_dir):
+    from conf_pipeline import _common as C
+
+    first = C.record_environment(out_dir, "conf_pipeline.run", argv=["--seeds", "1"])
+    C.record_environment(out_dir, "conf_pipeline.sweep", argv=[])
+    assert first["cpu_model"] and first["command"] == "conf_pipeline.run" and first["argv"] == ["--seeds", "1"]
+    other = {**first, "cpu_model": "Some Server CPU", "time": "2026-01-01T00:00:00"}
+    C.append_jsonl(out_dir / "environment.jsonl", other)
+    env = report.environment_table(out_dir)
+    assert len(env) == 2 and env.iloc[0]["cpu_model"] == "Some Server CPU"
+    assert env.set_index("cpu_model").loc[first["cpu_model"], "n_commands"] == 2
+    report.write_report(out_dir)
+    md = (out_dir / "report" / "report.md").read_text()
+    assert "## Where the jobs ran" in md and "Some Server CPU" in md
+    assert (out_dir / "report" / "environment.csv").exists()
+
+
+def test_a_report_without_an_environment_record_says_so(out_dir):
+    report.write_report(out_dir)
+    assert "no environment.jsonl" in (out_dir / "report" / "report.md").read_text()
+
+
+# --- the diagnostic oracle arms stay out of the default reports ----------------------------------
+
+def _mixed_dir(tmp_path):
+    import json as _json
+
+    rows, windows = [], []
+    for arm, tail in (("default", 0.1), ("confstream", 0.3), ("confstream_ari_oracle", 0.9)):
+        rows.append({"kind": "run", "algo": "A", "fold": "f", "seed": 1, "arm": arm, "status": "ok",
+                     "config_id": None, "n_samples_cap": 900, "lag_ari_win_tail_mean": tail,
+                     "lag_ari_win_mean": tail, "incumbent_throughput_sps": 100.0, "tail_from": 2})
+        windows.append({"kind": "window", "algo": "A", "fold": "f", "seed": 1, "arm": arm, "window": 3,
+                        "lag_ari_win": tail})
+    (tmp_path / "runs.jsonl").write_text("\n".join(map(_json.dumps, rows)) + "\n")
+    (tmp_path / "windows.jsonl").write_text("\n".join(map(_json.dumps, windows)) + "\n")
+    return tmp_path
+
+
+def test_the_default_readers_leave_the_diagnostic_arms_out_unless_asked(tmp_path):
+    from conf_pipeline import _common as C
+    from conf_pipeline import report as R
+
+    d = _mixed_dir(tmp_path)
+    assert set(R.current_runs(d)["arm"]) == {"default", "confstream"}
+    assert set(R.load_windows(d)["arm"]) == {"default", "confstream"}
+    assert set(R.current_runs(d, diagnostic=True)["arm"]) == {"default", "confstream", *C.DIAGNOSTIC_ARMS[:1]}
+    assert set(R.load_windows(d, diagnostic=True)["arm"]) >= {"confstream_ari_oracle"}
+    assert set(R.gain_table(d)["arm"]) == {"confstream"}
+    assert not any(c.endswith("ari_oracle") for c in R.headroom_table(d).columns)
