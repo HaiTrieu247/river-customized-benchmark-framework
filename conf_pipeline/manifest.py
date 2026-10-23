@@ -112,8 +112,8 @@ def algorithm_spec(algo: str) -> dict:
         "river_defaults": C.river_defaults(algo),
         "start_overrides": START_OVERRIDES.get(algo, {}),
         "space": {"params": [dataclasses.asdict(p) for p in space.params], "fixed": space.fixed},
+        #: Whether a model seed reaches it at all; which seed does is the protocol's seed policy.
         "accepts_seed": seeded,
-        "model_seed": "job seed" if seeded else "none (deterministic)",
     }
     if algo == "HPStream":
         out["default_projection"] = HPSTREAM_DEFAULT_PROJECTION

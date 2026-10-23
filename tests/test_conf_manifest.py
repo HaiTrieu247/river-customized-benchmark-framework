@@ -106,7 +106,8 @@ def test_the_manifest_records_protocol_arms_algorithms_and_streams():
     assert algo["river_defaults"]["epsilon"] == C.river_defaults("DenStream")["epsilon"]
     assert {p["name"] for p in algo["space"]["params"]} >= {"epsilon", "mu"}
     assert algo["space"]["fixed"] == {"beta": 0.75, "stream_speed": 100}
-    assert algo["model_seed"] == "none (deterministic)"
+    # how a seed reaches the model is the protocol's seed policy, never an algorithm's entry
+    assert algo["accepts_seed"] is False and "model_seed" not in algo
     (stream,) = m["streams"].values()
     assert stream["fold"] == "static_easy" and stream["data_seed"] == C.DATA_SEED
     assert stream["n_samples_cap"] == 900 and stream["content_sha256"] is None
@@ -115,7 +116,7 @@ def test_the_manifest_records_protocol_arms_algorithms_and_streams():
 
 def test_a_seeded_algorithm_records_that_the_job_seed_reaches_the_model():
     m = _built([_job(algo="CluStream")])
-    assert m["algorithms"]["CluStream"]["model_seed"] == "job seed"
+    assert m["algorithms"]["CluStream"]["accepts_seed"] is True and "model_seed" not in m["algorithms"]["CluStream"]
     assert m["algorithms"]["CluStream"]["start_overrides"] == {"sigma": 1.0}
 
 

@@ -45,7 +45,7 @@ from conf_pipeline import cost, variants as V  # noqa: E402
 PANEL_MD = r"""
 ## Bảng điều khiển
 
-Cell dưới chọn preset theo `OTB_EC_PRESET` (mặc định `full`) và thư mục kết quả theo `OTB_EC_OUT_DIR` (mặc định `conf_pipeline/out/ec_variants`). Preset `full` là thiết kế đã chốt: 8 thuật toán trên 12 luồng đã khóa, seed 1, 8 worker, giới hạn 24 giờ mỗi job. Lượt thứ nhất chạy sáu thuật toán rẻ cho mọi bộ, lượt thứ hai chạy CluStream và RepStream, nên kết quả đầu tiên có sau vài giờ. Preset `tiny` chỉ để kiểm tra đường ống trong vài phút, con số của nó không dùng để đọc kết quả.
+Cell dưới chọn preset theo `OTB_EC_PRESET` (mặc định `full`) và thư mục kết quả theo `OTB_EC_OUT_DIR` (mặc định `conf_pipeline/out/ec_variants`). Preset `full` là thiết kế đã chốt: 8 thuật toán trên 12 luồng đã khóa, tuner seed 101 và model seed 201, 8 worker, giới hạn 24 giờ mỗi job. Lượt thứ nhất chạy sáu thuật toán rẻ cho mọi bộ, lượt thứ hai chạy CluStream và RepStream, nên kết quả đầu tiên có sau vài giờ. Preset `tiny` chỉ để kiểm tra đường ống trong vài phút, con số của nó không dùng để đọc kết quả.
 
 `ORACLES` nhận `none`, `unconstrained`, `constrained` hoặc `both`; mỗi oracle tốn xấp xỉ một lần chạy `confstream`, nên `both` làm chi phí gần gấp ba. Các ngưỡng kết luận là giá trị tạm, đổi được ở đây. Một bộ được coi là giữ được chất lượng khi mức thay đổi trung bình không tệ hơn `-MAX_MEAN_LOSS` và không quá `MAX_SHARE_OVER_BAND` số cặp tụt quá `BAND`. `MIN_SPS` là tốc độ thấp nhất của cả bộ tune mà bài confStream gốc còn chấp nhận (CluStream trên powersupply, 15 mẫu mỗi giây).
 """

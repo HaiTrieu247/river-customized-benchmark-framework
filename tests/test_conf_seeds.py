@@ -52,7 +52,8 @@ def _members(path):
     return [json.loads(l) for l in Path(path).read_text().splitlines()]
 
 
-def test_the_same_tuner_seed_with_another_model_seed_draws_the_same_configurations(tmp_path):
+def test_the_same_tuner_seed_with_another_model_seed_draws_the_same_initial_population(tmp_path):
+    # Only the first window: from then on the scores (which the model seed changes) weight the draws.
     a = _run("STREAMKMeans", "confstream", seed=101, model_seed=201, calibration_seed=0, log=tmp_path / "a.jsonl")
     b = _run("STREAMKMeans", "confstream", seed=101, model_seed=202, calibration_seed=0, log=tmp_path / "b.jsonl")
     ma, mb = _members(tmp_path / "a.jsonl"), _members(tmp_path / "b.jsonl")

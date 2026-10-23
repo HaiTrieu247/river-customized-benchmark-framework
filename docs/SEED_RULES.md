@@ -23,13 +23,18 @@ schema 2), và từ chối mọi lệnh khác chính sách.
 | Seed | Cờ | Mặc định | Điều khiển | Không điều khiển |
 |---|---|---|---|---|
 | tuner seed | `run --tuner-seeds` | 101, 102, 103 | mọi lần rút của bộ tune: quần thể ban đầu, nạn nhân, cha, reset, đột biến | mô hình, dữ liệu, s |
-| model seed của arm online | `run --model-seed`, `sweep --model-seed` | 201, một giá trị cho mỗi out dir | `seed=` truyền vào constructor của mọi member, chỉ ở CluStream, HPStream, STREAMKMeans | bộ tune |
+| model seed của arm online | `run --model-seed`, `sweep --model-seed` | 201, một giá trị cho mỗi out dir | `seed=` truyền vào constructor của mọi member, chỉ ở CluStream, HPStream, STREAMKMeans | dòng số của bộ tune (xem chú thích dưới bảng) |
 | model seed của arm cố định | `run --fixed-model-seeds` | bằng `--model-seed` | các lần chạy lặp của `default`, `scaled_default`, `oracle_static` ở 3 thuật toán nhận seed | |
 | model seed của lượt quét | `sweep --model-seeds` | bằng `--model-seed` | các lần chạy lặp của mỗi điểm quét ở 3 thuật toán nhận seed | |
 | calibration seed | hằng `_common.CALIBRATION_SEED` | 0 | lấy mẫu con khi ước lượng s; giống nhau ở mọi arm và mọi seed | |
 | seed Sobol | `sweep --sobol-seed` | 1 | các điểm của thiết kế quét | lần chạy của từng điểm |
 | data seed | `--data-seed`, một giá trị cho mỗi out dir | 42 | nội dung luồng tổng hợp | luồng thật; mọi thứ khác |
 | seed phân tích | `robustness --boot-seed`; `label_reach` | 0 | bootstrap; chẩn đoán | mọi run |
+
+Chú thích về độc lập: model seed không rút từ dòng số của bộ tune, nên cùng tuner seed thì quần thể ban đầu
+giống hệt nhau. Nhưng bộ tune chọn nạn nhân và cha theo điểm của các member, mà điểm phụ thuộc đầu ra của mô
+hình, nên ở thuật toán nhận seed, đổi model seed vẫn đổi những cấu hình được rút từ cửa sổ thứ hai trở đi.
+Nguồn ngẫu nhiên tách nhau; quỹ đạo thì không.
 
 Ngoài seed, có hai thiết lập cố định cần cho tái lập: `PYTHONHASHSEED=0` và một luồng cho mỗi thư viện
 số. Cả hai được ép cho mọi tiến trình con. Hash seed cần vì KMeans của River phụ thuộc thứ tự băm
