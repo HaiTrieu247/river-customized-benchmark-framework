@@ -161,7 +161,8 @@ def test_the_ec_summary_says_per_setting_whether_it_keeps_the_quality_and_runs_f
 
 
 def test_a_setting_that_keeps_quality_and_runs_faster_reads_reducible():
-    pairs = pd.DataFrame([{"setting": "ec10_5", "algo": a, "fold": "covtype", "group": "real", "status": "ok",
+    pairs = pd.DataFrame([{"setting": "ec10_5", "arm": "confstream", "algo": a, "fold": "covtype", "group": "real",
+                           "status": "ok",
                            "tail": 0.3, "base_tail": 0.3, "d_tail": 0.0, "speedup_wall": 2.0, "speedup_model": 2.0,
                            "sps": 50.0, "base_sps": 25.0} for a in "ABC"])
     s = V.ec_summary(pairs)
@@ -193,3 +194,39 @@ def test_the_ec_run_cli_dry_run_lists_one_command_per_setting(tmp_path):
     assert proc.returncode == 0, proc.stderr
     lines = [l for l in proc.stdout.splitlines() if l.startswith("$")]
     assert len(lines) == 2 and all("--h 300" in l for l in lines) and "ec5_2" in lines[1]
+
+
+# --- E/C grid: the oracle tuners beside the online arm, by flag ---------------------------------------
+
+def test_the_oracle_flag_names_the_arms_each_setting_runs():
+    assert V.ec_arms("none") == ("confstream",)
+    assert V.ec_arms("unconstrained") == ("confstream", "confstream_ari_oracle")
+    assert V.ec_arms("constrained") == ("confstream", "confstream_ari_oracle_constrained")
+    assert V.ec_arms("both") == ("confstream", *C.DIAGNOSTIC_ARMS)
+    with pytest.raises(KeyError):
+        V.ec_arms("all")
+
+
+def test_the_ec_run_cli_passes_the_chosen_oracles_to_every_setting(tmp_path):
+    proc = subprocess.run([sys.executable, "-m", "conf_pipeline.variants", "ec-run", "--out-dir", str(tmp_path),
+                           "--algos", "DenStream", "--folds", "static_easy", "--grid", "ec20_10,ec5_2",
+                           "--oracles", "both", "--dry-run"], cwd=Path(__file__).resolve().parent.parent,
+                          capture_output=True, text=True)
+    assert proc.returncode == 0, proc.stderr
+    lines = [l for l in proc.stdout.splitlines() if l.startswith("$")]
+    assert len(lines) == 2
+    assert all("--arms confstream,confstream_ari_oracle,confstream_ari_oracle_constrained" in l for l in lines)
+
+
+def test_each_arm_is_read_against_the_base_of_the_same_arm(tmp_path):
+    root = _ec_dirs(tmp_path)
+    oracle = lambda tail, wall: {**_ec_row("A", "covtype", tail, wall, wall), "arm": "confstream_ari_oracle"}
+    for name, (tail, wall) in (("ec20_10", (0.50, 100.0)), ("ec10_5", (0.45, 50.0))):
+        with open(root / name / "runs.jsonl", "a") as f:
+            f.write(json.dumps(oracle(tail, wall)) + "\n")
+    pairs = V.ec_pairs(V.ec_runs(root))
+    row = pairs[(pairs.arm == "confstream_ari_oracle")].iloc[0]
+    assert row.d_tail == pytest.approx(-0.05) and row.speedup_wall == pytest.approx(2.0)
+    assert set(pairs.arm) == {"confstream", "confstream_ari_oracle"}
+    summary = V.ec_summary(pairs)
+    assert {("ec10_5", "confstream_ari_oracle"), ("ec10_5", "confstream")} <= set(zip(summary.setting, summary.arm))

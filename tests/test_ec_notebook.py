@@ -49,6 +49,16 @@ def test_the_full_preset_is_every_algorithm_on_the_locked_streams_with_one_seed_
     assert args[0] == "ec-run" and "--grid" in args and args[args.index("--workers") + 1] == "8"
 
 
+def test_the_notebook_runs_both_oracles_beside_the_online_arm_by_a_flag(tmp_path, monkeypatch):
+    from conf_pipeline import variants as V
+
+    for preset in ("full", "tiny"):
+        ns = _panel(preset, tmp_path, monkeypatch)
+        assert ns["ORACLES"] == "both" and ns["ARMS"] == V.ec_arms("both")
+        args = [str(a) for a in ns["RUN_ARGS_FIRST"]]
+        assert args[args.index("--oracles") + 1] == "both"
+
+
 def test_every_preset_leaves_a_tail(tmp_path, monkeypatch):
     for preset in ("full", "tiny"):
         ns = _panel(preset, tmp_path, monkeypatch)
@@ -70,4 +80,5 @@ def test_the_notebook_executes_in_tiny_mode(tmp_path, monkeypatch):
     NotebookClient(nb, timeout=900, kernel_name="python3", resources={"metadata": {"path": str(REPO)}}).execute()
     summary = pd.read_csv(tmp_path / "report" / "ec" / "summary.csv")
     assert set(summary["setting"]) == {"ec15_7", "ec10_5", "ec5_2", "ec20_5", "ec20_2"}
+    assert set(summary["arm"]) == {"confstream", "confstream_ari_oracle", "confstream_ari_oracle_constrained"}
     assert (tmp_path / "ec20_10" / "manifest.json").exists()

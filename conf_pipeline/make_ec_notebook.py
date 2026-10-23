@@ -32,7 +32,9 @@ Bộ tune online (`confstream`) giữ một ensemble gồm E cấu hình chạy 
 
 Sáu bộ E/C được chạy, mỗi bộ vào một thư mục riêng dưới `OUT_ROOT`. Bộ mốc `ec20_10` là giao thức hiện tại, chạy lại tại đây chứ không lấy từ `out/full`, vì `out/full` chạy với runtime gate còn mọi bộ ở đây chạy không gate. Ba bộ `ec15_7`, `ec10_5`, `ec5_2` thu nhỏ ensemble nhưng giữ tỉ lệ khoảng hai member một cấu hình thử. Hai bộ `ec20_5`, `ec20_2` giữ 20 member và chỉ giảm số cấu hình thử. Mọi thứ khác giữ nguyên: 12 luồng đã khóa cho pilot, mức cắt 100 000 mẫu, cửa sổ 1 000 mẫu, phần đuôi từ cửa sổ 20. Seed theo chính sách `split` (`docs/SEED_RULES.md`): bộ tune chạy một tuner seed (101), mô hình dùng model seed 201 ở mọi bộ, nên các bộ chỉ khác nhau ở ngân sách của ensemble.
 
-Mỗi bộ được so với bộ mốc trên cùng (thuật toán, luồng, seed). Chất lượng là tail ARI lagged. Tốc độ là tỉ lệ thời gian của bộ mốc so với bộ đó, đo theo wall time và theo thời gian chạy mô hình, cộng số mẫu mỗi giây của cả bộ tune. Chỉ có một seed, nên một chênh lệch nhỏ hơn độ dao động theo seed của bộ tune online (khoảng 0,005 đến 0,01 ARI trong `out/full`) chưa đọc được thành kết luận.
+Cờ `ORACLES` ở bảng điều khiển chọn có chạy thêm hai bộ tune chẩn đoán chọn theo nhãn (E4) hay không: `confstream_ari_oracle` chấm mọi member bằng ARI của cửa sổ vừa xong, còn `confstream_ari_oracle_constrained` làm như vậy nhưng giữ điều kiện của silhouette. Mặc định là `both`, chạy cả hai cạnh `confstream` trong mọi bộ, để thấy việc giảm ngân sách làm mất bao nhiêu ở một bộ tune có tín hiệu chọn hoàn hảo. `none` thì chỉ chạy `confstream`.
+
+Mỗi bộ được so với bộ mốc của chính arm đó, trên cùng (thuật toán, luồng, seed). Chất lượng là tail ARI lagged. Tốc độ là tỉ lệ thời gian của bộ mốc so với bộ đó, đo theo wall time và theo thời gian chạy mô hình, cộng số mẫu mỗi giây của cả bộ tune. Chỉ có một seed, nên một chênh lệch nhỏ hơn độ dao động theo seed của bộ tune online (khoảng 0,005 đến 0,01 ARI trong `out/full`) chưa đọc được thành kết luận.
 """
 
 SETUP = BASE_SETUP + r'''
@@ -45,7 +47,7 @@ PANEL_MD = r"""
 
 Cell dưới chọn preset theo `OTB_EC_PRESET` (mặc định `full`) và thư mục kết quả theo `OTB_EC_OUT_DIR` (mặc định `conf_pipeline/out/ec_variants`). Preset `full` là thiết kế đã chốt: 8 thuật toán trên 12 luồng đã khóa, seed 1, 8 worker, giới hạn 24 giờ mỗi job. Lượt thứ nhất chạy sáu thuật toán rẻ cho mọi bộ, lượt thứ hai chạy CluStream và RepStream, nên kết quả đầu tiên có sau vài giờ. Preset `tiny` chỉ để kiểm tra đường ống trong vài phút, con số của nó không dùng để đọc kết quả.
 
-Các ngưỡng kết luận là giá trị tạm, đổi được ở đây. Một bộ được coi là giữ được chất lượng khi mức thay đổi trung bình không tệ hơn `-MAX_MEAN_LOSS` và không quá `MAX_SHARE_OVER_BAND` số cặp tụt quá `BAND`. `MIN_SPS` là tốc độ thấp nhất của cả bộ tune mà bài confStream gốc còn chấp nhận (CluStream trên powersupply, 15 mẫu mỗi giây).
+`ORACLES` nhận `none`, `unconstrained`, `constrained` hoặc `both`; mỗi oracle tốn xấp xỉ một lần chạy `confstream`, nên `both` làm chi phí gần gấp ba. Các ngưỡng kết luận là giá trị tạm, đổi được ở đây. Một bộ được coi là giữ được chất lượng khi mức thay đổi trung bình không tệ hơn `-MAX_MEAN_LOSS` và không quá `MAX_SHARE_OVER_BAND` số cặp tụt quá `BAND`. `MIN_SPS` là tốc độ thấp nhất của cả bộ tune mà bài confStream gốc còn chấp nhận (CluStream trên powersupply, 15 mẫu mỗi giây).
 """
 
 PANEL = r"""
@@ -70,6 +72,8 @@ if PRESET not in PRESETS:
     raise SystemExit(f"OTB_EC_PRESET={PRESET!r}; presets: {sorted(PRESETS)}")
 globals().update(PRESETS[PRESET])
 GRID = list(V.EC_GRID)
+#: The oracle tuners run beside confstream in every setting: "none", "unconstrained", "constrained" or "both".
+ORACLES = "both"
 BAND = V.EC_BAND
 MAX_MEAN_LOSS = V.EC_MAX_MEAN_LOSS
 MAX_SHARE_OVER_BAND = V.EC_MAX_SHARE_OVER_BAND
@@ -83,18 +87,20 @@ RUN_SECOND = True
 
 # --- derived (nothing to edit below) ---
 OUT_ROOT.mkdir(parents=True, exist_ok=True)
+ARMS = V.ec_arms(ORACLES)
 
 
 def ec_args(algos):
     return ["ec-run", "--grid", ",".join(GRID), "--algos", ",".join(algos), "--folds", ",".join(FOLDS),
             "--tuner-seeds", ",".join(map(str, TUNER_SEEDS)), "--model-seed", MODEL_SEED, "--n-samples", N_SAMPLES, "--h", H,
-            "--freeze-after-window", FREEZE_AFTER_WINDOW, "--workers", WORKERS, "--timeout", TIMEOUT_S]
+            "--freeze-after-window", FREEZE_AFTER_WINDOW, "--workers", WORKERS, "--timeout", TIMEOUT_S,
+            "--oracles", ORACLES]
 
 
 RUN_ARGS_FIRST = ec_args(ALGOS_FIRST)
 RUN_ARGS_SECOND = ec_args(ALGOS_SECOND) if ALGOS_SECOND else None
 
-for name in ("PRESET", "OUT_ROOT", "GRID", "ALGOS_FIRST", "ALGOS_SECOND", "FOLDS", "TUNER_SEEDS", "MODEL_SEED", "N_SAMPLES", "H",
+for name in ("PRESET", "OUT_ROOT", "GRID", "ORACLES", "ARMS", "ALGOS_FIRST", "ALGOS_SECOND", "FOLDS", "TUNER_SEEDS", "MODEL_SEED", "N_SAMPLES", "H",
              "FREEZE_AFTER_WINDOW", "WORKERS", "TIMEOUT_S", "BAND", "MAX_MEAN_LOSS", "MAX_SHARE_OVER_BAND", "MIN_SPS",
              "RUN_FIRST", "RUN_SECOND"):
     print(f"{name:20s} = {globals()[name]}")
@@ -103,7 +109,7 @@ for name in ("PRESET", "OUT_ROOT", "GRID", "ALGOS_FIRST", "ALGOS_SECOND", "FOLDS
 DRY_RUN_MD = r"""
 ## Chạy thử và dự toán
 
-Cell dưới in các lệnh sẽ chạy (`--dry-run`, không job nào chạy thật), rồi dự toán chi phí của từng bộ từ chi phí đo được của `conf_pipeline/out/full`. Dự toán giả định chi phí tỉ lệ với số mô hình chạy mỗi cửa sổ, (E + C) / 30 của bộ mốc, nhân thêm `GATE_FREE_FACTOR` vì không gate thì các member chậm không bị loại. Đây là giả định, không phải số đo. Riêng CluStream, chạy thử trên máy này cho thấy không gate chậm hơn nhiều so với hệ số đó.
+Cell dưới in các lệnh sẽ chạy (`--dry-run`, không job nào chạy thật), rồi dự toán chi phí của từng bộ từ chi phí đo được của `conf_pipeline/out/full`. Dự toán giả định chi phí tỉ lệ với số mô hình chạy mỗi cửa sổ, (E + C) / 30 của bộ mốc, nhân thêm `GATE_FREE_FACTOR` vì không gate thì các member chậm không bị loại. Mỗi oracle được tính như một lần chạy `confstream`, vì nó chạy cùng số mô hình; đây cũng là giả định. Đây là giả định, không phải số đo. Riêng CluStream, chạy thử trên máy này cho thấy không gate chậm hơn nhiều so với hệ số đó.
 """
 
 DRY_RUN = r"""
@@ -120,7 +126,9 @@ if (SRC / "runs.jsonl").exists():
         for part, algos in (("lượt 1", ALGOS_FIRST), ("lượt 2", ALGOS_SECOND)):
             if not algos:
                 continue
-            s = cost.summarise(cost.plan(SRC, algos, FOLDS, ["confstream"], TUNER_SEEDS, N_SAMPLES, factor=factor), WORKERS)
+            jobs = cost.plan(SRC, algos, FOLDS, list(ARMS), TUNER_SEEDS, N_SAMPLES, factor=factor,
+                             proxy={arm: "confstream" for arm in ARMS if arm != "confstream"})
+            s = cost.summarise(jobs, WORKERS)
             rows.append({"setting": name, "lượt": part, "jobs": s["n_jobs"], "chưa đo": s["n_unknown"],
                          "CPU-h": round(s["cpu_h"], 1), f"giờ trên {WORKERS} worker": round(s["makespan_h"], 1)})
     est = pd.DataFrame(rows)
@@ -166,7 +174,7 @@ if runs.empty:
     print("Chưa có run nào.")
 else:
     show("Số job theo bộ và trạng thái", runs.groupby(["setting", "status"]).size().unstack(fill_value=0))
-cols = ["setting", "e_size", "e_test", "group", "n_pairs", "n_unfinished", "mean_base_tail", "mean_tail",
+cols = ["setting", "e_size", "e_test", "arm", "group", "n_pairs", "n_unfinished", "mean_base_tail", "mean_tail",
         "mean_d_tail", "min_d_tail", "share_loss_over_band", "tau_vs_base", "median_speedup_wall",
         "median_speedup_model", "median_sps", "share_sps_at_least_min", "verdict"]
 show("Kết luận cho từng bộ, mọi luồng", summary[summary["group"] == "all"] if len(summary) else summary, cols)
@@ -176,19 +184,19 @@ show("Theo nhóm luồng", summary[summary["group"] != "all"] if len(summary) el
 PER_ALGO_MD = r"""
 ## Theo thuật toán
 
-Hai bảng dưới cho từng thuật toán: mức thay đổi tail ARI trung bình qua các luồng, và mức tăng tốc trung vị theo wall time. Một bộ có thể giảm được cho thuật toán này mà không giảm được cho thuật toán khác. Hình cuối đặt mỗi (bộ, thuật toán) thành một điểm: trục ngang là mức tăng tốc, trục dọc là mức thay đổi chất lượng. Điểm càng ở góc phải trên càng tốt; đường gạch là `-MAX_MEAN_LOSS`, đường chấm là `-BAND`.
+Với mỗi arm đã chạy, hai bảng dưới cho từng thuật toán: mức thay đổi tail ARI trung bình qua các luồng, và mức tăng tốc trung vị theo wall time. Một bộ có thể giảm được cho thuật toán này mà không giảm được cho thuật toán khác. Hình của mỗi arm đặt mỗi (bộ, thuật toán) thành một điểm: trục ngang là mức tăng tốc, trục dọc là mức thay đổi chất lượng. Điểm càng ở góc phải trên càng tốt; đường gạch là `-MAX_MEAN_LOSS`, đường chấm là `-BAND`.
 """
 
 PER_ALGO = r"""
 done = pairs.dropna(subset=["d_tail"]) if len(pairs) else pairs
 if done.empty:
     print("Chưa có cặp nào chạy xong ở cả hai phía.")
-else:
-    show("Thay đổi tail ARI trung bình (thuật toán × bộ)",
-         done.pivot_table(index="algo", columns="setting", values="d_tail", aggfunc="mean").round(3))
-    show("Tăng tốc trung vị theo wall time (thuật toán × bộ)",
-         done.pivot_table(index="algo", columns="setting", values="speedup_wall", aggfunc="median").round(2))
-    per = done.groupby(["setting", "algo"]).agg(d=("d_tail", "mean"), speed=("speedup_wall", "median")).reset_index()
+for arm, by_arm in (done.groupby("arm", sort=False) if len(done) else []):
+    show(f"{arm}: thay đổi tail ARI trung bình (thuật toán × bộ)",
+         by_arm.pivot_table(index="algo", columns="setting", values="d_tail", aggfunc="mean").round(3))
+    show(f"{arm}: tăng tốc trung vị theo wall time (thuật toán × bộ)",
+         by_arm.pivot_table(index="algo", columns="setting", values="speedup_wall", aggfunc="median").round(2))
+    per = by_arm.groupby(["setting", "algo"]).agg(d=("d_tail", "mean"), speed=("speedup_wall", "median")).reset_index()
     fig, ax = plt.subplots(figsize=(7.5, 4.5))
     for setting, g in per.groupby("setting"):
         ax.scatter(g["speed"], g["d"], label=setting, s=36)
@@ -196,6 +204,7 @@ else:
     ax.axhline(-BAND, ls=":", lw=1, color="0.4")
     ax.axvline(1.0, lw=1, color="0.6")
     ax.set_xscale("log")
+    ax.set_title(arm)
     ax.set_xlabel("tăng tốc so với ec20_10 (wall time, trung vị)")
     ax.set_ylabel("thay đổi tail ARI so với ec20_10 (trung bình)")
     ax.legend(fontsize=8, ncol=2)

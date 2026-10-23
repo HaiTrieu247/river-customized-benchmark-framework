@@ -314,6 +314,19 @@ EC_GRID: dict[str, dict] = {
 }
 EC_BASE = "ec20_10"
 EC_ARMS: tuple[str, ...] = ("confstream",)
+#: ``--oracles``: the diagnostic tuners selecting by labels (E4) run beside the online arm in every
+#: setting, to see what a smaller ensemble costs a tuner with a perfect signal.
+EC_ORACLES: dict[str, tuple[str, ...]] = {
+    "none": (),
+    "unconstrained": ("confstream_ari_oracle",),
+    "constrained": ("confstream_ari_oracle_constrained",),
+    "both": C.DIAGNOSTIC_ARMS,
+}
+
+
+def ec_arms(oracles: str = "none") -> tuple[str, ...]:
+    """The arms every E/C setting runs: the online tuner, and the oracles ``oracles`` names."""
+    return EC_ARMS + EC_ORACLES[oracles]
 #: A gate-free base job of the slow algorithms can outlast the protocol's 6 h.
 EC_TIMEOUT_S = 24 * 3600
 #: Verdict thresholds (placeholders, all flags): the study's smallest effect of interest per pair, a
@@ -323,11 +336,11 @@ EC_BAND = C.MIN_CEILING_GAIN
 EC_MAX_MEAN_LOSS = 0.01
 EC_MAX_SHARE_OVER_BAND = 0.10
 EC_MIN_SPS = 15.0
-EC_RUN_COLS = ["setting", "e_size", "e_test", "algo", "fold", "seed", "status", "tail", "wall_s", "model_s",
+EC_RUN_COLS = ["setting", "e_size", "e_test", "arm", "algo", "fold", "seed", "status", "tail", "wall_s", "model_s",
                "n_samples", "sps", "incumbent_sps"]
-EC_PAIR_COLS = ["setting", "algo", "fold", "seed", "group", "status", "tail", "base_tail", "d_tail",
+EC_PAIR_COLS = ["setting", "arm", "algo", "fold", "seed", "group", "status", "tail", "base_tail", "d_tail",
                 "speedup_wall", "speedup_model", "sps", "base_sps"]
-EC_SUMMARY_COLS = ["setting", "e_size", "e_test", "group", "n_pairs", "n_unfinished", "mean_tail", "mean_base_tail",
+EC_SUMMARY_COLS = ["setting", "e_size", "e_test", "arm", "group", "n_pairs", "n_unfinished", "mean_tail", "mean_base_tail",
                    "mean_d_tail", "min_d_tail", "share_loss_over_band", "tau_vs_base", "median_speedup_wall",
                    "median_speedup_model", "median_sps", "share_sps_at_least_min", "keeps_quality", "faster",
                    "verdict"]
@@ -365,21 +378,23 @@ def run_ec(names, out_dir: Path, dry_run: bool = False, **kw) -> None:
 
 
 def ec_runs(out_dir: Path, names=None) -> pd.DataFrame:
-    """One row per (setting, algo, fold, seed) of the online arm: its status, tail ARI and costs."""
+    """One row per (setting, arm, algo, fold, seed) of the online arm and of the oracle arms run beside it
+    (read on purpose: the default readers leave the diagnostic arms out): status, tail ARI and costs."""
     rows = []
     for name in (list(EC_GRID) if names is None else list(names)):
         d = Path(out_dir) / name
         if not (d / "runs.jsonl").exists():
             continue
-        runs = report.current_runs(d)
+        runs = report.current_runs(d, diagnostic=True)
         if runs.empty:
             continue
-        runs = runs[runs["arm"].isin(list(EC_ARMS))]
+        runs = runs[runs["arm"].isin(list(EC_ARMS) + list(C.DIAGNOSTIC_ARMS))]
         for r in runs.to_dict("records"):
             ok = r.get("status") == "ok"
             wall = r.get("wall_s") if ok else None
             n = r.get("n_samples") if ok else None
-            rows.append({"setting": name, **EC_GRID[name], "algo": r["algo"], "fold": r["fold"], "seed": r["seed"],
+            rows.append({"setting": name, **EC_GRID[name], "arm": r["arm"], "algo": r["algo"], "fold": r["fold"],
+                         "seed": r["seed"],
                          "status": r.get("status"), "tail": report._num(r.get(report.TAIL)) if ok else None,
                          "wall_s": wall, "model_s": r.get("ensemble_runtime_s") if ok else None, "n_samples": n,
                          "sps": (n / wall) if ok and wall else None,
@@ -393,16 +408,16 @@ def _ratio(a, b):
 
 
 def ec_pairs(runs: pd.DataFrame, base: str = EC_BASE) -> pd.DataFrame:
-    """Every setting but ``base`` paired with ``base`` on the same (algo, fold, seed): the change in tail ARI
+    """Every setting but ``base`` paired with ``base`` on the same (arm, algo, fold, seed): the change in tail ARI
     and the speed-up (base time over the setting's). A pair whose setting did not finish keeps its status and
     reads no change; one whose base did not finish reads ``base: <status>``."""
     if runs.empty:
         return pd.DataFrame(columns=EC_PAIR_COLS)
-    key = ["algo", "fold", "seed"]
+    key = ["arm", "algo", "fold", "seed"]
     b = runs[runs["setting"] == base].set_index(key)
     rows = []
     for r in runs[runs["setting"] != base].to_dict("records"):
-        k = (r["algo"], r["fold"], r["seed"])
+        k = (r["arm"], r["algo"], r["fold"], r["seed"])
         br = b.loc[k].to_dict() if k in b.index else None
         if br is None or br["status"] != "ok":
             status = f"base: {br['status'] if br else 'missing'}"
@@ -413,7 +428,8 @@ def ec_pairs(runs: pd.DataFrame, base: str = EC_BASE) -> pd.DataFrame:
             group = C.stream_group(r["fold"])
         except ValueError:
             group = "unassigned"
-        rows.append({"setting": r["setting"], "algo": r["algo"], "fold": r["fold"], "seed": r["seed"], "group": group,
+        rows.append({"setting": r["setting"], "arm": r["arm"], "algo": r["algo"], "fold": r["fold"], "seed": r["seed"],
+                     "group": group,
                      "status": status, "tail": r["tail"], "base_tail": br["tail"] if br else None,
                      "d_tail": (r["tail"] - br["tail"]) if done and r["tail"] is not None and br["tail"] is not None
                      else None,
@@ -450,7 +466,7 @@ def ec_summary(pairs: pd.DataFrame, band: float = EC_BAND, max_mean_loss: float 
     rows = []
     if pairs.empty:
         return pd.DataFrame(columns=EC_SUMMARY_COLS)
-    for setting, by_setting in pairs.groupby("setting", sort=False):
+    for (setting, arm), by_setting in pairs.groupby(["setting", "arm"], sort=False):
         groups = [g for g in (*C.STREAM_GROUPS, "unassigned") if g in set(by_setting["group"])]
         for group in (*groups, "all"):
             sub = by_setting if group == "all" else by_setting[by_setting["group"] == group]
@@ -463,7 +479,7 @@ def ec_summary(pairs: pd.DataFrame, band: float = EC_BAND, max_mean_loss: float 
                        else "quality drops" if not keeps else "no speed-up")
             c = EC_GRID.get(setting, {})
             rows.append({
-                "setting": setting, "e_size": c.get("e_size"), "e_test": c.get("e_test"), "group": group,
+                "setting": setting, "e_size": c.get("e_size"), "e_test": c.get("e_test"), "arm": arm, "group": group,
                 "n_pairs": int(len(done)), "n_unfinished": int(len(sub) - len(done)),
                 "mean_tail": float(done["tail"].mean()) if len(done) else np.nan,
                 "mean_base_tail": float(done["base_tail"].mean()) if len(done) else np.nan,
@@ -494,11 +510,12 @@ def write_ec(out_dir: Path, names=None, base: str = EC_BASE, **thresholds) -> li
     summary.to_csv(paths[2], index=False)
     t = {"band": EC_BAND, "max_mean_loss": EC_MAX_MEAN_LOSS, "max_share_over_band": EC_MAX_SHARE_OVER_BAND,
          "min_sps": EC_MIN_SPS, **thresholds}
-    status = runs.groupby(["setting", "status"]).size().unstack(fill_value=0).reset_index() if len(runs) else runs
+    status = (runs.groupby(["setting", "arm", "status"]).size().unstack(fill_value=0).reset_index()
+              if len(runs) else runs)
     lines = [
         "# Can the online tuner run with fewer members and challengers?", "",
-        f"Read from `{out_dir}`: the online arm under every E/C setting found there, each paired with `{base}` "
-        "on the same (algo, fold, seed), all gate-free. `d_tail` is the setting's tail ARI minus the base's; "
+        f"Read from `{out_dir}`: the online arm, and the oracle arms when they ran, under every E/C setting found "
+        f"there, each paired with `{base}` of the same arm on the same (algo, fold, seed), all gate-free. `d_tail` is the setting's tail ARI minus the base's; "
         "`speedup_*` the base's time over the setting's (above 1 is faster), in wall time and in the members' "
         "model time; `sps` samples per second of the whole tuner. A pair that did not finish on either side is "
         "counted (`n_unfinished`) and never read as a change. "
@@ -536,6 +553,8 @@ def main() -> None:
                              f"read their base, {EC_BASE}, from --out-dir)")
     parser.add_argument("--grid", default="all", help=f"E/C settings, comma-separated from {list(EC_GRID)}, or all")
     parser.add_argument("--timeout", type=int, default=EC_TIMEOUT_S, help="ec-run: seconds per job")
+    parser.add_argument("--oracles", default="none", choices=list(EC_ORACLES),
+                        help="ec-run: the oracle tuners (selecting by labels) to run beside the online arm")
     parser.add_argument("--tuner-seeds", default=str(C.TUNER_SEEDS[0]), help="ec-run: the tuner seeds (split policy)")
     parser.add_argument("--model-seed", type=int, default=C.MODEL_SEED, help="ec-run: the models' seed (split policy)")
     parser.add_argument("--h", type=int, default=C.H, help="ec-run: the window")
@@ -571,6 +590,7 @@ def main() -> None:
         if args.action == "ec-run":
             run_ec(grid, out, dry_run=args.dry_run, algos=_csv(args.algos), folds=_csv(args.folds),
                    tuner_seeds=[int(s) for s in _csv(args.tuner_seeds)], model_seed=args.model_seed,
+                   arms=ec_arms(args.oracles),
                    workers=args.workers, timeout=args.timeout,
                    n_samples=args.n_samples or None, log_members=args.log_members, h=args.h,
                    freeze_after_window=args.freeze_after_window)
