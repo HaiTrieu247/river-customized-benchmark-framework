@@ -82,3 +82,32 @@ def test_the_notebook_executes_in_tiny_mode(tmp_path, monkeypatch):
     assert set(summary["setting"]) == {"ec15_7", "ec10_5", "ec5_2", "ec20_5", "ec20_2"}
     assert set(summary["arm"]) == {"confstream", "confstream_ari_oracle", "confstream_ari_oracle_constrained"}
     assert (tmp_path / "ec20_10" / "manifest.json").exists()
+
+
+def test_each_machine_runs_the_passes_its_environment_names(tmp_path, monkeypatch):
+    monkeypatch.delenv("OTB_EC_PARTS", raising=False)
+    monkeypatch.delenv("OTB_EC_MERGE_FROM", raising=False)
+    ns = _panel("full", tmp_path, monkeypatch)
+    assert ns["RUN_FIRST"] and ns["RUN_SECOND"] and ns["MERGE_FROM"] == []
+    for parts, first, second in (("first", True, False), ("second", False, True)):
+        monkeypatch.setenv("OTB_EC_PARTS", parts)
+        ns = _panel("full", tmp_path, monkeypatch)
+        assert (ns["RUN_FIRST"], ns["RUN_SECOND"]) == (first, second)
+    monkeypatch.setenv("OTB_EC_PARTS", "third")
+    with pytest.raises(SystemExit):
+        _panel("full", tmp_path, monkeypatch)
+
+
+def test_the_result_cell_reads_the_out_dirs_copied_from_another_machine(tmp_path, monkeypatch):
+    from conf_pipeline import make_ec_notebook
+    from conf_pipeline import variants as V
+    from tests.test_conf_variants import _two_machines
+
+    a, b = _two_machines(tmp_path)
+    monkeypatch.setenv("OTB_EC_MERGE_FROM", os.pathsep.join([str(b), str(tmp_path / "c")]))
+    ns = _panel("full", a, monkeypatch)
+    assert ns["MERGE_FROM"] == [b, tmp_path / "c"]
+    ns["MERGE_FROM"] = [b]
+    ns.update(V=V, pd=pd, show=lambda *args, **kw: None)
+    exec(make_ec_notebook.COMPARE, ns)
+    assert set(ns["runs"]["algo"]) == {"A", "B"}

@@ -230,3 +230,89 @@ def test_each_arm_is_read_against_the_base_of_the_same_arm(tmp_path):
     assert set(pairs.arm) == {"confstream", "confstream_ari_oracle"}
     summary = V.ec_summary(pairs)
     assert {("ec10_5", "confstream_ari_oracle"), ("ec10_5", "confstream")} <= set(zip(summary.setting, summary.arm))
+
+
+# --- E/C grid on two machines: each writes its own out dir, the reading takes both -------------------
+
+def _stamped(algo, fold, tail, wall, **extra):
+    return {**_ec_row(algo, fold, tail, wall, wall), "code_sha256": "code1", "protocol_fingerprint": "proto1",
+            "stream_sha256": f"sha-{fold}", **extra}
+
+
+def _two_machines(tmp_path, **b_extra):
+    """Machine a ran algorithm A and machine b algorithm B, each in every setting, into its own out dir;
+    ``b_extra`` overrides fields of every row machine b wrote."""
+    a, b = tmp_path / "a", tmp_path / "b"
+    for root, algo, extra in ((a, "A", {}), (b, "B", b_extra)):
+        for name, (tail, wall) in (("ec20_10", (0.30, 100.0)), ("ec10_5", (0.25, 40.0))):
+            _jsonl(root / name / "runs.jsonl",
+                   [_stamped(algo, fold, tail, wall, **extra) for fold in ("covtype", "scale_drift")])
+            _jsonl(root / name / "environment.jsonl", [{"cpu_model": f"CPU-{root.name}", "os": "TestOS 1"}])
+    return a, b
+
+
+def test_the_ec_reading_takes_each_machines_algorithms_from_its_own_out_dir(tmp_path):
+    a, b = _two_machines(tmp_path)
+    runs = V.ec_runs(a, also=[b])
+    assert set(zip(runs.algo, runs.source)) == {("A", str(a)), ("B", str(b))}
+    pairs = V.ec_pairs(runs)
+    assert sorted(pairs.algo) == ["A", "A", "B", "B"]
+    assert pairs.d_tail.tolist() == pytest.approx([-0.05] * 4)
+    assert pairs.speedup_wall.tolist() == pytest.approx([2.5] * 4)
+    assert set(zip(pairs.algo, pairs.source)) == {("A", str(a)), ("B", str(b))}
+
+
+def test_an_algorithm_with_runs_on_both_machines_is_refused(tmp_path):
+    a, b = _two_machines(tmp_path)
+    with open(b / "ec10_5" / "runs.jsonl", "a") as f:
+        f.write(json.dumps(_stamped("A", "covtype", 0.25, 40.0)) + "\n")
+    with pytest.raises(SystemExit, match="algorithm A has runs in more than one out dir"):
+        V.ec_runs(a, also=[b])
+
+
+def test_machines_under_other_protocols_are_refused(tmp_path):
+    a, b = _two_machines(tmp_path, protocol_fingerprint="proto2")
+    with pytest.raises(SystemExit, match="setting ec20_10 ran under other protocols"):
+        V.ec_runs(a, also=[b], allow_code_change=True)
+
+
+def test_machines_that_read_other_stream_content_are_refused(tmp_path):
+    a, b = _two_machines(tmp_path, stream_sha256="sha-other")
+    with pytest.raises(SystemExit, match="stream covtype was read with other content"):
+        V.ec_runs(a, also=[b], allow_code_change=True)
+
+
+def test_machines_that_ran_other_code_are_refused_unless_the_change_is_allowed(tmp_path):
+    a, b = _two_machines(tmp_path, code_sha256="code2")
+    with pytest.raises(SystemExit, match="other code"):
+        V.ec_runs(a, also=[b])
+    assert set(V.ec_runs(a, also=[b], allow_code_change=True).algo) == {"A", "B"}
+    md = V.write_ec(a, also=[b], allow_code_change=True)[3].read_text()
+    assert "--allow-code-change" in md and "code1" in md and "code2" in md
+
+
+def test_one_out_dir_is_read_without_the_checks_across_machines(tmp_path):
+    a, _ = _two_machines(tmp_path)
+    with open(a / "ec10_5" / "runs.jsonl", "a") as f:
+        f.write(json.dumps(_stamped("C", "covtype", 0.25, 40.0, code_sha256="code9")) + "\n")
+    assert set(V.ec_runs(a).algo) == {"A", "C"}
+
+
+def test_the_ec_report_names_every_out_dir_with_its_machine(tmp_path):
+    a, b = _two_machines(tmp_path)
+    sources = V.ec_sources(V.ec_runs(a, also=[b]))
+    assert sources.set_index("source").loc[str(b), "algos"] == "B"
+    assert sources.set_index("source").loc[str(b), "machine"] == "CPU-b, TestOS 1"
+    md = V.write_ec(a, also=[b])[3].read_text()
+    assert str(b) in md and "CPU-a, TestOS 1" in md and "CPU-b, TestOS 1" in md
+
+
+def test_the_ec_compare_cli_reads_the_out_dirs_of_other_machines(tmp_path):
+    a, b = _two_machines(tmp_path, code_sha256="code2")
+    cmd = [sys.executable, "-m", "conf_pipeline.variants", "ec-compare", "--out-dir", str(a), "--also-from", str(b)]
+    repo = Path(__file__).resolve().parent.parent
+    refused = subprocess.run(cmd, cwd=repo, capture_output=True, text=True)
+    assert refused.returncode != 0 and "other code" in refused.stderr
+    proc = subprocess.run([*cmd, "--allow-code-change"], cwd=repo, capture_output=True, text=True)
+    assert proc.returncode == 0, proc.stderr
+    assert set(pd.read_csv(a / "report" / "ec" / "runs.csv").algo) == {"A", "B"}

@@ -42,6 +42,15 @@ per second of the whole tuner, and a verdict under thresholds that are flags (pl
 
     python -m conf_pipeline.variants ec-run --out-dir conf_pipeline/out/ec_variants --workers 8
     python -m conf_pipeline.variants ec-compare --out-dir conf_pipeline/out/ec_variants
+
+The settings may run on several machines, each algorithm whole on one of them (every setting and the
+base), each machine into its own out dir. Copy the others' out dirs beside this one and read them
+together with ``--also-from``: the reading refuses an algorithm found in two out dirs (its speed-ups
+would divide one machine's time by another's), a setting run under two protocols, a stream read with
+two contents, and, unless ``--allow-code-change``, out dirs made by other code::
+
+    python -m conf_pipeline.variants ec-compare --out-dir conf_pipeline/out/ec_variants \
+        --also-from conf_pipeline/out/ec_variants_b
 """
 
 from __future__ import annotations
@@ -337,9 +346,11 @@ EC_MAX_MEAN_LOSS = 0.01
 EC_MAX_SHARE_OVER_BAND = 0.10
 EC_MIN_SPS = 15.0
 EC_RUN_COLS = ["setting", "e_size", "e_test", "arm", "algo", "fold", "seed", "status", "tail", "wall_s", "model_s",
-               "n_samples", "sps", "incumbent_sps"]
+               "n_samples", "sps", "incumbent_sps", "source", "code_sha256", "protocol_fingerprint", "stream_sha256"]
 EC_PAIR_COLS = ["setting", "arm", "algo", "fold", "seed", "group", "status", "tail", "base_tail", "d_tail",
-                "speedup_wall", "speedup_model", "sps", "base_sps"]
+                "speedup_wall", "speedup_model", "sps", "base_sps", "source"]
+EC_SOURCE_COLS = ["source", "algos", "settings", "runs", "machine", "python", "river", "code_sha256",
+                  "packages_sha256"]
 EC_SUMMARY_COLS = ["setting", "e_size", "e_test", "arm", "group", "n_pairs", "n_unfinished", "mean_tail", "mean_base_tail",
                    "mean_d_tail", "min_d_tail", "share_loss_over_band", "tau_vs_base", "median_speedup_wall",
                    "median_speedup_model", "median_sps", "share_sps_at_least_min", "keeps_quality", "faster",
@@ -377,29 +388,120 @@ def run_ec(names, out_dir: Path, dry_run: bool = False, **kw) -> None:
             raise SystemExit(f"setting {name}: conf_pipeline.run exited with {proc.returncode}")
 
 
-def ec_runs(out_dir: Path, names=None) -> pd.DataFrame:
+def ec_runs(out_dir: Path, names=None, also=(), allow_code_change: bool = False) -> pd.DataFrame:
     """One row per (setting, arm, algo, fold, seed) of the online arm and of the oracle arms run beside it
-    (read on purpose: the default readers leave the diagnostic arms out): status, tail ARI and costs."""
+    (read on purpose: the default readers leave the diagnostic arms out): status, tail ARI and costs, and
+    the out dir it came from (``source``). ``also`` names out dirs other machines wrote, read beside
+    ``out_dir`` once ``check_sources`` lets them be read as one study."""
     rows = []
-    for name in (list(EC_GRID) if names is None else list(names)):
-        d = Path(out_dir) / name
-        if not (d / "runs.jsonl").exists():
-            continue
-        runs = report.current_runs(d, diagnostic=True)
-        if runs.empty:
-            continue
-        runs = runs[runs["arm"].isin(list(EC_ARMS) + list(C.DIAGNOSTIC_ARMS))]
-        for r in runs.to_dict("records"):
-            ok = r.get("status") == "ok"
-            wall = r.get("wall_s") if ok else None
-            n = r.get("n_samples") if ok else None
-            rows.append({"setting": name, **EC_GRID[name], "arm": r["arm"], "algo": r["algo"], "fold": r["fold"],
-                         "seed": r["seed"],
-                         "status": r.get("status"), "tail": report._num(r.get(report.TAIL)) if ok else None,
-                         "wall_s": wall, "model_s": r.get("ensemble_runtime_s") if ok else None, "n_samples": n,
-                         "sps": (n / wall) if ok and wall else None,
-                         "incumbent_sps": r.get("incumbent_throughput_sps") if ok else None})
-    return pd.DataFrame(rows, columns=EC_RUN_COLS)
+    for root in (Path(out_dir), *map(Path, also)):
+        for name in (list(EC_GRID) if names is None else list(names)):
+            d = root / name
+            if not (d / "runs.jsonl").exists():
+                continue
+            runs = report.current_runs(d, diagnostic=True)
+            if runs.empty:
+                continue
+            runs = runs[runs["arm"].isin(list(EC_ARMS) + list(C.DIAGNOSTIC_ARMS))]
+            for r in runs.to_dict("records"):
+                ok = r.get("status") == "ok"
+                wall = r.get("wall_s") if ok else None
+                n = r.get("n_samples") if ok else None
+                rows.append({"setting": name, **EC_GRID[name], "arm": r["arm"], "algo": r["algo"], "fold": r["fold"],
+                             "seed": r["seed"],
+                             "status": r.get("status"), "tail": report._num(r.get(report.TAIL)) if ok else None,
+                             "wall_s": wall, "model_s": r.get("ensemble_runtime_s") if ok else None, "n_samples": n,
+                             "sps": (n / wall) if ok and wall else None,
+                             "incumbent_sps": r.get("incumbent_throughput_sps") if ok else None,
+                             "source": str(root), "code_sha256": _text(r.get("code_sha256")),
+                             "protocol_fingerprint": _text(r.get("protocol_fingerprint")),
+                             "stream_sha256": _text(r.get("stream_sha256")) if ok else None})
+    runs = pd.DataFrame(rows, columns=EC_RUN_COLS)
+    if also:
+        check_sources(runs, allow_code_change)
+    return runs
+
+
+def _text(v):
+    """A hash as read from a row: None when absent (None or NaN alike)."""
+    return None if v is None or (isinstance(v, float) and v != v) else str(v)
+
+
+def _by_source(runs: pd.DataFrame, col: str) -> dict[str, list[str]]:
+    """The distinct values of ``col`` per out dir, absent ones left out."""
+    return {s: sorted({v for v in g[col] if _text(v) is not None}) for s, g in runs.groupby("source", sort=False)}
+
+
+def _differ(per_source: dict[str, list[str]]) -> bool:
+    return len({tuple(v) for v in per_source.values() if v}) > 1
+
+
+def _listed(per_source: dict[str, list[str]]) -> str:
+    return "; ".join(f"{s}: {', '.join(v) or '-'}" for s, v in per_source.items())
+
+
+def check_sources(runs: pd.DataFrame, allow_code_change: bool = False) -> list[str]:
+    """Whether the runs of several out dirs (one per machine) may be read as one study. Raises
+    ``SystemExit`` naming every conflict; returns the code each out dir ran when the code differs and
+    ``allow_code_change`` accepts it (empty otherwise).
+
+    - Every algorithm comes from one out dir. A setting is paired with the base on one machine then, so
+      no speed-up divides one machine's time by another's.
+    - Every setting ran under one protocol (``protocol_fingerprint``: the window, cap, tail start, seed
+      policy and the module constants) and every stream was read with one content (``stream_sha256``).
+    - Every out dir ran the same code (``code_sha256``: the framework's and River's Python files), unless
+      ``allow_code_change``.
+    """
+    if runs["source"].nunique() < 2:
+        return []
+    conflicts = [f"algorithm {algo} has runs in more than one out dir: {', '.join(sorted(set(g['source'])))}"
+                 for algo, g in runs.groupby("algo", sort=True) if g["source"].nunique() > 1]
+    for setting, g in runs.groupby("setting", sort=False):
+        seen = _by_source(g, "protocol_fingerprint")
+        if _differ(seen):
+            conflicts.append(f"setting {setting} ran under other protocols: {_listed(seen)}")
+    ok = runs[runs["status"] == "ok"]
+    for fold, g in ok.groupby("fold", sort=True):
+        if g["stream_sha256"].dropna().nunique() > 1:
+            conflicts.append(f"stream {fold} was read with other content: {_listed(_by_source(g, 'stream_sha256'))}")
+    if conflicts:
+        raise SystemExit("these out dirs cannot be read as one study:\n  " + "\n  ".join(conflicts)
+                         + "\nRun each algorithm whole on one machine, under the same command and data.")
+    code = _by_source(runs, "code_sha256")
+    if not _differ(code):
+        return []
+    if not allow_code_change:
+        raise SystemExit("these out dirs were made by other code (code_sha256, the framework's and River's "
+                         f"Python files): {_listed(code)}\nSync the code on every machine before it runs, or "
+                         "pass --allow-code-change to read them together; the report then says so.")
+    return [f"{s}: {', '.join(v) or '-'}" for s, v in code.items()]
+
+
+def ec_sources(runs: pd.DataFrame) -> pd.DataFrame:
+    """One row per out dir the runs came from: what ran there, and on which machine and code, as its
+    environment records (``environment.jsonl``) and manifests say."""
+    from . import manifest as M
+
+    def joined(values) -> str | None:
+        return ", ".join(sorted({t for t in map(_text, values) if t})) or None
+
+    rows = []
+    for source, g in (runs.groupby("source", sort=False) if len(runs) else []):
+        envs, packages = [], []
+        for setting in dict.fromkeys(g["setting"]):
+            d = Path(source) / setting
+            envs += list(C.read_jsonl(d / C.ENVIRONMENT_JSONL.name))
+            m = M.load(d)
+            if m:
+                packages.append((m.get("code") or {}).get("packages_sha256"))
+        rows.append({
+            "source": source, "algos": joined(g["algo"]), "settings": int(g["setting"].nunique()), "runs": len(g),
+            "machine": joined(", ".join(str(x) for x in (e.get("cpu_model") or e.get("processor") or e.get("machine"),
+                                                         e.get("os")) if x) for e in envs),
+            "python": joined(e.get("python") for e in envs), "river": joined(e.get("river_version") for e in envs),
+            "code_sha256": joined(g["code_sha256"]), "packages_sha256": joined(packages),
+        })
+    return pd.DataFrame(rows, columns=EC_SOURCE_COLS)
 
 
 def _ratio(a, b):
@@ -435,7 +537,7 @@ def ec_pairs(runs: pd.DataFrame, base: str = EC_BASE) -> pd.DataFrame:
                      else None,
                      "speedup_wall": _ratio(br["wall_s"], r["wall_s"]) if done else None,
                      "speedup_model": _ratio(br["model_s"], r["model_s"]) if done else None,
-                     "sps": r["sps"], "base_sps": br["sps"] if br else None})
+                     "sps": r["sps"], "base_sps": br["sps"] if br else None, "source": r["source"]})
     return pd.DataFrame(rows, columns=EC_PAIR_COLS)
 
 
@@ -496,10 +598,15 @@ def ec_summary(pairs: pd.DataFrame, band: float = EC_BAND, max_mean_loss: float 
     return pd.DataFrame(rows, columns=EC_SUMMARY_COLS)
 
 
-def write_ec(out_dir: Path, names=None, base: str = EC_BASE, **thresholds) -> list[Path]:
+def write_ec(out_dir: Path, names=None, base: str = EC_BASE, also=(), allow_code_change: bool = False,
+             **thresholds) -> list[Path]:
+    """The E/C report into ``<out_dir>/report/ec``, reading ``out_dir`` and the out dirs ``also`` names
+    (other machines', see ``ec_runs``)."""
     from . import analyze
 
-    runs = ec_runs(out_dir, names)
+    runs = ec_runs(out_dir, names, also, allow_code_change)
+    code_changes = check_sources(runs, allow_code_change) if also else []
+    sources = ec_sources(runs)
     pairs = ec_pairs(runs, base)
     summary = ec_summary(pairs, **thresholds)
     rep = Path(out_dir) / C.REPORT_DIR.name / "ec"
@@ -523,6 +630,13 @@ def write_ec(out_dir: Path, names=None, base: str = EC_BASE, **thresholds) -> li
         f"-{t['max_mean_loss']:g} and at most {t['max_share_over_band']:.0%} of its pairs lose more than "
         f"{t['band']:g}; the paper's slowest whole-tuner rate was {t['min_sps']:g} samples/s. One seed: changes "
         "smaller than the online tuner's seed noise (about 0.005-0.01 on the full run) are not read.", "",
+        "## Where the runs came from", "",
+        analyze._md_table(sources) if len(sources) else "_(no runs yet)_", "",
+        *([f"The runs come from {len(sources)} out dirs. Each algorithm comes from one of them, so every speed-up "
+           "divides two times taken on one machine; `sps` and `share_sps_at_least_min` mix machines.", ""]
+          if len(sources) > 1 else []),
+        *(["The out dirs were made by other code, read together under `--allow-code-change`: "
+           + "; ".join(code_changes) + ".", ""] if code_changes else []),
         "## Jobs by status", "", analyze._md_table(status) if len(status) else "_(no runs yet)_", "",
         "## Verdict per setting and stream group", "",
         analyze._md_table(summary, 3) if len(summary) else "_(nothing to compare yet)_", "",
@@ -564,6 +678,10 @@ def main() -> None:
     parser.add_argument("--max-mean-loss", type=float, default=EC_MAX_MEAN_LOSS)
     parser.add_argument("--max-share-over-band", type=float, default=EC_MAX_SHARE_OVER_BAND)
     parser.add_argument("--min-sps", type=float, default=EC_MIN_SPS)
+    parser.add_argument("--also-from", default="",
+                        help="ec-compare: out dirs other machines wrote (comma-separated), read beside --out-dir")
+    parser.add_argument("--allow-code-change", action="store_true",
+                        help="ec-compare: read out dirs made by other code together (the report says so)")
     parser.add_argument("--variants", default="all", help=f"comma-separated, from {list(VARIANTS)}, or all")
     parser.add_argument("--algos", default=",".join(VARIANT_ALGOS))
     parser.add_argument("--folds", default=",".join(C.FOLDS))
@@ -595,7 +713,8 @@ def main() -> None:
                    n_samples=args.n_samples or None, log_members=args.log_members, h=args.h,
                    freeze_after_window=args.freeze_after_window)
             return
-        for p in write_ec(out, grid, band=args.band, max_mean_loss=args.max_mean_loss,
+        for p in write_ec(out, grid, also=_csv(args.also_from) or (), allow_code_change=args.allow_code_change,
+                          band=args.band, max_mean_loss=args.max_mean_loss,
                           max_share_over_band=args.max_share_over_band, min_sps=args.min_sps):
             print(p)
         return

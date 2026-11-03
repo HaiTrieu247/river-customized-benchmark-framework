@@ -48,6 +48,8 @@ PANEL_MD = r"""
 Cell dưới chọn preset theo `OTB_EC_PRESET` (mặc định `full`) và thư mục kết quả theo `OTB_EC_OUT_DIR` (mặc định `conf_pipeline/out/ec_variants`). Preset `full` là thiết kế đã chốt: 8 thuật toán trên 12 luồng đã khóa, tuner seed 101 và model seed 201, 8 worker, giới hạn 24 giờ mỗi job. Lượt thứ nhất chạy sáu thuật toán rẻ cho mọi bộ, lượt thứ hai chạy CluStream và RepStream, nên kết quả đầu tiên có sau vài giờ. Preset `tiny` chỉ để kiểm tra đường ống trong vài phút, con số của nó không dùng để đọc kết quả.
 
 `ORACLES` nhận `none`, `unconstrained`, `constrained` hoặc `both`; mỗi oracle tốn xấp xỉ một lần chạy `confstream`, nên `both` làm chi phí gần gấp ba. Các ngưỡng kết luận là giá trị tạm, đổi được ở đây. Một bộ được coi là giữ được chất lượng khi mức thay đổi trung bình không tệ hơn `-MAX_MEAN_LOSS` và không quá `MAX_SHARE_OVER_BAND` số cặp tụt quá `BAND`. `MIN_SPS` là tốc độ thấp nhất của cả bộ tune mà bài confStream gốc còn chấp nhận (CluStream trên powersupply, 15 mẫu mỗi giây).
+
+Hai lượt chạy được trên hai máy khác nhau. Biến môi trường `OTB_EC_PARTS` chọn lượt mà máy này chạy: `both` (mặc định), `first` hoặc `second`. Mỗi thuật toán phải chạy trọn trên một máy, cả bộ mốc lẫn các bộ còn lại, để mọi tỉ lệ tăng tốc là thương của hai thời gian đo trên cùng một máy. Hai máy phải chạy cùng code của framework và River (cùng commit, không có thay đổi chưa commit) và cùng các giá trị ở bảng điều khiển này. Khi máy kia chạy xong, chép thư mục kết quả của nó về máy này vào một thư mục khác `OUT_ROOT`, rồi đặt `OTB_EC_MERGE_FROM` là đường dẫn đó (nhiều đường dẫn thì nối bằng `:`). Cell kết quả đọc cả hai thư mục. Nó từ chối đọc khi một thuật toán có kết quả ở cả hai nơi, khi hai máy chạy khác giao thức hoặc đọc khác dữ liệu, và khi hai máy chạy khác code. Trường hợp khác code chỉ đọc được khi đặt `ALLOW_CODE_CHANGE = True`, và báo cáo sẽ ghi lại điều đó.
 """
 
 PANEL = r"""
@@ -81,8 +83,16 @@ MIN_SPS = V.EC_MIN_SPS
 #: The projected cost reads the full run's measured costs, which had the runtime gate; a gate-free run
 #: keeps its slow members. 1.2 is what the repeat smoke measured (an assumption here, not a measurement).
 GATE_FREE_FACTOR = 1.2
-RUN_FIRST = True
-RUN_SECOND = True
+#: The passes this machine runs: "both", "first" (the cheap algorithms) or "second" (CluStream and RepStream).
+PARTS = os.environ.get("OTB_EC_PARTS", "both")
+if PARTS not in ("both", "first", "second"):
+    raise SystemExit(f"OTB_EC_PARTS={PARTS!r}; one of both, first, second")
+RUN_FIRST = PARTS in ("both", "first")
+RUN_SECOND = PARTS in ("both", "second")
+#: Out dirs another machine wrote, copied here, read beside OUT_ROOT (os.pathsep-separated in the environment).
+MERGE_FROM = [Path(p) for p in os.environ.get("OTB_EC_MERGE_FROM", "").split(os.pathsep) if p]
+#: Read out dirs made by other code together; the report says so.
+ALLOW_CODE_CHANGE = False
 # --- one-off overrides go here, e.g. WORKERS = 6 ---
 
 # --- derived (nothing to edit below) ---
@@ -102,19 +112,19 @@ RUN_ARGS_SECOND = ec_args(ALGOS_SECOND) if ALGOS_SECOND else None
 
 for name in ("PRESET", "OUT_ROOT", "GRID", "ORACLES", "ARMS", "ALGOS_FIRST", "ALGOS_SECOND", "FOLDS", "TUNER_SEEDS", "MODEL_SEED", "N_SAMPLES", "H",
              "FREEZE_AFTER_WINDOW", "WORKERS", "TIMEOUT_S", "BAND", "MAX_MEAN_LOSS", "MAX_SHARE_OVER_BAND", "MIN_SPS",
-             "RUN_FIRST", "RUN_SECOND"):
+             "PARTS", "RUN_FIRST", "RUN_SECOND", "MERGE_FROM", "ALLOW_CODE_CHANGE"):
     print(f"{name:20s} = {globals()[name]}")
 """
 
 DRY_RUN_MD = r"""
 ## Chạy thử và dự toán
 
-Cell dưới in các lệnh sẽ chạy (`--dry-run`, không job nào chạy thật), rồi dự toán chi phí của từng bộ từ chi phí đo được của `conf_pipeline/out/full`. Dự toán giả định chi phí tỉ lệ với số mô hình chạy mỗi cửa sổ, (E + C) / 30 của bộ mốc, nhân thêm `GATE_FREE_FACTOR` vì không gate thì các member chậm không bị loại. Mỗi oracle được tính như một lần chạy `confstream`, vì nó chạy cùng số mô hình; đây cũng là giả định. Đây là giả định, không phải số đo. Riêng CluStream, chạy thử trên máy này cho thấy không gate chậm hơn nhiều so với hệ số đó.
+Cell dưới in các lệnh của những lượt mà máy này chạy (`--dry-run`, không job nào chạy thật), rồi dự toán chi phí của từng bộ từ chi phí đo được của `conf_pipeline/out/full`. Dự toán giả định chi phí tỉ lệ với số mô hình chạy mỗi cửa sổ, (E + C) / 30 của bộ mốc, nhân thêm `GATE_FREE_FACTOR` vì không gate thì các member chậm không bị loại. Mỗi oracle được tính như một lần chạy `confstream`, vì nó chạy cùng số mô hình; đây cũng là giả định. Đây là giả định, không phải số đo. Riêng CluStream, chạy thử trên máy này cho thấy không gate chậm hơn nhiều so với hệ số đó.
 """
 
 DRY_RUN = r"""
-for args in (RUN_ARGS_FIRST, RUN_ARGS_SECOND):
-    if args:
+for run, args in ((RUN_FIRST, RUN_ARGS_FIRST), (RUN_SECOND, RUN_ARGS_SECOND)):
+    if run and args:
         run_cli("conf_pipeline.variants", OUT_ROOT, *args, "--dry-run")
 
 SRC = REPO / "conf_pipeline" / "out" / "full"
@@ -164,15 +174,18 @@ COMPARE_MD = r"""
 ## Kết quả
 
 Cell dưới so mọi bộ với bộ mốc và ghi `report/ec/` (`runs.csv`, `pairs.csv`, `summary.csv`, `ec.md`). Nó đọc được cả khi mới có một phần kết quả, ví dụ sau lượt 1. `d_tail` là tail ARI của bộ đó trừ của bộ mốc trên cùng (thuật toán, luồng, seed). `speedup_wall` và `speedup_model` là thời gian của bộ mốc chia thời gian của bộ đó, lớn hơn 1 là nhanh hơn. `sps` là số mẫu mỗi giây của cả bộ tune. `tau_vs_base` là Kendall τ giữa thứ hạng các thuật toán của bộ đó và của bộ mốc, trung bình qua các luồng. `verdict` là `reducible` khi bộ đó vừa giữ được chất lượng theo các ngưỡng ở bảng điều khiển vừa nhanh hơn, `quality drops` khi chất lượng tụt quá ngưỡng, `no speed-up` khi không nhanh hơn, `undecided` khi chưa có cặp nào chạy xong ở cả hai phía.
+
+Bảng đầu tiên cho biết kết quả được đọc từ những thư mục nào: `OUT_ROOT`, cộng các thư mục trong `MERGE_FROM` khi có máy thứ hai. Mỗi dòng ghi thư mục đó chứa thuật toán nào, chạy trên máy nào, với phiên bản Python, River và hash của code. Khi đọc từ hai máy, tỉ lệ tăng tốc vẫn luôn so hai thời gian đo trên cùng một máy, nhưng `median_sps` và `share_sps_at_least_min` trộn số đo của hai máy.
 """
 
 COMPARE = r"""
-paths = V.write_ec(OUT_ROOT, GRID, band=BAND, max_mean_loss=MAX_MEAN_LOSS,
-                   max_share_over_band=MAX_SHARE_OVER_BAND, min_sps=MIN_SPS)
+paths = V.write_ec(OUT_ROOT, GRID, also=MERGE_FROM, allow_code_change=ALLOW_CODE_CHANGE, band=BAND,
+                   max_mean_loss=MAX_MEAN_LOSS, max_share_over_band=MAX_SHARE_OVER_BAND, min_sps=MIN_SPS)
 runs, pairs, summary = (pd.read_csv(p) for p in paths[:3])
 if runs.empty:
     print("Chưa có run nào.")
 else:
+    show("Kết quả đọc từ", V.ec_sources(runs))
     show("Số job theo bộ và trạng thái", runs.groupby(["setting", "status"]).size().unstack(fill_value=0))
 cols = ["setting", "e_size", "e_test", "arm", "group", "n_pairs", "n_unfinished", "mean_base_tail", "mean_tail",
         "mean_d_tail", "min_d_tail", "share_loss_over_band", "tau_vs_base", "median_speedup_wall",
