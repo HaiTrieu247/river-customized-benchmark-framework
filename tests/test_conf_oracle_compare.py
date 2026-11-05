@@ -72,3 +72,15 @@ def test_the_cli_writes_its_tables_and_report(two_arms):
     assert proc.returncode == 0, proc.stderr
     rep = two_arms / "report" / "oracle_compare"
     assert {p.name for p in rep.iterdir()} >= {"jobs.csv", "pairs.csv", "groups.csv", "windows.csv", "oracle_compare.md"}
+
+
+def test_the_runs_wrote_lifecycle_logs_outside_members_and_the_member_readers_ignore_them(two_arms):
+    from conf_pipeline import report as RR
+
+    life = sorted((two_arms / "lifecycle").glob("*.jsonl"))
+    assert len(life) == 3 and all(p.stat().st_size > 0 for p in life)
+    assert all(p.parent.name == "members" for p in RR._member_files(two_arms))
+    members = RR.load_members(two_arms)
+    assert len(members) and "event" not in members.columns
+    readings, seen = RR.member_readings(two_arms)
+    assert len(seen) == 3 and all(r["star"] for r in readings.values())

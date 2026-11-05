@@ -129,3 +129,23 @@ def test_warm_start_trains_a_fresh_model_on_the_buffer_without_predicting():
     left = adapter.predict_one({"a": 0.0, "b": 0.0})
     right = adapter.predict_one({"a": 5.0, "b": 0.0})
     assert left != right
+
+
+# --- the silhouette's reason ----------------------------------------------------------------
+
+def test_silhouette_status_names_why_a_partition_has_no_silhouette_and_matches_the_score():
+    from benchmark.tuning.window import SILHOUETTE_REASONS, silhouette_status
+
+    xs = [x for x, _ in _two_blobs(10)]
+    cases = {
+        "valid": [i % 2 for i in range(10)],
+        "single_label": [0] * 10,
+        "one_label_per_point": list(range(10)),
+        "insufficient_points": [None] * 9 + [0],
+    }
+    for reason, labels in cases.items():
+        st = silhouette_status(xs, labels)
+        assert st.reason == reason and reason in SILHOUETTE_REASONS
+        assert (st.score, st.defined) == batch_silhouette(xs, labels)
+    st = silhouette_status(xs, [None, None] + [i % 2 for i in range(8)])
+    assert st.n_none == 2 and st.n_points == 8 and st.n_labels == 2 and st.max_label_share == 0.5

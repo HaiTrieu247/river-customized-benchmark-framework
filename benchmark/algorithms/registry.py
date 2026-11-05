@@ -32,6 +32,7 @@ from typing import Any, Callable
 from .adapter import ClustererAdapter, build_river_path, make_adapter
 from .clustream_pyramidal import CluStreamPyramidal
 from .denstream_fast import DenStreamPatchedFast
+from .hpstream_stable_labels import HPStreamStableLabels
 from .denstream_patched import DenStreamPatched
 from .transformers import OneHotCategorical, safe_standard_scaler
 
@@ -170,6 +171,13 @@ def _hpstream(**kw):
     return cluster.HPStream(**params), params
 
 
+def _hpstream_stable_labels(**kw):
+    # HPStream's constructor defaults, unchanged: the variant differs only in how it names a new cluster.
+    params = _hpstream()[1]
+    params.update(kw)
+    return HPStreamStableLabels(**params), params
+
+
 def _birch(**kw):
     params = dict(
         threshold=0.0,
@@ -285,8 +293,8 @@ def _textclust(**kw):
 
 #: name -> spec. Covers every clusterer exported by ``river.cluster``, plus the
 #: framework subclasses that work around a RIVER_BUGS.md entry under their own
-#: name (AGENTS.md rule 1.3): DenStreamPatched, DenStreamPatchedFast and
-#: CluStreamPyramidal. Each sits next to the river entry it extends.
+#: name (AGENTS.md rule 1.3): DenStreamPatched, DenStreamPatchedFast,
+#: CluStreamPyramidal and HPStreamStableLabels. Each sits next to the river entry it extends.
 ALGORITHMS: dict[str, AlgorithmSpec] = {
     "CluStream": AlgorithmSpec(
         _clustream, default_preprocessor="standard",
@@ -386,6 +394,18 @@ ALGORITHMS: dict[str, AlgorithmSpec] = {
         provenance=(
             "added for this project from Aggarwal et al. (2004); verification state not "
             "recorded in this registry"
+        ),
+    ),
+    "HPStreamStableLabels": AlgorithmSpec(
+        _hpstream_stable_labels, default_preprocessor="none",
+        note=(
+            "HPStream whose new clusters take labels from a counter that only grows, instead of the "
+            "evicted cluster's label (RIVER_BUGS.md GAP-6): the same clusters, sums and predictions "
+            "as HPStream at every point, under labels that are never reused"
+        ),
+        provenance=(
+            "HPStream from the vendored River tree with `_free_label` replaced in a subclass; upstream "
+            "untouched. Defaults are HPStream's"
         ),
     ),
     "DenStream": AlgorithmSpec(

@@ -751,3 +751,164 @@ def test_the_default_readers_leave_the_diagnostic_arms_out_unless_asked(tmp_path
     assert set(R.load_windows(d, diagnostic=True)["arm"]) >= {"confstream_ari_oracle"}
     assert set(R.gain_table(d)["arm"]) == {"confstream"}
     assert not any(c.endswith("ari_oracle") for c in R.headroom_table(d).columns)
+
+
+# --- the mechanism campaign's shared readers and paired contrasts (analysis_support) ------------------
+
+import math as _math
+
+import numpy as np
+import pandas as pd
+
+from conf_pipeline import analysis_support as AS
+
+
+def test_a_seed_is_none_whether_it_was_none_nan_or_missing_and_an_int_otherwise():
+    assert AS.seed_key(None) is None and AS.seed_key(float("nan")) is None and AS.seed_key(pd.NA) is None
+    assert AS.seed_key(101.0) == 101 and AS.seed_key(np.int64(201)) == 201
+
+
+def test_the_latest_attempt_stands_for_a_job_and_a_skip_only_for_a_job_never_attempted():
+    rows = [{"kind": "run", "algo": "DenStream", "fold": "f", "arm": "confstream", "seed": 101, "model_seed": None,
+             "status": "error"},
+            {"kind": "run", "algo": "DenStream", "fold": "f", "arm": "confstream", "seed": 101, "model_seed": None,
+             "status": "ok"},
+            {"kind": "run", "algo": "HPStream", "fold": "f", "arm": "default", "seed": 201, "model_seed": 201,
+             "status": "timeout"},
+            {"kind": "run", "algo": "HPStream", "fold": "f", "arm": "default", "seed": 201, "model_seed": 201,
+             "status": "skipped"},
+            {"kind": "run", "algo": "HPStream", "fold": "f", "arm": "default", "seed": 201, "model_seed": 202,
+             "status": "ok"}]
+    latest = AS.latest_attempts(rows)
+    assert len(latest) == 3
+    assert latest[("DenStream", "f", "confstream", 101, None, None)]["status"] == "ok"
+    assert latest[("HPStream", "f", "default", 201, 201, None)]["status"] == "timeout"   # a failure is never replaced by a skip
+
+
+def _tw(rows):
+    df = pd.DataFrame(rows, columns=["algo", "fold", "arm", "seed", "model_seed", "config_id", "window", "lag_ari_win"])
+    return df.astype({"seed": object, "model_seed": object, "config_id": object})
+
+
+def test_a_fixed_arm_is_one_replicate_set_beside_every_tuner_seed_on_the_common_windows_only():
+    rows = [("HPStream", "covtype", "default", 201, 201, None, w, 0.2) for w in (20, 21, 22)]
+    rows += [("HPStream", "covtype", "confstream", s, 201, None, w, 0.5 + 0.1 * (s - 101)) for s in (101, 102)
+             for w in (21, 22, 23)]
+    p = AS.paired_contrast(_tw(rows), "confstream", "default", "lag_ari_win")
+    assert list(p["replicate"]) == [101, 102] and p["broadcast"].all()
+    assert list(p["n_common"]) == [2, 2] and list(p["n_windows_a"]) == [3, 3] and list(p["n_windows_b"]) == [3, 3]
+    assert p["delta"].tolist() == pytest.approx([0.3, 0.4])
+
+
+def test_two_online_arms_pair_by_tuner_seed_and_a_missing_seed_or_disjoint_windows_say_why():
+    rows = [("DenStream", "covtype", "confstream", 101, None, None, 20, 0.5),
+            ("DenStream", "covtype", "confstream", 102, None, None, 20, 0.6),
+            ("DenStream", "covtype", "random_online", 101, None, None, 20, 0.4),
+            ("DenStream", "kdd99", "confstream", 101, None, None, 20, 0.5),
+            ("DenStream", "kdd99", "random_online", 101, None, None, 21, 0.4)]
+    p = AS.paired_contrast(_tw(rows), "confstream", "random_online", "lag_ari_win").set_index(["fold", "replicate"])
+    assert p.loc[("covtype", 101), "delta"] == pytest.approx(0.1)
+    assert "missing under random_online" in p.loc[("covtype", 102), "note"]
+    assert p.loc[("kdd99", 101), "note"] == "no common window" and _math.isnan(p.loc[("kdd99", 101), "delta"])
+
+
+def test_two_online_arms_pair_by_model_seed_too_and_another_model_seed_is_a_missing_counterpart():
+    rows = [("HPStream", "covtype", "confstream", 101, 201, None, 20, 0.7),
+            ("HPStream", "covtype", "random_online", 101, 202, None, 20, 0.1)]
+    p = AS.paired_contrast(_tw(rows), "confstream", "random_online", "lag_ari_win")
+    assert len(p) == 2 and p["delta"].isna().all()                       # never paired as one replicate
+    notes = dict(zip(p["model_seed"], p["note"]))
+    assert "model seed 201) missing under random_online" in notes[201]
+    assert "model seed 202) missing under confstream" in notes[202]
+
+
+def test_two_model_seeds_under_one_tuner_seed_are_two_replicates_and_a_fixed_arm_stands_beside_each():
+    rows = [("HPStream", "covtype", "confstream", 101, m, None, w, v) for m, v in ((201, 0.5), (202, 0.7))
+            for w in (20, 21)]
+    rows += [("HPStream", "covtype", "random_online", 101, m, None, w, v) for m, v in ((201, 0.4), (202, 0.4))
+             for w in (20, 21)]
+    rows += [("HPStream", "covtype", "default", m, m, None, w, v) for m, v in ((201, 0.1), (202, 0.3)) for w in (20, 21)]
+    tw = _tw(rows)
+    aw = AS.arm_windows(tw, "confstream", "lag_ari_win")
+    assert len(aw) == 4 and set(zip(aw["replicate"], aw["model_seed"])) == {(101, 201), (101, 202)}
+    on = AS.paired_contrast(tw, "confstream", "random_online", "lag_ari_win").set_index("model_seed")
+    assert on.loc[201, "delta"] == pytest.approx(0.1) and on.loc[202, "delta"] == pytest.approx(0.3)
+    assert (on["n_common"] == 2).all()
+    fx = AS.paired_contrast(tw, "confstream", "default", "lag_ari_win").set_index("model_seed")
+    assert fx["broadcast"].all() and fx.loc[201, "b_n_runs"] == 2                  # the fixed mean, 0.2, beside both
+    assert fx.loc[201, "delta"] == pytest.approx(0.3) and fx.loc[202, "delta"] == pytest.approx(0.5)
+    with pytest.raises(ValueError, match="same tuner seed and model seed"):
+        AS.arm_windows(_tw(rows + [("HPStream", "covtype", "confstream", 101, 201, None, 20, 0.9)]),
+                       "confstream", "lag_ari_win")
+
+
+def test_runs_without_the_partition_counts_leave_validity_undefined_rather_than_read_off_the_score_status():
+    runs = pd.DataFrame([{"arm": "confstream", "status": "ok", "algo": "A", "fold": "covtype",
+                          "member_status_counts": {"valid": 8, "infeasible_memory": 2}}])
+    (c,) = AS.coverage(runs).to_dict("records")
+    assert c["n_member_windows"] == 10 and c["share_floor_score"] == pytest.approx(0.2)
+    assert _math.isnan(c["share_partition_undefined"]) and _math.isnan(c["share_infeasible"])
+    assert _math.isnan(c["n_valid_partition_infeasible"])
+
+
+def test_two_fixed_arms_are_one_replicate_averaged_over_their_runs():
+    rows = [("HPStream", "covtype", "default", m, m, None, 20, v) for m, v in ((201, 0.2), (202, 0.4))]
+    rows += [("HPStream", "covtype", "scaled_default", m, m, None, 20, v) for m, v in ((201, 0.5), (202, 0.5))]
+    (row,) = AS.paired_contrast(_tw(rows), "scaled_default", "default", "lag_ari_win").to_dict("records")
+    assert row["replicate"] == "fixed" and row["a_n_runs"] == row["b_n_runs"] == 2
+    assert row["delta"] == pytest.approx(0.2)
+
+
+def test_variants_of_a_source_are_averaged_before_the_sources_and_seeds_add_no_block():
+    pairs = pd.DataFrame([
+        {"algo": "A", "fold": "insects_abrupt_balanced", "group": "real", "block": "insects", "replicate": s,
+         "delta": 0.3, "n_common": 5} for s in (101, 102, 103)] + [
+        {"algo": "A", "fold": "insects_gradual_balanced", "group": "real", "block": "insects", "replicate": 101,
+         "delta": 0.3, "n_common": 5},
+        {"algo": "A", "fold": "covtype", "group": "real", "block": "covtype", "replicate": 101, "delta": -0.1,
+         "n_common": 5},
+        {"algo": "B", "fold": "covtype", "group": "real", "block": "covtype", "replicate": 101, "delta": 0.1,
+         "n_common": 5}])
+    agg = AS.aggregate_contrast(pairs, n_boot=200)
+    blocks = agg["blocks"].set_index("block")
+    assert blocks.loc["insects", "delta"] == pytest.approx(0.3) and blocks.loc["covtype", "delta"] == pytest.approx(0.0)
+    assert blocks.loc["covtype", "n_algorithms"] == 2
+    real = agg["groups"].query("level == 'group' and unit == 'real'").iloc[0]
+    assert real["delta_block_mean"] == pytest.approx(0.15) and real["n_blocks"] == 2      # not (0.3*4 - 0.1 + 0.1)/6
+    assert _math.isnan(real["ci_low"])                                                     # two blocks: no interval
+    assert real["share_cells_above_threshold"] == pytest.approx(3 / 4)
+    assert real["share_cells_below_threshold"] == pytest.approx(1 / 4)
+
+
+def test_contrasts_end_to_end_on_a_split_dir_with_failures_and_coverage(tmp_path):
+    from tests._split_fixture import make_out_dir
+
+    out = make_out_dir(tmp_path / "o", arms=("default", "scaled_default", "confstream", "frozen_prefix",
+                                             "frozen_reinit", "random_online"),
+                       drop={("DenStream", "kdd99", "random_online")})
+    t = report.contrast_tables(out)
+    g = t["groups"].query("level == 'group' and metric == 'ari' and subset == 'all' and unit == 'real'")
+    assert set(g["contrast"]) == {"scaled_default-default", "confstream-scaled_default", "frozen_reinit-frozen_prefix",
+                                  "confstream-frozen_reinit", "confstream-random_online"}
+    e1 = g.set_index("contrast").loc["scaled_default-default"]
+    assert e1["n_algorithms"] == 2                         # HPStream/RepStream never read 0 by construction
+    full = g.set_index("contrast").loc["confstream-scaled_default"]
+    assert full["n_algorithms"] == 4                       # ... but stay candidates against confstream
+    assert set(t["filled"]["algo"]) == {"HPStream", "RepStream"}
+    cov = t["coverage"].set_index("arm")
+    assert cov.loc["random_online", "n_error"] == 2 and cov.loc["random_online", "n_ok"] == 54
+    assert cov.loc["scaled_default", "n_skipped"] == 14 and cov.loc["scaled_default", "n_missing"] == 0
+    c = cov.loc["confstream"]
+    # validity of the partition, apart from the caps: 3 one-label partitions of the 31 that were read,
+    # the one shed by the memory cap included (its score status alone would say 2 of 32)
+    assert c["n_member_windows"] == 32 * c["n_ok"] and c["n_member_windows_partition_read"] == 31 * c["n_ok"]
+    assert c["share_partition_undefined"] == pytest.approx(3 / 31) == c["share_partition_single_label"]
+    assert c["share_partition_insufficient_points"] == 0
+    # feasibility rejection, apart from the partition: 2 of 32, one valid and one undefined partition
+    assert c["share_infeasible"] == pytest.approx(2 / 32) == c["share_infeasible_memory"]
+    assert c["n_valid_partition_infeasible"] == c["n_undefined_partition_infeasible"] == c["n_ok"]
+    assert c["share_member_error"] == pytest.approx(1 / 32) and c["share_floor_score"] == pytest.approx(5 / 32)
+    nmi = t["groups"].query("metric == 'nmi'")
+    assert len(nmi)
+    paths = report.write_contrasts(out)
+    assert (out / "report" / "contrasts" / "contrasts.md").exists() and len(paths) == 9

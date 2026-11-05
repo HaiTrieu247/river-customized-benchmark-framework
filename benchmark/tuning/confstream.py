@@ -52,6 +52,7 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import random
 import time
 from dataclasses import dataclass, field
 from typing import Callable
@@ -69,7 +70,8 @@ CMM_VARIANTS: dict[str, dict] = {
 from ..evaluation.runner import run_once
 from . import signals as SIG
 from .space import ParamSpace, SamplerState, SpaceContext
-from .window import UNDEFINED_SCORE, WindowBuffer, batch_silhouette, warm_start
+from .window import (UNDEFINED_SCORE, WindowBuffer, external_support, silhouette_status, silhouette_support,
+                     support_fingerprint, warm_start)
 
 
 #: The two ways a child configuration can be drawn: ``"evolutionary"`` (the
@@ -94,6 +96,31 @@ TIE_BREAKS = ("micro_clusters", "runtime")
 #: silhouette's gate, a member without a partition staying undefined, which isolates the signal
 #: from that gate. The silhouette is still logged (``sig_silhouette``).
 ORACLE_SIGNALS: dict[str, bool] = {"ari_oracle": False, "ari_oracle_constrained": True}
+#: What a member's selection score rests on, after the caps (``WindowOutcome.score_status``):
+#: ``valid`` (a partition with a silhouette, within every cap, and a reading of the selection
+#: signal), ``member_error`` (the model raised), ``infeasible_<cap>`` (memory, micro_clusters,
+#: runtime), ``undefined_<reason>`` (the sequential partition has no silhouette,
+#: ``window.SILHOUETTE_REASONS``) and ``signal_undefined`` (a partition, but the selection signal
+#: read nothing). Every status but ``valid`` scores ``UNDEFINED_SCORE``; the status says why.
+SCORE_STATUSES: tuple[str, ...] = (
+    "valid", "member_error", "infeasible_memory", "infeasible_micro_clusters", "infeasible_runtime",
+    "undefined_insufficient_points", "undefined_single_label", "undefined_one_label_per_point",
+    "signal_undefined",
+)
+#: The order a window's incumbent is named by (``ConfStreamEnsemble.incumbent_key``), level by
+#: level: the first level at which the winner and the runner-up differ is ``decided_by``.
+TIE_LEVELS: dict[str, tuple[str, ...]] = {
+    "micro_clusters": ("score", "usable", "micro_clusters", "incumbent", "member_id"),
+    "runtime": ("score", "usable", "runtime", "member_id"),
+    "unusable": ("score", "usable", "incumbent", "member_id"),
+}
+#: Schema of the lifecycle events (``ConfStreamEnsemble.events``): births, challenges, decisions
+#: and the freeze, one dict each.
+LIFECYCLE_SCHEMA = 1
+#: Where a member came from (``birth`` events): one of the explicit starts, an offspring of a start
+#: drawn when the ensemble is filled, a child of the evolutionary or the uniform sampler, or a fresh
+#: copy of the frozen configuration (``reinit_after_freeze``).
+BIRTH_ORIGINS: tuple[str, ...] = ("start", "initial_offspring", "evolutionary", "uniform", "reinit_copy")
 
 
 @dataclass
@@ -215,6 +242,32 @@ class WindowOutcome:
     #: Whether the member produced a partition (no error, a defined silhouette), whatever its
     #: selection score says; None means ``defined`` tells. The runtime reference reads it.
     partitioned: bool | None = None
+    #: The silhouette of the sequential (predict-before-learn) partition, before any cap or signal
+    #: replaces the score: None when undefined; ``silhouette_reason`` says why
+    #: (``window.SILHOUETTE_REASONS``), None for a member that raised.
+    silhouette_raw: float | None = None
+    silhouette_reason: str | None = None
+    #: Points the silhouette kept, ``None`` predictions it left out, and the share of the kept
+    #: points under the largest label.
+    n_points_scored: int | None = None
+    n_none: int | None = None
+    max_label_share: float | None = None
+    #: The points of the window handed to the member, and which of them each reading used, by
+    #: position (``window.support_fingerprint``): ``support_sha`` the silhouette's
+    #: (``window.silhouette_support``), ``n_points_external`` and ``external_support_sha`` the windowed
+    #: external metrics' (``window.external_support``). Records only: nothing reads them back.
+    n_points_input: int | None = None
+    support_sha: str | None = None
+    n_points_external: int | None = None
+    external_support_sha: str | None = None
+    #: ``SCORE_STATUSES``: what the selection score rests on, set once the caps are applied.
+    score_status: str | None = None
+    #: Readings of the end-of-window snapshot (the window predicted again by a copy of the model
+    #: once it has learned it), computed only when ``stability`` is asked for; diagnostics, never
+    #: selected by. Keys ``snap_*``.
+    snapshot: dict = field(default_factory=dict)
+    #: A diagnostic reading that failed (its message); the member and the selection go on.
+    diag_error: str | None = None
 
     @property
     def memory_mb(self) -> float | None:
@@ -248,7 +301,19 @@ class WindowOutcome:
             "n_fallback": self.n_fallback,
             "n_true_classes": self.n_true_classes,
             "majority_class_share": self.majority_class_share,
+            "silhouette_raw": round(self.silhouette_raw, 6) if self.silhouette_raw is not None else None,
+            "silhouette_reason": self.silhouette_reason,
+            "n_points_scored": self.n_points_scored,
+            "n_none": self.n_none,
+            "n_points_input": self.n_points_input,
+            "support_sha": self.support_sha,
+            "n_points_external": self.n_points_external,
+            "external_support_sha": self.external_support_sha,
+            "max_label_share": round(self.max_label_share, 6) if self.max_label_share is not None else None,
+            "score_status": self.score_status,
             **{f"{k}_win": v for k, v in self.window_metrics.items()},
+            **self.snapshot,
+            **({"diag_error": self.diag_error} if self.diag_error is not None else {}),
             **({"cmm_error": self.cmm_error} if self.cmm_error is not None else {}),
             **{f"sig_{k}": (round(v, 6) if v is not None else None) for k, v in self.signals.items()},
         }
@@ -288,6 +353,10 @@ class WindowReport:
     cmm_window: dict = field(default_factory=dict)
     #: Seconds spent building and warm-starting the next test set (no member's runtime).
     spawn_runtime_s: float = 0.0
+    #: How the incumbent was named (``ConfStreamEnsemble.decision_info``).
+    decision: dict = field(default_factory=dict)
+    #: Children built for the next window whose construction or warm start raised.
+    n_birth_errors: int = 0
 
     @property
     def scoring_runtime_s(self) -> float:
@@ -308,6 +377,15 @@ class WindowReport:
     @property
     def cmm_runtime_s(self) -> float:
         return float(sum(o.cmm_runtime_s for o in self.outcomes))
+
+    @property
+    def status_counts(self) -> dict[str, int]:
+        """Members of the window per ``SCORE_STATUSES`` entry (only the statuses seen)."""
+        out: dict[str, int] = {}
+        for o in self.outcomes:
+            key = o.score_status or "unknown"
+            out[key] = out.get(key, 0) + 1
+        return out
 
 
 class _CMMState:
@@ -433,6 +511,33 @@ def apply_feasibility(outcomes: list[WindowOutcome], cfg: EnsembleConfig) -> Non
             o.score = UNDEFINED_SCORE
 
 
+def score_status(o: WindowOutcome) -> str:
+    """``SCORE_STATUSES``: the first of error, cap, undefined partition, unread signal that holds."""
+    if o.error is not None:
+        return "member_error"
+    if not o.feasible:
+        return f"infeasible_{o.feasible_reason}"
+    if o.silhouette_reason is not None and o.silhouette_reason != "valid":
+        return f"undefined_{o.silhouette_reason}"
+    if not o.defined:
+        return "signal_undefined"
+    return "valid"
+
+
+class _GlobalRandomState:
+    """Python's and NumPy's global generators as they were on entry, restored on exit: a
+    diagnostic reading can never move a draw anything else makes from them."""
+
+    def __enter__(self):
+        self._py, self._np = random.getstate(), np.random.get_state()
+        return self
+
+    def __exit__(self, *exc):
+        random.setstate(self._py)
+        np.random.set_state(self._np)
+        return False
+
+
 # --- the ensemble ---------------------------------------------------------------
 
 
@@ -469,6 +574,15 @@ class ConfStreamEnsemble:
         self._next_id = 0
         self._last_incumbent_id: int | None = None
         self.frozen = False
+        #: Lifecycle events since the last ``drain_events`` (``LIFECYCLE_SCHEMA``): what a log of
+        #: births, challenges, decisions and the freeze is written from. Records only; nothing
+        #: reads them back.
+        self.events: list[dict] = []
+
+    def drain_events(self) -> list[dict]:
+        """The lifecycle events recorded since the last call, which are then forgotten."""
+        out, self.events = self.events, []
+        return out
 
     # -- members -----------------------------------------------------------------
     def _resolve(self, u: dict) -> dict:
@@ -476,17 +590,24 @@ class ConfStreamEnsemble:
         params = self.space.resolve(u, self.ctx)
         return self.post_resolve(params) if self.post_resolve is not None else params
 
-    def _new_member(self, u, params, state, parent_id, born_window, buffer) -> Member:
+    def _new_member(self, u, params, state, parent_id, born_window, buffer, origin: str = "start",
+                    reset: bool | None = None) -> Member:
         member = Member(
             id=self._next_id, u=dict(u), params=dict(params), adapter=None,  # type: ignore[arg-type]
             state=state, parent_id=parent_id, born_window=born_window,
         )
         self._next_id += 1
+        n_warm = 0
         try:
             member.adapter = self.make_adapter(dict(params), self.seed)
-            warm_start(member.adapter, buffer)
+            n_warm = warm_start(member.adapter, buffer)
         except Exception as exc:  # a configuration River cannot run is a fact to record
             member.error = f"{type(exc).__name__}: {exc}"
+        self.events.append({
+            "event": "birth", "window": born_window, "member_id": member.id, "parent_id": parent_id,
+            "origin": origin, "reset": reset, "params": dict(params), "warm_start_samples": n_warm,
+            "error": member.error,
+        })
         return member
 
     def find(self, member_id: int) -> Member | None:
@@ -502,14 +623,14 @@ class ConfStreamEnsemble:
                 params.setdefault(k, v)
             u = self.space.unit_point(params, self.ctx)
             self.active.append(self._new_member(
-                u, params, SamplerState.initial(self.space), None, window_index, buffer,
+                u, params, SamplerState.initial(self.space), None, window_index, buffer, origin="start",
             ))
         while len(self.active) < self.cfg.e_size:
             parent = self.active[int(self.rng.integers(len(starts)))]
             child_u, child_state = parent.state.offspring(parent.u, self.rng, self.cfg.lam)
             params = self._resolve(child_u)
             self.active.append(self._new_member(
-                child_u, params, child_state, parent.id, window_index, buffer,
+                child_u, params, child_state, parent.id, window_index, buffer, origin="initial_offspring",
             ))
 
     # -- one window ----------------------------------------------------------------
@@ -537,7 +658,8 @@ class ConfStreamEnsemble:
             return WindowOutcome(score=UNDEFINED_SCORE, defined=False, runtime_s=0.0,
                                  error=m.error, feasible=False, feasible_reason="error", **base)
         t_score = time.perf_counter()
-        score, defined = batch_silhouette(buffer.xs, preds)
+        sil = silhouette_status(buffer.xs, preds)
+        score, defined = sil.score, sil.defined
         scoring_s = time.perf_counter() - t_score
         win = res.windows[0] if res.windows else None
         outcome = WindowOutcome(
@@ -553,8 +675,15 @@ class ConfStreamEnsemble:
             n_true_classes=win.n_true_classes if win else None,
             majority_class_share=win.majority_class_share if win else None,
             scoring_runtime_s=scoring_s, pred_sha=prediction_hash(preds), partitioned=defined,
+            silhouette_raw=score if defined else None, silhouette_reason=sil.reason,
+            n_points_scored=sil.n_points, n_none=sil.n_none, max_label_share=sil.max_label_share,
             **base,
         )
+        ext_mask = external_support(buffer.ys, preds)
+        outcome.n_points_input = len(preds)
+        outcome.support_sha = support_fingerprint(silhouette_support(preds))
+        outcome.n_points_external = sum(ext_mask)
+        outcome.external_support_sha = support_fingerprint(ext_mask)
         if m.id == self._last_incumbent_id:
             outcome.predictions = preds
         if cmm is not None:
@@ -570,11 +699,19 @@ class ConfStreamEnsemble:
             t0 = time.perf_counter()
             needed = SIG.per_member_needed(self.cfg.signals_needed)
             noise = {"noise": self.cfg.signal_noise, "noise_labels": tuple(sentinel_labels(adapter.model))}
-            outcome.signals = SIG.member_signals(window, preds, needed, **noise)
-            if "silhouette" in self.cfg.log_signals:
-                outcome.signals["silhouette"] = score if defined else None
-            if "stability" in self.cfg.signals_needed:
-                outcome.signals["stability"] = SIG.stability(preds, self._repredict(adapter, buffer), **noise)
+            selects = self.cfg.selection_signal != "silhouette" and self.cfg.selection_signal in SIG.SIGNALS
+            with _GlobalRandomState():
+                try:
+                    outcome.signals = SIG.member_signals(window, preds, needed, **noise)
+                except Exception as exc:
+                    if selects:
+                        raise
+                    outcome.signals = {}
+                    outcome.diag_error = f"signals: {type(exc).__name__}: {exc}"
+                if "silhouette" in self.cfg.log_signals:
+                    outcome.signals["silhouette"] = score if defined else None
+                if "stability" in self.cfg.signals_needed:
+                    self._snapshot_into(outcome, adapter, buffer, preds, noise, selects)
             outcome.signals_runtime_s = time.perf_counter() - t0
             sel = self.cfg.selection_signal
             if sel != "silhouette" and sel in SIG.PER_MEMBER + SIG.MODEL_SIGNALS:
@@ -588,6 +725,40 @@ class ConfStreamEnsemble:
             outcome.score, outcome.defined = float(m.outcome_override), True
             m.outcome_override = None
         return outcome
+
+    def _snapshot_into(self, outcome: WindowOutcome, adapter: ClustererAdapter, buffer: WindowBuffer,
+                       preds: list, noise: dict, selects: bool) -> None:
+        """``stability`` and the snapshot's readings, from ONE prediction pass of a copy of the
+        model at the end of the window (``_repredict``). The snapshot's silhouette is the same
+        classic silhouette as the score, on the snapshot's labels (``snap_silhouette``,
+        ``snap_silhouette_defined``, ``snap_silhouette_reason``); ``snap_label_agreement`` is the
+        share of points both predictions labelled with the same raw label (a renaming lowers it
+        and leaves ``stability``, an ARI, at 1). Never selected by. A failure is recorded in
+        ``diag_error``; it is raised only when the tuner selects by ``stability`` itself."""
+        try:
+            again = self._repredict(adapter, buffer)
+            outcome.signals["stability"] = SIG.stability(preds, again, **noise)
+        except Exception as exc:
+            if selects and self.cfg.selection_signal == "stability":
+                raise
+            outcome.signals["stability"] = None
+            outcome.diag_error = f"stability: {type(exc).__name__}: {exc}"
+            outcome.snapshot = {"snap_silhouette": None, "snap_silhouette_defined": None,
+                                "snap_silhouette_reason": None, "snap_n_pred_labels": None,
+                                "snap_pred_sha": None, "snap_label_agreement": None}
+            return
+        both = [(a, b) for a, b in zip(preds, again) if a is not None and b is not None]
+        snap = {"snap_n_pred_labels": len({b for b in again if b is not None}),
+                "snap_pred_sha": prediction_hash(again),
+                "snap_label_agreement": (round(sum(a == b for a, b in both) / len(both), 6) if both else None)}
+        try:
+            st = silhouette_status(buffer.xs, again)
+            snap.update(snap_silhouette=round(st.score, 6) if st.defined else None,
+                        snap_silhouette_defined=st.defined, snap_silhouette_reason=st.reason)
+        except Exception as exc:
+            snap.update(snap_silhouette=None, snap_silhouette_defined=None, snap_silhouette_reason="scoring_error")
+            outcome.diag_error = f"snapshot silhouette: {type(exc).__name__}: {exc}"
+        outcome.snapshot = snap
 
     @staticmethod
     def _repredict(adapter: ClustererAdapter, buffer: WindowBuffer) -> list:
@@ -636,14 +807,40 @@ class ConfStreamEnsemble:
         doing nothing is fastest, and the runtime of a member with no
         partition says nothing about its configuration.
         """
-        def key(o: WindowOutcome):
-            if o.defined and o.feasible:
-                if tie_break == "runtime":
-                    return (-o.score, 0, o.runtime_s, o.member_id)
-                n_micro = o.n_micro_clusters if o.n_micro_clusters is not None else 0
-                return (-o.score, 0, n_micro, 0 if o.member_id == last_incumbent_id else 1, o.member_id)
-            return (-o.score, 1, 0 if o.member_id == last_incumbent_id else 1, o.member_id, 0)
-        return min(outcomes, key=key)
+        return min(outcomes, key=lambda o: ConfStreamEnsemble.incumbent_key(o, last_incumbent_id, tie_break))
+
+    @staticmethod
+    def incumbent_key(o: WindowOutcome, last_incumbent_id: int | None, tie_break: str = "micro_clusters") -> tuple:
+        """The sort key ``pick_incumbent`` minimises (``TIE_LEVELS`` names its levels). A member
+        whose micro-cluster count is unknown (None) counts as 0 micro-clusters; ``member_id``
+        (the older member) is the last level, so the key is total and the pick deterministic."""
+        if o.defined and o.feasible:
+            if tie_break == "runtime":
+                return (-o.score, 0, o.runtime_s, o.member_id)
+            n_micro = o.n_micro_clusters if o.n_micro_clusters is not None else 0
+            return (-o.score, 0, n_micro, 0 if o.member_id == last_incumbent_id else 1, o.member_id)
+        return (-o.score, 1, 0 if o.member_id == last_incumbent_id else 1, o.member_id, 0)
+
+    @staticmethod
+    def decision_info(outcomes: list[WindowOutcome], last_incumbent_id: int | None,
+                      tie_break: str = "micro_clusters") -> dict:
+        """How ``pick_incumbent`` named its winner: ``decided_by``, the first ``TIE_LEVELS`` level at
+        which the winner's key differs from the runner-up's (``only_member`` with one member),
+        ``n_top_ties``, the members on the winner's score and usability, and ``tie_break``."""
+        keys = sorted((ConfStreamEnsemble.incumbent_key(o, last_incumbent_id, tie_break), o.member_id)
+                      for o in outcomes)
+        if not keys:
+            return {}
+        win = keys[0][0]
+        usable = win[1] == 0
+        levels = TIE_LEVELS[tie_break if usable else "unusable"]
+        decided_by = "only_member"
+        if len(keys) > 1:
+            other = keys[1][0]
+            decided_by = next((levels[i] for i in range(min(len(win), len(levels))) if win[i] != other[i]),
+                              levels[-1])
+        n_ties = sum(1 for k, _ in keys if k[0] == win[0] and k[1] == win[1])
+        return {"decided_by": decided_by, "n_top_ties": n_ties, "tie_break": tie_break, "usable": usable}
 
     def process_window(self, buffer: WindowBuffer, window_index: int) -> WindowReport:
         members = self.active + self.test
@@ -655,6 +852,8 @@ class ConfStreamEnsemble:
         apply_feasibility(outcomes, self.cfg)
         if "rank_agg" in self.cfg.signals_needed:
             self._rank_aggregate(outcomes, overridden)
+        for o in outcomes:
+            o.score_status = score_status(o)
         for m, o in zip(members, outcomes):
             m.score, m.last = o.score, o
 
@@ -663,26 +862,42 @@ class ConfStreamEnsemble:
         # Resolve the test set against the active set, one challenger at a time.
         n_tested, n_accepted, n_discarded = len(self.test), 0, 0
         for challenger in self.test:
+            event = {"event": "challenge", "window": window_index, "challenger_id": challenger.id,
+                     "challenger_score": challenger.score, "victim_id": None, "victim_score": None}
             if len(self.active) < self.cfg.e_size:
                 # only after a freeze with renewal: the copies fill the ensemble back up
                 self.active.append(challenger)
                 n_accepted += 1
+                self.events.append({**event, "outcome": "filled"})
                 continue
             best = self.pick_incumbent([m.last for m in self.active], self._last_incumbent_id, self.cfg.tie_break)
             candidates = [m for m in self.active if m.id != best.member_id]
             if not candidates:
                 n_discarded += 1
+                self.events.append({**event, "outcome": "discarded_no_victim"})
                 continue
             w = victim_weights([m.score for m in candidates])
             victim = candidates[int(self.rng.choice(len(candidates), p=w))]
+            event.update(victim_id=victim.id, victim_score=victim.score)
             if challenger.score > victim.score:
                 self.active[self.active.index(victim)] = challenger
                 n_accepted += 1
+                self.events.append({**event, "outcome": "accepted"})
             else:
                 n_discarded += 1
+                self.events.append({**event, "outcome": "rejected"})
         self.test = []
 
-        incumbent = self.pick_incumbent([m.last for m in self.active], self._last_incumbent_id, self.cfg.tie_break)
+        active_outcomes = [m.last for m in self.active]
+        previous = self._last_incumbent_id
+        incumbent = self.pick_incumbent(active_outcomes, previous, self.cfg.tie_break)
+        decision = {**self.decision_info(active_outcomes, previous, self.cfg.tie_break),
+                    "incumbent_id": incumbent.member_id, "previous_incumbent_id": previous,
+                    "switched": previous is not None and incumbent.member_id != previous,
+                    "score": incumbent.score, "score_status": incumbent.score_status,
+                    "n_active": len(self.active), "n_evaluated": len(outcomes),
+                    "n_evaluated_ok": sum(1 for o in outcomes if o.error is None)}
+        self.events.append({"event": "decision", "window": window_index, **decision})
         self._last_incumbent_id = incumbent.member_id
 
         if (self.cfg.freeze_after_window is not None and not self.frozen
@@ -691,6 +906,8 @@ class ConfStreamEnsemble:
             self.frozen = True
             keep = self.active[0]
             self._frozen_member = (dict(keep.u), dict(keep.params), keep.state, keep.id)
+            self.events.append({"event": "freeze", "window": window_index, "member_id": keep.id,
+                                "params": dict(keep.params), "reinit_after_freeze": self.cfg.reinit_after_freeze})
 
         # Spawn the next test set from the (possibly refreshed, possibly
         # frozen) active set. A frozen ensemble spawns nothing.
@@ -702,8 +919,10 @@ class ConfStreamEnsemble:
             if self.frozen:
                 # re-initialisation control: a fresh model of the frozen configuration
                 u, params, state, parent_id = self._frozen_member
-                self.test.append(self._new_member(u, params, state, parent_id, window_index, buffer))
+                self.test.append(self._new_member(u, params, state, parent_id, window_index, buffer,
+                                                  origin="reinit_copy"))
                 continue
+            reset = None
             if self.cfg.sampler == "uniform":
                 parent_id = None
                 child_u = {p.name: float(self.rng.random()) for p in self.space.params}
@@ -715,13 +934,15 @@ class ConfStreamEnsemble:
                 # it for its own offspring (paper, Sec. 3; MOA resets before
                 # it samples).
                 state = parent.state
-                if self.rng.random() < self.cfg.p_reset:
+                reset = bool(self.rng.random() < self.cfg.p_reset)
+                if reset:
                     state = state.reset(self.space)
                     n_reset += 1
                 child_u, child_state = state.offspring(parent.u, self.rng, self.cfg.lam)
             params = self._resolve(child_u)
             self.test.append(self._new_member(
                 child_u, params, child_state, parent_id, window_index, buffer,
+                origin=self.cfg.sampler, reset=reset,
             ))
 
         return WindowReport(
@@ -730,4 +951,5 @@ class ConfStreamEnsemble:
             n_discarded=n_discarded, n_spawned=len(self.test), n_reset=n_reset,
             frozen=self.frozen, cmm_window=cmm.window_readings() if cmm is not None else {},
             spawn_runtime_s=(time.perf_counter() - t_spawn) if n_spawn else 0.0,
+            decision=decision, n_birth_errors=sum(1 for m in self.test if m.error is not None),
         )

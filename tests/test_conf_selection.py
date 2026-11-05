@@ -498,3 +498,429 @@ def test_an_out_dir_without_the_selecting_arm_reports_it_undefined_with_the_reas
         assert f"`{v}` did not run" in md
     assert "no `scaled_default` run to select on" in md
     assert rep / "selection.md" in paths and not (rep / "F_selection_regret.png").exists()
+
+
+# --- split seed policy end to end, and the campaign's LOBO (real sources, block-weighted) ------------
+
+from tests._split_fixture import ALGOS as FX_ALGOS, REAL as FX_REAL, TAIL as FX_TAIL, make_out_dir
+
+
+def test_write_selection_reads_a_split_dir_with_seedless_fixed_runs_and_its_windows(tmp_path):
+    out = make_out_dir(tmp_path / "o")
+    runs = S.report.current_runs(out)
+    windows = S.load_windows(out, runs, ("default", "confstream"))
+    fixed = windows[(windows["arm"] == "default") & (windows["algo"] == "DenStream")]
+    assert len(fixed) == len(FX_TAIL) * len(FX_REAL + ("static_overlap",)) and fixed["seed"].isna().all()
+    halves = S.half_values(windows, S.report._tail_from_by_job(runs))
+    assert len(halves[(halves["arm"] == "default") & (halves["algo"] == "DenStream")]) == 2 * 7
+    paths = S.write_selection(out)
+    rows = pd.read_csv(out / "report" / "selection" / "selection_regret.csv")
+    assert set(rows["variant"]) == {"same_data", "prefix_suffix"}           # held-out seeds: not assumed
+    md = (out / "report" / "selection" / "selection.md").read_text()
+    assert S.NO_HELDOUT_SEEDS_NOTE in md and len(paths) >= 3
+
+
+def test_a_split_dir_reads_the_held_out_seed_split_only_on_seeds_given_and_a_shared_dir_keeps_the_legacy_ones():
+    split = pd.DataFrame({"seed_policy": ["split"]})
+    assert S.resolve_heldout_seeds(split) == (None, None)
+    assert S.resolve_heldout_seeds(split, (101,), (102, 103)) == ((101,), (102, 103))
+    assert S.resolve_heldout_seeds(pd.DataFrame({"seed": [1]})) == (S.SELECT_SEEDS, S.EVAL_SEEDS)
+    values = pd.DataFrame({"algo": ["A"], "fold": ["covtype"], "arm": ["default"], "seed": [None], "value": [0.1]})
+    assert S.wide(values, "default", seeds=[101]).empty                      # a None seed never casts
+
+
+def _plan(algos=FX_ALGOS, folds=FX_REAL):
+    """The fixture's design as a plan: every algorithm on every real fold under every LOBO regime."""
+    return S.lobo_plan(algos, folds, source="fixture design")
+
+
+def _lobo(out, plan=None, **kw):
+    from conf_pipeline import analysis_support as AS
+
+    runs = AS.run_table(out, arms=S.LOBO_REGIMES)
+    tw, filled = AS.fill_identical_windows(AS.tail_windows(out, runs, metrics=("lag_ari_win",)))
+    return S.lobo_real(tw, "lag_ari_win", plan=_plan() if plan is None else plan, runs=runs, **kw), filled
+
+
+def _flat(v):
+    return {w: v for w in FX_TAIL}
+
+
+def test_lobo_never_reads_the_held_out_source_to_choose_or_to_break_a_tie(tmp_path):
+    base, _ = _lobo(make_out_dir(tmp_path / "a"))
+    moved = {(a, "covtype", arm): _flat(0.99 if a == "SOStream" else 0.01)
+             for a in FX_ALGOS for arm in ("default", "scaled_default", "confstream")}
+    other, _ = _lobo(make_out_dir(tmp_path / "b", override=moved))
+    keep = ["selector", "pick", "n_tied", "tied", "band_set", "train_score", "candidates", "excluded", "train_windows"]
+    for res in (base, other):
+        res["f"] = res["folds"][(res["folds"]["held_out"] == "covtype") & (res["folds"]["variant"] == "same_data")]
+    pd.testing.assert_frame_equal(base["f"][keep].reset_index(drop=True), other["f"][keep].reset_index(drop=True))
+    assert not np.allclose(base["f"]["q_test"].fillna(-1), other["f"]["q_test"].fillna(-1))   # the test reading did move
+    sc_a = base["training_scores"].query("held_out == 'covtype'").reset_index(drop=True)
+    sc_b = other["training_scores"].query("held_out == 'covtype'").reset_index(drop=True)
+    pd.testing.assert_frame_equal(sc_a, sc_b)
+    assert "covtype" not in set(sc_a["train_block"])
+
+
+def test_lobo_weighs_each_training_source_block_once_whatever_its_variants(tmp_path):
+    # Under confstream, SOStream reads 0.62 on both INSECTS variants and 0.45 on the three other sources,
+    # DenStream 0.5 everywhere: per fold SOStream wins (0.518), per block it loses (0.4925).
+    over = {}
+    for f in FX_REAL:
+        for a in FX_ALGOS:
+            v = {"DenStream": 0.5, "SOStream": 0.62 if f.startswith("insects") else 0.45}.get(a, 0.1)
+            over[(a, f, "confstream")] = _flat(v)
+    res, _ = _lobo(make_out_dir(tmp_path / "o", override=over))
+    row = res["folds"].query("variant == 'same_data' and held_out == 'shuttle' and selector == 'lobo_target'").iloc[0]
+    assert row["pick"] == "DenStream" and row["n_train_blocks"] == 4 and row["n_train_folds"] == 5
+    sc = res["training_scores"].query("variant == 'same_data' and held_out == 'shuttle' and regime == 'confstream' "
+                                      "and algo == 'SOStream'")
+    assert sc.set_index("train_block").loc["insects", "n_folds"] == 2
+    assert row["train_score"] == pytest.approx(0.5)                   # SOStream's block mean is 0.4925
+
+
+def test_lobo_fills_the_identical_scaled_defaults_before_the_panel_so_every_algorithm_stays_a_candidate(tmp_path):
+    res, filled = _lobo(make_out_dir(tmp_path / "o"))
+    assert filled == ["HPStream", "RepStream"]
+    rows = res["folds"]
+    assert (rows["n_candidates"] == 4).all() and rows["excluded"].fillna("").eq("").all()
+
+
+def _status(res, analysis="primary", variant="same_data"):
+    st = res["status"]
+    return st[(st["analysis"] == analysis) & (st["variant"] == variant)].iloc[0]
+
+
+def test_a_full_panel_is_eligible_and_reads_as_designed(tmp_path):
+    res, _ = _lobo(make_out_dir(tmp_path / "o"))
+    st = _status(res)
+    assert st["analysis_status"] == "eligible" and st["n_blocks_expected"] == 5 and st["n_blocks_eligible"] == 5
+    assert st["plan_source"] == "fixture design" and not st["missing"]
+    rows = res["folds"].query("variant == 'same_data'")
+    assert (rows["panel_status"] == "eligible").all() and (rows["test_status"] == "available").all()
+    assert rows.query("selector != 'random'")["pick"].notna().all()
+    summ = res["summary"].query("variant == 'same_data' and analysis == 'all sources'").set_index("difference")
+    assert summ.loc["lobo_target_minus_lobo_scaled_default", "analysis_status"] == "eligible"
+    assert np.isfinite(summ.loc["lobo_target_minus_lobo_scaled_default", "mean"])
+    assert "reduced" not in res                                        # never made unless asked for
+
+
+def test_one_of_two_training_blocks_losing_common_support_makes_the_primary_ineligible(tmp_path):
+    # Three sources: holding out covtype leaves kdd99 and electricity to train on. On electricity
+    # DenStream reads only windows 20-21 under default and SOStream only 22-23: no common window.
+    folds = ("covtype", "kdd99", "electricity")
+    over = {("DenStream", "electricity", "default"): {20: 0.3, 21: 0.3, 22: None, 23: None},
+            ("SOStream", "electricity", "default"): {20: None, 21: None, 22: 0.3, 23: 0.3}}
+    out = make_out_dir(tmp_path / "o", folds=folds, override=over)
+    res, _ = _lobo(out, plan=_plan(folds=folds))
+    rows = res["folds"].query("variant == 'same_data' and held_out == 'covtype'")
+    assert (rows["panel_status"] == "ineligible").all()
+    assert rows.query("selector != 'random'")["pick"].isna().all()     # no choice from the reduced panel
+    assert rows["q_test"].isna().all()
+    assert rows["missing"].iloc[0] == "electricity: no tail window every candidate reads under every regime"
+    assert rows["expected_train_blocks"].iloc[0] == "electricity;kdd99"
+    assert rows["incomplete_train_blocks"].iloc[0] == "electricity"
+    st = _status(res)
+    assert st["analysis_status"] == "ineligible" and st["n_blocks_eligible"] < st["n_blocks_expected"]
+    summ = res["summary"].query("variant == 'same_data' and analysis == 'all sources'").set_index("difference")
+    assert summ.loc["lobo_target_minus_lobo_scaled_default", "analysis_status"] == "ineligible"
+    assert np.isnan(summ.loc["lobo_target_minus_lobo_scaled_default", "mean"])   # no headline on a narrowed panel
+
+
+def test_a_training_block_with_no_job_on_file_is_expected_from_the_plan_not_from_the_results(tmp_path):
+    out = make_out_dir(tmp_path / "o", folds=tuple(f for f in FX_REAL if f != "electricity"))
+    res, _ = _lobo(out)                                                # the plan still names electricity
+    st = _status(res)
+    assert st["analysis_status"] == "ineligible" and "electricity" in st["expected_blocks"].split(";")
+    assert "DenStream/electricity/confstream: not on file" in st["missing"]
+    rows = res["folds"].query("variant == 'same_data' and held_out == 'electricity'").set_index("selector")
+    assert rows.loc["lobo_target", "panel_status"] == "eligible"       # its own training panel is whole
+    assert rows.loc["lobo_target", "test_status"] == "unavailable"     # but it has nothing to be tested on
+    assert rows.loc["lobo_target", "pick"] is not None and np.isnan(rows.loc["lobo_target", "q_test"])
+    other = res["folds"].query("variant == 'same_data' and held_out == 'covtype'")
+    assert (other["panel_status"] == "ineligible").all()
+
+
+def test_a_required_regime_missing_from_the_out_dir_makes_the_primary_ineligible(tmp_path):
+    out = make_out_dir(tmp_path / "o", arms=("default", "confstream"))
+    res, _ = _lobo(out)
+    st = _status(res)
+    assert st["analysis_status"] == "ineligible" and st["missing_regimes"] == "scaled_default"
+    rows = res["folds"].query("variant == 'same_data'")
+    assert (rows["panel_status"] == "ineligible").all() and rows.query("selector != 'random'")["pick"].isna().all()
+
+
+def test_test_source_values_and_labels_never_move_the_choice_or_the_candidates(tmp_path):
+    base, _ = _lobo(make_out_dir(tmp_path / "a"))
+    # the held-out source's readings move, and on two windows its labels leave a single class (no reading)
+    moved = {(a, "shuttle", "confstream"): {20: None, 21: None, 22: 0.9 if a == "RepStream" else 0.05, 23: 0.05}
+             for a in FX_ALGOS}
+    moved.update({(a, "shuttle", arm): _flat(0.99 if a == "SOStream" else 0.0)
+                  for a in FX_ALGOS for arm in ("default", "scaled_default")})
+    other, _ = _lobo(make_out_dir(tmp_path / "b", override=moved))
+    keep = ["selector", "pick", "n_tied", "tied", "band_set", "train_score", "candidates", "excluded",
+            "train_windows", "panel_status"]
+    a = base["folds"].query("held_out == 'shuttle'")[keep].reset_index(drop=True)
+    b = other["folds"].query("held_out == 'shuttle'")[keep].reset_index(drop=True)
+    pd.testing.assert_frame_equal(a, b)
+    assert other["folds"].query("held_out == 'shuttle' and variant == 'same_data'")["test_windows"].iloc[0] == 2
+
+
+@pytest.mark.parametrize("status", ["error", "timeout", "oom", None])
+def test_a_missing_or_failed_test_job_keeps_the_choice_and_says_why_the_test_is_unavailable(tmp_path, status):
+    base, _ = _lobo(make_out_dir(tmp_path / "a"))
+    out = make_out_dir(tmp_path / "b", drop={("DenStream", "kdd99", "confstream")})
+    runs = [json.loads(x) for x in (out / "runs.jsonl").read_text().splitlines() if x]
+    if status is None:                                                 # never written at all
+        runs = [r for r in runs if not (r["algo"] == "DenStream" and r["fold"] == "kdd99" and r["arm"] == "confstream")]
+    else:
+        for r in runs:
+            if r["algo"] == "DenStream" and r["fold"] == "kdd99" and r["arm"] == "confstream":
+                r["status"] = status
+    (out / "runs.jsonl").write_text("\n".join(json.dumps(r) for r in runs) + "\n")
+    res, _ = _lobo(out)
+    keep = ["selector", "pick", "n_tied", "tied", "train_score", "candidates", "excluded", "panel_status"]
+    a = base["folds"].query("held_out == 'kdd99'")[keep].reset_index(drop=True)
+    b = res["folds"].query("held_out == 'kdd99'")[keep].reset_index(drop=True)
+    pd.testing.assert_frame_equal(a, b)                                # the choice and the candidates hold
+    rows = res["folds"].query("variant == 'same_data' and held_out == 'kdd99'")
+    assert (rows["test_status"] == "unavailable").all() and rows["q_test"].isna().all() and rows["regret"].isna().all()
+    why = status if status is not None else "not on file"
+    assert all(f"DenStream/kdd99/confstream: {why}" in n for n in rows["test_missing"])
+    assert _status(res)["analysis_status"] == "ineligible"            # kdd99 also trains the other blocks
+
+
+def test_a_reduced_panel_is_a_sensitivity_made_only_on_request_and_kept_apart(tmp_path):
+    out = make_out_dir(tmp_path / "o", drop={("DenStream", "kdd99", "confstream")})
+    res, _ = _lobo(out)
+    assert "reduced" not in res
+    res, _ = _lobo(out, reduced_panel=True)
+    prim = res["folds"].query("variant == 'same_data' and held_out == 'covtype'")
+    assert prim.query("selector != 'random'")["pick"].isna().all()   # the primary is untouched by the request
+    red = res["reduced"]["folds"].query("variant == 'same_data'")
+    assert (red["analysis"] == "reduced_panel").all()
+    others = red[red["held_out"] != "kdd99"]
+    assert (others["n_candidates"] == 3).all() and others["excluded"].str.contains("DenStream").all()
+    assert not others["candidates"].str.contains("DenStream").any()   # excluded for every selector alike
+    assert (red[red["held_out"] == "kdd99"]["n_candidates"] == 4).all()
+    rsum = res["reduced"]["summary"]
+    assert (rsum["analysis_status"] == "sensitivity: reduced panel").all()
+
+
+def test_the_plan_comes_from_the_campaign_inventory_with_the_identical_scaled_defaults_read_through_default():
+    jobs = [{"algo": a, "fold": f, "arm": arm, "seed": None, "model_seed": None, "config_id": None}
+            for a in ("DenStream", "HPStream") for f in ("covtype", "static_overlap")
+            for arm in ("default", "scaled_default", "confstream") if not (a == "HPStream" and arm == "scaled_default")]
+    skipped = [{"algo": "HPStream", "fold": f, "arm": "scaled_default", "seed": None, "model_seed": None,
+                "reason": "identical"} for f in ("covtype", "static_overlap")]
+    plan = S.plan_from_inventory({"jobs": jobs, "skipped": skipped}, source="campaign manifest")
+    assert plan["algos"] == ["DenStream", "HPStream"] and plan["blocks"] == {"covtype": ["covtype"]}
+    assert plan["cells"][("HPStream", "covtype", "scaled_default")]["via"] == "default"
+    assert plan["cells"][("DenStream", "covtype", "confstream")]["jobs"] == [
+        ("DenStream", "covtype", "confstream", None, None, None)]
+
+
+def test_an_exact_tie_goes_to_the_algorithm_name_that_sorts_first_and_random_is_the_exact_mean(tmp_path):
+    over = {(a, f, arm): _flat(0.4 if a in ("RepStream", "HPStream") else 0.2)
+            for a in FX_ALGOS for f in FX_REAL for arm in ("default", "scaled_default", "confstream")}
+    res, _ = _lobo(make_out_dir(tmp_path / "o", override=over))
+    rows = res["folds"].query("variant == 'same_data' and held_out == 'kdd99'").set_index("selector")
+    for s in ("lobo_default", "lobo_scaled_default", "lobo_target"):
+        assert rows.loc[s, "pick"] == "HPStream" and rows.loc[s, "n_tied"] == 2 and rows.loc[s, "tied"] == "HPStream;RepStream"
+    assert rows.loc["random", "q_test"] == pytest.approx((0.4 + 0.4 + 0.2 + 0.2) / 4)
+    assert rows.loc["lobo_target", "regret"] == pytest.approx(0.0)
+    assert rows.loc["random", "regret"] == pytest.approx(0.1)
+
+
+def test_lobo_reads_real_sources_only_and_reruns_without_each_source_shuttle_included(tmp_path):
+    res, _ = _lobo(make_out_dir(tmp_path / "o"))
+    assert set(res["folds"]["held_out"]) == {"covtype", "kdd99", "electricity", "shuttle", "insects"}
+    assert "static_overlap" not in set(res["training_scores"]["train_block"])
+    loso = res["loso"]
+    assert "without shuttle (drop Shuttle)" in set(loso["analysis"])
+    prim = loso.query("variant == 'same_data' and difference == 'lobo_target_minus_lobo_scaled_default'")
+    assert set(prim["n_blocks"]) == {4}
+    diffs = res["differences"].query("variant == 'same_data'").set_index("held_out")
+    q = res["folds"].query("variant == 'same_data'").set_index(["held_out", "selector"])["q_test"]
+    for b in diffs.index:
+        assert diffs.loc[b, "lobo_target_minus_lobo_scaled_default"] == pytest.approx(
+            q[(b, "lobo_target")] - q[(b, "lobo_scaled_default")])
+    summ = res["summary"].query("variant == 'same_data' and analysis == 'all sources'").set_index("difference")
+    assert summ.loc["lobo_target_minus_lobo_scaled_default", "n_blocks"] == 5
+
+
+def test_the_lobo_cli_writes_its_tables(tmp_path):
+    out = make_out_dir(tmp_path / "o")
+    S.main(["--out-dir", str(out), "--lobo"])
+    rep = out / "report" / "lobo"
+    for name in ("lobo_folds.csv", "lobo_training_scores.csv", "lobo_differences.csv", "lobo_summary.csv",
+                 "lobo_loso.csv", "coverage.csv", "lobo.md"):
+        assert (rep / name).exists()
+    assert "Tie policy" in (rep / "lobo.md").read_text()
+    S.main(["--out-dir", str(out), "--lobo", "--metric", "nmi"])
+    assert (out / "report" / "lobo_nmi" / "lobo_folds.csv").exists()
+
+
+def _fixture_config(tmp_path, out, folds=FX_REAL):
+    """A campaign config whose inventory is the fixture's design (the campaign's own protocol, the
+    fixture's streams, arms, algorithms and tuner seeds)."""
+    cfg = json.loads((C.PIPELINE_ROOT / "campaigns" / "mechanism_pilot.json").read_text())
+    cfg.update(folds=list(folds), arms=["default", "scaled_default", "confstream"], out_dir=str(out),
+               groups=[{"name": "fixture", "algos": list(FX_ALGOS), "tuner_seeds": [101, 102]}])
+    path = tmp_path / "campaign.json"
+    path.write_text(json.dumps(cfg))
+    # the run manifest a campaign's run would leave, with the protocol keys the plan is checked against
+    proto = {k: cfg["protocol"][k] for k in S._PLAN_PROTOCOL_KEYS}
+    (out / "manifest.json").write_text(json.dumps({"protocol": {**proto, "runtime_factor": None}}))
+    return path
+
+
+def test_the_lobo_cli_reads_the_expected_panel_from_the_campaign_plan(tmp_path):
+    out = make_out_dir(tmp_path / "o")
+    S.main(["--out-dir", str(out), "--lobo", "--campaign-config", str(_fixture_config(tmp_path, out))])
+    rep = out / "report" / "lobo"
+    st = pd.read_csv(rep / "lobo_status.csv").set_index("variant")
+    assert st.loc["same_data", "analysis_status"] == "eligible" and st.loc["same_data", "n_blocks_eligible"] == 5
+    assert st.loc["same_data", "plan_source"].startswith("campaign config")
+    summ = pd.read_csv(rep / "lobo_summary.csv").query("variant == 'same_data' and analysis == 'all sources'")
+    assert np.isfinite(summ.set_index("difference").loc["lobo_target_minus_lobo_scaled_default", "mean"])
+    cov = pd.read_csv(rep / "coverage.csv").set_index("arm")
+    assert cov.loc["confstream", "n_jobs_expected"] == cov.loc["confstream", "n_jobs_on_file"] == 6 * 4 * 2
+    assert (cov["n_missing"] == 0).all()                              # real folds only, the plan's jobs
+    md = (rep / "lobo.md").read_text()
+    assert "## Status of the primary reading" in md and "**eligible**" in md
+    assert not (rep / "reduced_panel").exists()
+
+
+def test_the_lobo_cli_without_a_plan_or_with_a_job_missing_says_the_primary_is_not_eligible(tmp_path):
+    out = make_out_dir(tmp_path / "o")
+    S.main(["--out-dir", str(out), "--lobo"])                        # no manifest, no config: nothing to check against
+    rep = out / "report" / "lobo"
+    st = pd.read_csv(rep / "lobo_status.csv")
+    assert (st["analysis_status"] == "ineligible").all()
+    assert st["missing"].str.contains("no plan on file").all()
+    summ = pd.read_csv(rep / "lobo_summary.csv")
+    assert summ["mean"].isna().all()
+    assert "not eligible: means left undefined" in (rep / "lobo.md").read_text()
+    # a planned training job that failed: the plan names it, so the primary is not eligible either
+    out2 = make_out_dir(tmp_path / "o2", drop={("SOStream", "electricity", "default")})
+    cfg = _fixture_config(tmp_path, out2)
+    S.main(["--out-dir", str(out2), "--lobo", "--campaign-config", str(cfg), "--reduced-panel"])
+    rep2 = out2 / "report" / "lobo"
+    st2 = pd.read_csv(rep2 / "lobo_status.csv").set_index("variant")
+    assert st2.loc["same_data", "analysis_status"] == "ineligible"
+    assert "SOStream/electricity/default: error (1 of 1 jobs)" in st2.loc["same_data", "missing"]
+    assert st2.loc["same_data", "missing_regimes"] == "default"
+    red = pd.read_csv(rep2 / "reduced_panel" / "lobo_status.csv")
+    assert (red["analysis_status"] == "sensitivity: reduced panel").all()
+    red_rows = pd.read_csv(rep2 / "reduced_panel" / "lobo_folds.csv")
+    assert (red_rows["analysis"] == "reduced_panel").all()
+    prim_rows = pd.read_csv(rep2 / "lobo_folds.csv")
+    assert (prim_rows["analysis"] == "primary").all()
+    assert "Sensitivity: reduced panel" in (rep2 / "lobo.md").read_text()
+
+
+def test_a_campaign_config_is_the_plan_only_for_a_dir_run_under_its_protocol(tmp_path):
+    out = make_out_dir(tmp_path / "o")
+    cfg = _fixture_config(tmp_path, out)
+    m = json.loads((out / "manifest.json").read_text())
+    m["protocol"]["h"] = 200                                          # the dir ran another window size
+    (out / "manifest.json").write_text(json.dumps(m))
+    S.main(["--out-dir", str(out), "--lobo", "--campaign-config", str(cfg), "--reduced-panel"])
+    rep = out / "report" / "lobo"
+    st = pd.read_csv(rep / "lobo_status.csv").set_index("variant")
+    assert st.loc["same_data", "analysis_status"] == "ineligible"
+    assert "plan: protocol.h: the dir ran 200, the plan says 1000" in st.loc["same_data", "missing"]
+    rows = pd.read_csv(rep / "lobo_folds.csv")
+    assert rows.query("selector != 'random'")["pick"].isna().all()
+    red = pd.read_csv(rep / "reduced_panel" / "lobo_folds.csv")
+    assert red.query("selector != 'random'")["pick"].isna().all()   # a reduced panel does not mend a protocol
+    (out / "manifest.json").unlink()                                 # no run manifest: nothing to check against
+    S.main(["--out-dir", str(out), "--lobo", "--campaign-config", str(cfg)])
+    st = pd.read_csv(rep / "lobo_status.csv").set_index("variant")
+    assert st.loc["same_data", "analysis_status"] == "ineligible" and "no run manifest" in st.loc["same_data", "missing"]
+
+
+# --- review round: LOSO under an ineligible primary, replicates, label variants -------------------
+
+def _drop_run(out, algo, fold, arm, seed):
+    """Remove one run (its summary and its windows) from a fixture dir, as if it was never written."""
+    for name in ("runs.jsonl", "windows.jsonl"):
+        rows = [json.loads(x) for x in (out / name).read_text().splitlines() if x]
+        rows = [r for r in rows if not (r["algo"] == algo and r["fold"] == fold and r["arm"] == arm
+                                        and r.get("seed") == seed)]
+        (out / name).write_text("\n".join(json.dumps(r) for r in rows) + "\n")
+
+
+def test_leave_one_source_out_is_not_read_while_the_primary_is_not_eligible(tmp_path):
+    res, _ = _lobo(make_out_dir(tmp_path / "o", drop={("DenStream", "shuttle", "default")}))
+    assert _status(res)["analysis_status"] == "ineligible"
+    lo = res["loso"].query("variant == 'same_data'")
+    assert (lo["analysis_status"] == S.LOSO_NOT_READ).all() and lo["mean"].isna().all()
+    # dropping shuttle, the block that holds the gap, would otherwise read as a whole panel
+    assert "without shuttle (drop Shuttle)" in set(lo["analysis"])
+    full, _ = _lobo(make_out_dir(tmp_path / "f"))
+    assert (full["loso"]["analysis_status"] == "eligible").all()
+
+
+def test_a_cell_level_plan_still_misses_a_tuner_seed_that_one_fold_lacks(tmp_path):
+    out = make_out_dir(tmp_path / "o")
+    _drop_run(out, "DenStream", "kdd99", "confstream", 102)
+    res, _ = _lobo(out)                                  # the fixture's plan names cells only
+    st = _status(res)
+    assert st["analysis_status"] == "ineligible"
+    assert "DenStream/kdd99/confstream: not on file (1 of 2 jobs)" in st["missing"]
+    rows = res["folds"].query("variant == 'same_data' and held_out == 'kdd99'")
+    assert (rows["test_status"] == "unavailable").all()  # and the choice there is kept
+    assert rows.query("selector != 'random'")["pick"].notna().all()
+
+
+def test_a_window_one_replicate_does_not_read_is_left_out_of_the_cell_not_averaged_over_the_others(tmp_path):
+    out = make_out_dir(tmp_path / "o")
+    rows = [json.loads(x) for x in (out / "windows.jsonl").read_text().splitlines() if x]
+    for r in rows:
+        if (r["algo"], r["fold"], r["arm"], r["seed"]) == ("DenStream", "covtype", "confstream", 102) and r["window"] >= 22:
+            r["lag_ari_win"] = None
+    (out / "windows.jsonl").write_text("\n".join(json.dumps(r) for r in rows) + "\n")
+    res, _ = _lobo(out)
+    st = _status(res)
+    assert st["analysis_status"] == "eligible" and st["n_windows_partial_replicates"] == 2
+    assert st["partial_replicates"] == "DenStream/covtype/confstream: 2"
+    base, _ = _lobo(make_out_dir(tmp_path / "b"))
+    a = res["folds"].query("variant == 'same_data' and held_out == 'kdd99'")["train_windows"].iloc[0]
+    b = base["folds"].query("variant == 'same_data' and held_out == 'kdd99'")["train_windows"].iloc[0]
+    assert b - a == 2                                    # covtype's windows 22 and 23 left the common support
+
+
+def test_a_label_variant_in_a_campaign_is_a_candidate_under_its_own_name():
+    jobs = [{"algo": a, "fold": "covtype", "arm": arm, "seed": None, "model_seed": None, "config_id": None}
+            for a in ("DenStream", "HPStreamStableLabels") for arm in ("default", "confstream")]
+    plan = S.plan_from_inventory({"jobs": jobs, "skipped": []}, source="campaign manifest")
+    assert plan["algos"] == ["DenStream", "HPStreamStableLabels"]
+    assert plan["cells"][("HPStreamStableLabels", "covtype", "scaled_default")]["via"] == "default"
+    assert S.plan_from_inventory({"jobs": [{**jobs[0], "algo": "DenStreamPatchedFast"}], "skipped": []},
+                                 source="x")["algos"] == []                     # an implementation variant is not
+
+
+def test_a_label_variant_beside_its_reference_makes_the_plan_ineligible(tmp_path):
+    plan = S.lobo_plan(["DenStream", "HPStream", "HPStreamStableLabels"], FX_REAL, source="x")
+    assert plan["problems"] and "HPStreamStableLabels and HPStream are both candidates" in plan["problems"][0]
+    res, _ = _lobo(make_out_dir(tmp_path / "o"), plan=plan)
+    assert _status(res)["analysis_status"] == "ineligible"
+    assert res["folds"].query("selector != 'random'")["pick"].isna().all()
+
+
+def test_the_plans_protocol_is_checked_arm_by_arm(tmp_path):
+    out = make_out_dir(tmp_path / "o")
+    cfg = _fixture_config(tmp_path, out)
+    m = json.loads((out / "manifest.json").read_text())
+    online = {"e_size": 3, "e_test": 2, "p_reset": 0.01, "tie_break": "micro_clusters", "log_signals": [],
+              "signal_noise": "label", "runtime_factor": None, "external_metrics": ["ari", "nmi", "cmm"]}
+    m["arms"] = {"confstream": online, "default": {**online, "e_size": 1, "e_test": 0}}
+    (out / "manifest.json").write_text(json.dumps(m))
+    probs = S.plan_protocol_problems(json.loads(cfg.read_text()), out)
+    assert "arms.confstream.e_size: the dir ran 3, the plan says 20" in probs
+    assert "arms.confstream.e_test: the dir ran 2, the plan says 10" in probs
+    assert "arms.confstream.log_signals: the dir ran [], the plan says ['stability']" in probs
+    assert "arms.default.log_signals: the dir ran [], the plan says ['stability']" in probs
+    assert not any(p.startswith("arms.default.e_size") for p in probs)      # a fixed arm runs one member

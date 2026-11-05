@@ -768,3 +768,226 @@ def test_the_oracle_keeps_the_silhouette_beside_other_logged_signals():
     ens.initialise(_blob_window(200, 0), window_index=0)
     rep = ens.process_window(_blob_window(200, 1), window_index=1)
     assert all(o.signals.get("silhouette") is not None and "silhouette_std" in o.signals for o in rep.outcomes)
+
+
+# --- diagnostics never move the trajectory ----------------------------------------------------
+
+def _trajectory(ens, n_windows=6, h=60):
+    """Every member's predictions hash and score, the incumbent and the births, window by window."""
+    ens.initialise(_blob_window(h, seed=0), window_index=0)
+    out = []
+    for w in range(1, n_windows + 1):
+        r = ens.process_window(_blob_window(h, seed=w), window_index=w)
+        out.append((r.incumbent.member_id,
+                    sorted((o.member_id, o.pred_sha, o.score, o.feasible_reason) for o in r.outcomes),
+                    [(m.id, m.params) for m in ens.test]))
+    return out
+
+
+def _events(ens):
+    return [{k: v for k, v in e.items()} for e in ens.drain_events()]
+
+
+def test_stability_and_the_snapshot_change_no_prediction_score_birth_or_decision():
+    off = _ensemble(e_size=4, e_test=2, seed=3)
+    on = _ensemble(e_size=4, e_test=2, seed=3, log_signals=("stability",))
+    assert _trajectory(off) == _trajectory(on)
+    assert _events(off) == _events(on)
+
+
+def test_the_snapshot_reads_one_reprediction_and_is_never_the_score():
+    ens = _ensemble(e_size=3, e_test=1, log_signals=("stability",))
+    calls = []
+    original = ConfStreamEnsemble._repredict
+
+    def counted(adapter, buffer):
+        calls.append(1)
+        return original(adapter, buffer)
+
+    ens._repredict = counted
+    ens.initialise(_blob_window(60, seed=0), window_index=0)
+    r = ens.process_window(_blob_window(60, seed=1), window_index=1)
+    assert len(calls) == len(r.outcomes)              # one reprediction per member, shared
+    for o in r.outcomes:
+        row = o.to_dict()
+        assert row["snap_silhouette_reason"] in ("valid", "single_label", "one_label_per_point")
+        assert row["sig_stability"] is not None and 0.0 <= row["snap_label_agreement"] <= 1.0
+        assert row["score"] == round(o.silhouette_raw if o.defined else UNDEFINED_SCORE, 6)
+
+
+def test_a_failing_diagnostic_is_recorded_and_changes_nothing_else():
+    off = _ensemble(e_size=4, e_test=2, seed=5)
+    on = _ensemble(e_size=4, e_test=2, seed=5, log_signals=("stability", "silhouette_std"))
+
+    def boom(adapter, buffer):
+        raise RuntimeError("no snapshot")
+
+    on._repredict = boom
+    assert _trajectory(off) == _trajectory(on)
+    last = on.active[0].last
+    assert last.error is None and last.diag_error == "stability: RuntimeError: no snapshot"
+    assert last.signals["stability"] is None and last.to_dict()["snap_silhouette"] is None
+
+
+class _NoisyModel:
+    """A model whose prediction draws from Python's and NumPy's global generators and changes its own
+    state: diagnostics must leave both the live model and the global draws where they were."""
+
+    def __init__(self):
+        self.n_predicted = 0
+        self.centers = {0: 0.0, 1: 5.0}
+
+    def learn_one(self, x):
+        pass
+
+    def predict_one(self, x):
+        self.n_predicted += 1
+        jitter = random.random() * 1e-3 + float(np.random.random()) * 1e-3
+        return min(self.centers, key=lambda c: abs(self.centers[c] - x["a"] - jitter))
+
+
+def _noisy_ensemble(log_signals=()):
+    from benchmark.algorithms.adapter import make_adapter
+
+    cfg = EnsembleConfig(e_size=2, e_test=1, lam=0.05, p_reset=0.0, log_signals=log_signals)
+    return ConfStreamEnsemble(space=SPACE, ctx=CTX, make_adapter=lambda p, s: make_adapter("noisy", _NoisyModel(), p),
+                              start_params=[START], config=cfg, rng=np.random.default_rng(0), seed=0)
+
+
+def test_diagnostics_isolate_the_global_generators_and_predict_on_a_copy():
+    runs = []
+    for signals in ((), ("stability",)):
+        random.seed(11)
+        np.random.seed(11)
+        ens = _noisy_ensemble(signals)
+        traj = _trajectory(ens, n_windows=4, h=40)
+        runs.append((traj, [m.adapter.model.n_predicted for m in ens.active], random.random(), np.random.random()))
+    assert runs[0] == runs[1]
+
+
+def test_a_decision_after_window_t_moves_nothing_scored_on_t_and_is_read_on_t_plus_1():
+    a, b = _ensemble(e_size=4, e_test=2, seed=8), _ensemble(e_size=4, e_test=2, seed=8)
+    for ens in (a, b):
+        ens.initialise(_blob_window(60, seed=0), window_index=0)
+        ens.process_window(_blob_window(60, seed=1), window_index=1)
+    forced = max(m.id for m in b.active if m.id != b._last_incumbent_id)
+    b.find(forced).outcome_override = 9.0               # only b's decision after window 2 changes
+    ra, rb = (e.process_window(_blob_window(60, seed=2), window_index=2) for e in (a, b))
+    assert [(o.member_id, o.pred_sha) for o in ra.outcomes] == [(o.member_id, o.pred_sha) for o in rb.outcomes]
+    assert (ra.lag.member_id, ra.lag.pred_sha) == (rb.lag.member_id, rb.lag.pred_sha)
+    assert rb.incumbent.member_id == forced != ra.incumbent.member_id
+    nb = b.process_window(_blob_window(60, seed=3), window_index=3)
+    assert nb.lag.member_id == forced and nb.lag.window_index == 3
+
+
+# --- the tie order is total and recorded --------------------------------------------------------
+
+def test_the_incumbent_key_counts_unknown_micro_clusters_as_zero_and_ends_on_the_member_id():
+    tied = [_outcome(5, 0.1, score=0.7, n_micro=None), _outcome(3, 0.9, score=0.7, n_micro=0)]
+    assert ConfStreamEnsemble.pick_incumbent(tied).member_id == 3
+    info = ConfStreamEnsemble.decision_info(tied, None)
+    assert info == {"decided_by": "member_id", "n_top_ties": 2, "tie_break": "micro_clusters", "usable": True}
+    fewer = [_outcome(5, 0.1, score=0.7, n_micro=4), _outcome(3, 0.9, score=0.7, n_micro=9)]
+    assert ConfStreamEnsemble.decision_info(fewer, None)["decided_by"] == "micro_clusters"
+    assert ConfStreamEnsemble.decision_info(fewer, 5)["decided_by"] == "micro_clusters"
+    same = [_outcome(5, 0.1, score=0.7, n_micro=4), _outcome(3, 0.9, score=0.7, n_micro=4)]
+    assert ConfStreamEnsemble.decision_info(same, 5)["decided_by"] == "incumbent"
+    assert ConfStreamEnsemble.pick_incumbent(same, 5).member_id == 5
+    best = [_outcome(1, 0.1, score=0.9), _outcome(2, 0.1, score=0.7)]
+    assert ConfStreamEnsemble.decision_info(best, None)["decided_by"] == "score"
+    valid_floor = [_outcome(4, 0.1, score=UNDEFINED_SCORE, defined=True), _outcome(2, 0.1, score=UNDEFINED_SCORE, defined=False)]
+    assert ConfStreamEnsemble.pick_incumbent(valid_floor).member_id == 4      # a valid -1 beats an undefined -1
+    assert ConfStreamEnsemble.decision_info(valid_floor, None)["decided_by"] == "usable"
+    nothing = [_outcome(4, 0.1, defined=False, score=UNDEFINED_SCORE), _outcome(2, 0.1, defined=False, score=UNDEFINED_SCORE)]
+    info = ConfStreamEnsemble.decision_info(nothing, 4)
+    assert ConfStreamEnsemble.pick_incumbent(nothing, 4).member_id == 4
+    assert info["usable"] is False and info["decided_by"] == "incumbent"
+    assert ConfStreamEnsemble.decision_info([_outcome(1, 0.1)], None)["decided_by"] == "only_member"
+
+
+def test_every_member_window_gets_a_score_status_that_says_why_its_score_is_what_it_is():
+    from benchmark.tuning.confstream import SCORE_STATUSES, score_status
+
+    ok = _outcome(1, 0.1)
+    ok.silhouette_reason = "valid"
+    assert score_status(ok) == "valid"
+    one = _outcome(2, 0.1, defined=False, score=UNDEFINED_SCORE)
+    one.silhouette_reason = "single_label"
+    assert score_status(one) == "undefined_single_label"
+    heavy = _outcome(3, 0.1, memory_mb=9999.0)
+    heavy.silhouette_reason = "valid"
+    apply_feasibility([heavy], EnsembleConfig(runtime_factor=None))
+    assert score_status(heavy) == "infeasible_memory"
+    broken = _outcome(4, 0.1, error="ValueError: x")
+    assert score_status(broken) == "member_error"
+    assert {score_status(o) for o in (ok, one, heavy, broken)} <= set(SCORE_STATUSES)
+    ens = _ensemble(e_size=3, e_test=1)
+    ens.initialise(_blob_window(40, seed=0), window_index=0)
+    r = ens.process_window(_blob_window(40, seed=1), window_index=1)
+    assert sum(r.status_counts.values()) == len(r.outcomes)
+    assert all(o.to_dict()["score_status"] in SCORE_STATUSES for o in r.outcomes)
+
+
+# --- the lifecycle log -------------------------------------------------------------------------
+
+def _run_events(n_windows=5, **kw):
+    ens = _ensemble(e_size=4, e_test=2, seed=2, **kw)
+    ens.initialise(_blob_window(40, seed=0), window_index=0)
+    for w in range(1, n_windows + 1):
+        ens.process_window(_blob_window(40, seed=w), window_index=w)
+    return ens, ens.drain_events()
+
+
+def test_lifecycle_events_record_every_birth_challenge_and_decision():
+    ens, events = _run_events()
+    births = [e for e in events if e["event"] == "birth"]
+    assert [e["origin"] for e in births[:4]] == ["start", "initial_offspring", "initial_offspring", "initial_offspring"]
+    assert len(births) == 4 + 2 * 5 and all(e["warm_start_samples"] == 40 and e["error"] is None for e in births)
+    assert all(e["origin"] == "evolutionary" and e["reset"] is False for e in births[4:])
+    decisions = [e for e in events if e["event"] == "decision"]
+    assert [e["window"] for e in decisions] == [1, 2, 3, 4, 5]
+    assert all(e["n_evaluated"] == (4 if e["window"] == 1 else 6) for e in decisions)
+    challenges = [e for e in events if e["event"] == "challenge"]
+    assert len(challenges) == 2 * 4 and {e["outcome"] for e in challenges} <= {"accepted", "rejected"}
+    assert ens.drain_events() == []
+
+
+def test_uniform_children_keep_the_initial_population_and_the_schedule_of_the_evolutionary_ones():
+    _, evo = _run_events(sampler="evolutionary")
+    _, uni = _run_events(sampler="uniform")
+    first = lambda ev: [(e["member_id"], e["params"]) for e in ev if e["event"] == "birth" and e["window"] == 0]
+    assert first(evo) == first(uni)
+    sched = lambda ev: [(e["event"], e["window"], e.get("n_evaluated")) for e in ev if e["event"] in ("birth", "decision")]
+    assert sched(evo) == sched(uni)
+    assert {e["origin"] for e in uni if e["event"] == "birth" and e["window"] > 0} == {"uniform"}
+
+
+def test_the_frozen_arms_follow_confstream_event_for_event_until_the_freeze_decision():
+    t0 = 2
+    _, online = _run_events(n_windows=4)
+    _, prefix = _run_events(n_windows=4, freeze_after_window=t0)
+    _, reinit = _run_events(n_windows=4, freeze_after_window=t0, reinit_after_freeze=True)
+
+    def until_freeze(ev):
+        out = []
+        for e in ev:
+            out.append(e)
+            if e["event"] == "decision" and e["window"] == t0:
+                return out
+        raise AssertionError("no decision at the freeze window")
+
+    assert until_freeze(prefix) == until_freeze(online) == until_freeze(reinit)
+    assert not any(e["event"] == "freeze" for e in online)
+    after = lambda ev: [e for e in ev[len(until_freeze(ev)):] if e["event"] == "birth"]  # noqa: E731
+    assert {e["origin"] for e in after(online)} == {"evolutionary"}
+    assert after(prefix) == []
+    assert after(reinit) and {e["origin"] for e in after(reinit)} == {"reinit_copy"}
+
+
+def test_reinit_copies_after_the_freeze_carry_the_frozen_parameters_and_are_warm_started():
+    _, events = _run_events(n_windows=4, freeze_after_window=2, reinit_after_freeze=True)
+    (freeze,) = [e for e in events if e["event"] == "freeze"]
+    after = [e for e in events if e["event"] == "birth" and e["window"] >= freeze["window"]]
+    assert after and all(e["origin"] == "reinit_copy" and e["params"] == freeze["params"]
+                         and e["parent_id"] == freeze["member_id"] and e["warm_start_samples"] == 40 for e in after)
+    assert any(e["event"] == "challenge" and e["outcome"] == "filled" for e in events)

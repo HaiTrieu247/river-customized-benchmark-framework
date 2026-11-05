@@ -37,6 +37,7 @@ reports_out/
 *.svg
 *.json
 !tests/fixtures/*.json
+!conf_pipeline/campaigns/*.json
 results.json
 
 # Editor / IDE / tooling

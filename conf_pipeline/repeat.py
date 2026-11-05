@@ -10,7 +10,15 @@ jobs by (algo, fold, seed, arm, config_id) and compares, per window,
   lagged member's predictions included as a hash (``pred_sha``; runs made before 2026-10-23
   have none and compare on the rest);
 - the ensemble (member logs, when both runs wrote them): which members were alive, and each
-  one's ``MEMBER_FIELDS``.
+  one's ``MEMBER_FIELDS``;
+- the lifecycle (``lifecycle/``, when both runs wrote it): every birth, challenge, decision and
+  freeze event, field by field (``LIFECYCLE_IGNORED`` aside).
+
+A job is keyed by ``KEY``, its model seed included, so a fixed configuration run on two model
+seeds is two jobs; a deterministic fixed configuration (no seed) reads its member and lifecycle
+logs under ``seedx``, as ``run.job_name`` writes them. ``--strict`` exits non-zero unless every job
+is on both sides, ok, identical, with evaluation windows and (``--require-members``) member logs:
+the check a reproducibility smoke runs.
 
 A job's ``cause`` is read at the first window where the members part: ``runtime gate`` when a
 member was shed for its runtime on one side only, ``model or scoring`` when the same member with
@@ -37,19 +45,26 @@ import pandas as pd
 from . import _common as C
 from .manifest import canonical
 
-KEY = ("algo", "fold", "seed", "arm", "config_id")
+KEY = ("algo", "fold", "seed", "arm", "config_id", "model_seed")
+#: Lifecycle fields that are not part of the trajectory (none today: events carry no timing).
+LIFECYCLE_IGNORED: tuple[str, ...] = ()
 WINDOW_FIELDS = ("incumbent_id", "params", "pred_sha", "score", "feasible_reason",
                  "lag_member_id", "lag_pred_sha", "lag_ari_win")
 MEMBER_FIELDS = ("params", "pred_sha", "score", "feasible_reason")
 JOB_COLS = [*KEY, "status", "identical", "n_windows", "first_divergence_window", "first_divergence_field",
             "n_windows_differing", "max_abs_lag_ari_diff", "a_tail", "b_tail", "tail_diff", "wall_ratio",
             "members_logged", "member_first_divergence_window", "member_first_divergence_field", "cause",
+            "lifecycle_logged", "n_lifecycle_events", "lifecycle_first_divergence",
             "a_share_over_factor", "b_share_over_factor"]
 WINDOW_COLS = [*KEY, "window", "fields", "a_incumbent_id", "b_incumbent_id", "a_lag_ari_win", "b_lag_ari_win"]
 
 
 def _key(row: dict) -> tuple:
-    return tuple(row.get(k) for k in KEY)
+    from .report import _cid, _seed_key
+    from .run import _model_seed_of
+
+    return (row.get("algo"), row.get("fold"), _seed_key(row.get("seed")), row.get("arm"),
+            _cid(row.get("config_id")), _seed_key(_model_seed_of(row)))
 
 
 def _summaries(out_dir: Path) -> dict:
@@ -68,10 +83,37 @@ def _windows(out_dir: Path) -> dict:
     return out
 
 
+def _log_name(key: tuple) -> str:
+    """The file stem ``run.job_name`` gives the job ``key`` (``seedx`` for a run without a seed)."""
+    from .run import job_name
+
+    algo, fold, seed, arm, cid, _ = key
+    return job_name({"algo": algo, "fold": fold, "seed": seed, "arm": arm, "config_id": cid})
+
+
 def _member_path(out_dir: Path, key: tuple) -> Path:
-    algo, fold, seed, arm, cid = key
-    name = f"{algo}__{fold}__seed{seed}__{arm}" + (f"__cfg{cid}" if cid is not None else "")
-    return Path(out_dir) / C.MEMBERS_DIR.name / f"{name}.jsonl"
+    return Path(out_dir) / C.MEMBERS_DIR.name / f"{_log_name(key)}.jsonl"
+
+
+def _lifecycle(out_dir: Path, key: tuple) -> list[dict] | None:
+    from .run import LIFECYCLE_DIR
+
+    path = Path(out_dir) / LIFECYCLE_DIR / f"{_log_name(key)}.jsonl"
+    if not path.exists():
+        return None
+    return [{k: v for k, v in r.items() if k not in LIFECYCLE_IGNORED} for r in C.read_jsonl(path)]
+
+
+def _lifecycle_divergence(la: list[dict], lb: list[dict]) -> str | None:
+    """The first lifecycle event the two runs disagree on, as ``"<index> <event> <field>"``."""
+    for i in range(max(len(la), len(lb))):
+        if i >= len(la) or i >= len(lb):
+            return f"{i} missing on {'a' if i >= len(la) else 'b'}"
+        a, b = la[i], lb[i]
+        field = next((k for k in sorted(set(a) | set(b), key=str) if not _same(a.get(k), b.get(k))), None)
+        if field is not None:
+            return f"{i} {a.get('event')} {field}"
+    return None
 
 
 def _members(out_dir: Path, key: tuple) -> dict | None:
@@ -142,6 +184,10 @@ def compare(dir_a: Path, dir_b: Path, factor: float = C.RUNTIME_FACTOR) -> tuple
             jobs.append({**row, "status": "only in a" if key in sa else "only in b", "identical": False})
             continue
         a, b = sa[key], sb[key]
+        if a.get("status") == "skipped" and b.get("status") == "skipped":
+            # a job both runs wrote down as not run (an identical configuration): nothing to compare
+            jobs.append({**row, "status": "skipped on both", "identical": a.get("error") == b.get("error")})
+            continue
         if a.get("status") != "ok" or b.get("status") != "ok":
             jobs.append({**row, "status": f"a: {a.get('status')}, b: {b.get('status')}", "identical": False})
             continue
@@ -169,9 +215,14 @@ def compare(dir_a: Path, dir_b: Path, factor: float = C.RUNTIME_FACTOR) -> tuple
         if cause is None:
             cause = ("none" if first_w is None else "tie-break") if logged else (
                 "none" if first_w is None else "not logged")
+        la, lb = _lifecycle(dir_a, key), _lifecycle(dir_b, key)
+        life_logged = la is not None and lb is not None
+        life_div = _lifecycle_divergence(la, lb) if life_logged else None
         tail_a, tail_b = a.get("lag_ari_win_tail_mean"), b.get("lag_ari_win_tail_mean")
         jobs.append({
-            **row, "status": "both", "identical": first_w is None and mw is None, "n_windows": len(ta),
+            **row, "status": "both", "identical": first_w is None and mw is None and life_div is None,
+            "n_windows": len(ta), "lifecycle_logged": life_logged,
+            "n_lifecycle_events": len(la) if life_logged else None, "lifecycle_first_divergence": life_div,
             "first_divergence_window": first_w, "first_divergence_field": first_f, "n_windows_differing": n_diff,
             "max_abs_lag_ari_diff": max_ari, "a_tail": tail_a, "b_tail": tail_b,
             "tail_diff": (tail_b - tail_a) if tail_a is not None and tail_b is not None else None,
@@ -180,6 +231,30 @@ def compare(dir_a: Path, dir_b: Path, factor: float = C.RUNTIME_FACTOR) -> tuple
             "cause": cause, "a_share_over_factor": _share_over(ma, factor), "b_share_over_factor": _share_over(mb, factor),
         })
     return pd.DataFrame(jobs).reindex(columns=JOB_COLS), pd.DataFrame(diffs).reindex(columns=WINDOW_COLS)
+
+
+def strict_failures(jobs: pd.DataFrame, require_members: bool = False) -> list[str]:
+    """Why a reproducibility check fails, one line per job: on one side only or not ok, not identical,
+    without evaluation windows, or (``require_members``) without member logs on both sides. A job both
+    sides skipped for the same reason is no failure; no job at all is one."""
+    if jobs.empty:
+        return ["no job on either side"]
+    out = []
+    for r in jobs.to_dict("records"):
+        name = " ".join(str(r.get(k)) for k in KEY)
+        if r.get("status") == "skipped on both" and r.get("identical"):
+            continue
+        if r.get("status") != "both":
+            out.append(f"{name}: {r.get('status')}")
+            continue
+        if not r.get("n_windows"):
+            out.append(f"{name}: no evaluation window")
+        if require_members and not r.get("members_logged"):
+            out.append(f"{name}: member logs missing on a side")
+        if not r.get("identical"):
+            out.append(f"{name}: differs (window {r.get('first_divergence_window')}, member window "
+                       f"{r.get('member_first_divergence_window')}, lifecycle {r.get('lifecycle_first_divergence')})")
+    return out
 
 
 def write_repeat(dir_a: Path, dir_b: Path, out: Path, factor: float = C.RUNTIME_FACTOR) -> list[Path]:
@@ -194,7 +269,7 @@ def write_repeat(dir_a: Path, dir_b: Path, out: Path, factor: float = C.RUNTIME_
     both = jobs[jobs["status"] == "both"]
     lines = [
         "# Repeatability: two runs of one protocol", "",
-        f"`a` = `{dir_a}`, `b` = `{dir_b}`. Jobs are paired by (algo, fold, seed, arm, config_id); per window "
+        f"`a` = `{dir_a}`, `b` = `{dir_b}`. Jobs are paired by (algo, fold, seed, arm, config_id, model_seed); per window "
         f"the trajectory fields {', '.join(f'`{f}`' for f in WINDOW_FIELDS)} are compared exactly, and with "
         f"member logs on both sides every member's {', '.join(f'`{f}`' for f in MEMBER_FIELDS)}. Runtimes "
         "are expected to differ and are only reported.", "",
@@ -219,17 +294,28 @@ def write_repeat(dir_a: Path, dir_b: Path, out: Path, factor: float = C.RUNTIME_
     return paths
 
 
-def main() -> None:
+def main(argv=None) -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--a", required=True, help="one out dir")
     parser.add_argument("--b", required=True, help="the other, made under the same protocol")
     parser.add_argument("--out", default=None, help="where the tables go (default: <b>/report/repeat)")
     parser.add_argument("--factor", type=float, default=C.RUNTIME_FACTOR,
                         help="the runtime cap replayed on the member logs")
-    args = parser.parse_args()
+    parser.add_argument("--strict", action="store_true",
+                        help="exit 1 unless every job is on both sides, ok, identical and has evaluation windows")
+    parser.add_argument("--require-members", action="store_true",
+                        help="with --strict: also fail a job without member logs on both sides")
+    args = parser.parse_args(argv)
     out = Path(args.out) if args.out else Path(args.b) / C.REPORT_DIR.name / "repeat"
     for p in write_repeat(Path(args.a), Path(args.b), out, args.factor):
         print(p)
+    if args.strict:
+        jobs, _ = compare(Path(args.a), Path(args.b), args.factor)
+        failures = strict_failures(jobs, args.require_members)
+        if failures:
+            print("NOT REPRODUCED:\n  " + "\n  ".join(failures))
+            raise SystemExit(1)
+        print(f"reproduced: {len(jobs)} jobs identical")
 
 
 if __name__ == "__main__":

@@ -23,6 +23,9 @@ conditions each section states.
 
 GAP-5 was measured on 2026-10-07 against the same tree and environment.
 
+GAP-6 was read and measured on 2026-11-04 against the same tree at commit `873fa6e0`,
+river `0.26.1`, Python 3.13.3, macOS 27.2, with `PYTHONHASHSEED=0`.
+
 ---
 
 ## BUG-1 — `StandardScaler(window_size=...)` can emit complex numbers
@@ -1459,3 +1462,78 @@ sit on scales two to four orders of magnitude apart, and every coordinate is
 drawn from the same N(`mu`, `sigma`). The protocol does not rescale streams, so
 those cells keep the collapse and are read as such, not as a property of the
 online phase.
+
+---
+
+## GAP-6 — the labels `predict_one` returns carry no identity across `learn_one` in five clusterers
+
+**Severity:** medium for any evaluation that reads predict-before-learn labels over a span of
+points as one partition (prequential ARI, a windowed silhouette): a label can name one cluster early
+in the span and another later, and the joined labels then group points the model never grouped.
+**Status:** read in the source and measured on unmodified river.
+**Location:** [`denstream.py:351`](../river/river/cluster/denstream.py) (macro clusters numbered from 0
+on every `predict_one`), [`birch.py:392`](../river/river/cluster/birch.py) (`dict(enumerate(features))`
+at each reclustering), [`dbstream.py:384-389`](../river/river/cluster/dbstream.py)
+(`_generate_clusters_from_labels` at each reclustering), [`clustream.py:251-259`](../river/river/cluster/clustream.py)
+(a new `KMeans` every `time_gap` points), [`hpstream.py:620-646`](../river/river/cluster/hpstream.py)
+(`_free_label` hands the evicted cluster's label to the newcomer).
+
+### Symptom
+
+`tests/test_partition_audit.py::test_denstream_renumbers_its_macro_clusters_when_an_earlier_p_micro_cluster_goes`:
+three groups of points, remove the first p-micro-cluster (what the periodic pruning of `learn_one`
+does), and the label of the untouched group around 20 drops by one.
+
+Measured with `conf_pipeline.partition_audit` (River's default configurations, h = 1 000, the window
+predicted again by a copy every 10 points, 4 streams x 2 windows = 800 intervals per algorithm,
+`result/partition_audit_2026-11-04/audit.csv`): the same partition under permuted labels with a label
+reused for another set of points 3 times for BIRCH, 7 for CluStream, 4 for DBSTREAM; HPStream's
+partition changed with a renumbering in 684 of 800 intervals. SOStream, RepStream (monotone counters)
+and STREAMKMeans (one persistent k-means) never reuse a label. `docs/SEQUENTIAL_PARTITION_AUDIT.md`
+has the full table.
+
+### Root cause
+
+The `Clusterer` interface defines a label as the answer to one `predict_one` call. These five
+algorithms rebuild their macro clustering from scratch (DBSCAN, a global clustering, a fresh k-means)
+and number its clusters in iteration order, or recycle the smallest free key, so nothing ties a
+label to a cluster across calls.
+
+### What it costs a benchmark
+
+A windowed internal index or a prequential external index computed on the sequential labels can
+merge two clusters under one label (a reused label) or split one cluster over two (a fresh label).
+How often it moves a tuner's choice is not measured. The OTB campaign keeps the sequential
+partition as its selection signal and logs, per member and window, `stability` and the raw label
+agreement with an end-of-window snapshot (`snap_label_agreement`), so the effect under tuned
+configurations can be read from its logs.
+
+### Suggested upstream fix
+
+Document that labels are only meaningful within one call. Where the algorithm keeps an identity
+it could expose it: HPStream could draw labels from a monotone counter instead of recycling
+(`_free_label`), which leaves the clustering itself unchanged (read in the code, and checked point by
+point in `tests/test_hpstream_stable_labels.py`); the
+reclustering algorithms would need a matching step between successive clusterings, which is a design
+decision, not a fix.
+
+### Workaround here
+
+For HPStream only, `HPStreamStableLabels` (`benchmark/algorithms/hpstream_stable_labels.py`, registered
+beside the untouched `HPStream` and listed in `_common.LABEL_VARIANTS`): `_free_label` draws from a counter
+that only grows, starting at `max_clusters`. `tests/test_hpstream_stable_labels.py` holds it to River's
+class point by point on three configurations (a healthy one, the degenerate regime where nearly every
+point opens a cluster and evicts one, and a radius threshold that starves clusters): the same clusters
+with the same sums, weights, times and dimensions in the same order, the same predicted cluster at every
+point, and no label ever naming a second cluster object, while River's class hands labels on. On
+2026-11-04 the user decided that the mechanism campaign runs `HPStreamStableLabels` in HPStream's place
+(`conf_pipeline/campaigns/mechanism_pilot.json`, `decisions`); River's `HPStream` stays registered and
+runnable, and earlier results (`out/full`) are River's.
+
+For DenStream, BIRCH, DBSTREAM and CluStream there is none: the framework does not relabel predictions,
+and naming macro clusters that are rebuilt from scratch needs a rule for merges and splits, which is a
+design decision, not a fix. Each has a small counterexample on River's own class in
+`tests/test_partition_audit.py` (a label passed to points the model kept apart before and after, read off
+the raw labels with no matching: `partition_audit.label_handoffs`). `conf_pipeline.campaign` writes the
+open status of these four, and of River's HPStream were it run, into every dry run and campaign manifest
+(`measurement_status`).

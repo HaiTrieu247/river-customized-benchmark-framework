@@ -1,0 +1,56 @@
+{
+  "schema": 1,
+  "name": "mechanism_pilot",
+  "description": "Six-arm mechanism pilot (E1 scaled_default, E2 frozen_reinit, E5 random_online beside default, confstream, frozen_prefix) on the 12 streams locked in docs/MECHANISM_PILOT.md, gate-free, sequential silhouette as the selection signal, stability and the end-of-window snapshot logged as diagnostics only. The two E4 oracle arms of MECHANISM_PILOT.md are not in this inventory; they can be added later as an extension under the same protocol.",
+  "out_dir": "conf_pipeline/out/mech_campaign",
+  "folds": [
+    "covtype", "kdd99", "electricity", "shuttle", "insects_abrupt_imbalanced",
+    "scale_drift", "density_drift", "k_drift", "mixed_drift",
+    "static_overlap", "incremental_drift", "evolving"
+  ],
+  "arms": ["default", "scaled_default", "confstream", "frozen_prefix", "frozen_reinit", "random_online"],
+  "groups": [
+    {"name": "six_algorithms_three_tuner_seeds",
+     "algos": ["DenStream", "HPStreamStableLabels", "DBSTREAM", "STREAMKMeans", "SOStream", "BIRCH"],
+     "tuner_seeds": [101, 102, 103]},
+    {"name": "clustream_repstream_one_tuner_seed",
+     "algos": ["CluStream", "RepStream"],
+     "tuner_seeds": [101]}
+  ],
+  "protocol": {
+    "seed_policy": "split",
+    "model_seed": 201,
+    "fixed_model_seeds": [201],
+    "data_seed": 42,
+    "h": 1000,
+    "e_size": 20,
+    "e_test": 10,
+    "freeze_after_window": 20,
+    "n_samples": 100000,
+    "p_reset": 0.01,
+    "half_life_frac": 0.1,
+    "lam": null,
+    "runtime_gate": false,
+    "max_memory_mb": 2048.0,
+    "max_micro_clusters": 10000,
+    "tie_break": "micro_clusters",
+    "log_members": true,
+    "signals": ["stability"],
+    "signal_noise": "label",
+    "cmm": true
+  },
+  "locked_to_repo_constants": ["h", "e_size", "e_test", "freeze_after_window", "n_samples", "p_reset",
+                               "half_life_frac", "max_memory_mb", "max_micro_clusters", "data_seed", "model_seed"],
+  "operational": {
+    "timeout_s": 43200,
+    "timeout_source": "conf_pipeline/make_notebook.py, preset full (TIMEOUT_S = 12 * 3600), the timeout out/full ran under",
+    "workers": 8
+  },
+  "decisions": {
+    "HPStream": "read through HPStreamStableLabels, run in its place: River's HPStream with labels never reused (RIVER_BUGS.md GAP-6), the same clusters and predictions at every point; decided by the user on 2026-11-04. River's HPStream stays registered and runnable; the campaign does not run both, as one model would count twice"
+  },
+  "excluded_arms": {
+    "confstream_ari_oracle": "E4 diagnostic; left out of this six-arm campaign, addable later under the same protocol",
+    "confstream_ari_oracle_constrained": "E4 diagnostic; left out of this six-arm campaign, addable later under the same protocol"
+  }
+}

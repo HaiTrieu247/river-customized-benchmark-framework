@@ -20,9 +20,15 @@ Tables (each a function, each written as a CSV and a section of ``report.md``):
 - ``proxy_table``    rank correlation between the silhouette and ARI over the members of a window
 - ``drift_table``    drop and recovery around the drift points of the synthetic folds
 
+``--contrasts`` writes the mechanism campaign's paired contrasts instead (``CONTRASTS``: E1
+``scaled_default-default`` and ``confstream-scaled_default``, E2 ``frozen_reinit-frozen_prefix`` and
+``confstream-frozen_reinit``, E5 ``confstream-random_online``), on common tail windows, source block as
+the unit (``analysis_support``), with coverage, failures, and per arm the undefined-partition, cap-rejection
+and member-error rates kept apart.
+
 Run from the repo root::
 
-    python -m conf_pipeline.report [--out-dir conf_pipeline/out]
+    python -m conf_pipeline.report [--out-dir conf_pipeline/out] [--contrasts]
 """
 
 from __future__ import annotations
@@ -1360,10 +1366,217 @@ def _plots(out_dir: Path, rep: Path) -> list[Path]:
     return written
 
 
-def main() -> None:
+# --- the mechanism campaign's paired contrasts (E1, E2, E5) ---------------------------------------
+
+#: ``(a, b, what a - b asks)``: every contrast is read per replicate on the tail windows both arms read.
+CONTRASTS: tuple[tuple[str, str, str], ...] = (
+    ("scaled_default", "default", "E1: River's defaults in units of s against the raw defaults"),
+    ("confstream", "scaled_default", "E1: what online tuning adds once the defaults are in units of s"),
+    ("frozen_reinit", "frozen_prefix", "E2: renewing the model with the configuration frozen"),
+    ("confstream", "frozen_reinit", "E2: changing the configuration beyond renewal"),
+    ("confstream", "random_online", "E5: evolutionary against uniform sampling of children (same schedule; not "
+                                    "a matched-compute comparison)"),
+)
+
+
+def _scaled_changed(runs: pd.DataFrame) -> dict[tuple, bool | None]:
+    """(algo, fold) -> whether ``scaled_default`` moved a distance parameter there (``scaled_changed`` of
+    its ok runs); None when no run says."""
+    out: dict[tuple, bool | None] = {}
+    if runs.empty or "scaled_changed" not in runs:
+        return out
+    for r in runs[(runs["arm"] == "scaled_default") & (runs["status"] == "ok")].to_dict("records"):
+        v = r.get("scaled_changed")
+        if isinstance(v, list):
+            out[(r["algo"], r["fold"])] = out.get((r["algo"], r["fold"])) or bool(v)
+    return out
+
+
+def contrast_tables(out_dir: Path, threshold: float = C.MIN_CEILING_GAIN, n_boot: int = 2000,
+                    boot_seed: int = 0) -> dict[str, pd.DataFrame]:
+    """The five ``CONTRASTS`` on ``out_dir``'s latest ok runs, for ARI and (where the windows have it) NMI.
+
+    ``scaled_default`` of an algorithm without a distance parameter reads its ``default`` windows in
+    ``confstream - scaled_default`` (so every algorithm is compared), never in ``scaled_default - default``
+    (where it would read 0 by construction); that contrast is also read on the cells whose scaled
+    configuration actually differs (``e1_changed_only``: BIRCH's zero ``threshold`` stays zero)."""
+    from . import analysis_support as AS
+
+    runs = AS.run_table(out_dir)
+    tw = AS.tail_windows(out_dir, runs, extra=AS.SUPPORT_EXTRA)
+    filled_tw, filled = AS.fill_identical_windows(tw)
+    changed = _scaled_changed(runs)
+    pairs, cells, algo_blocks, blocks, groups, support = [], [], [], [], [], []
+    for a, b, what in CONTRASTS:
+        source = filled_tw if (a, b) != ("scaled_default", "default") else tw
+        for metric, col in AS.METRICS.items():
+            if col not in source or source[col].notna().sum() == 0:
+                continue
+            p = AS.paired_contrast(source, a, b, col)
+            subsets = [("all", p)]
+            if (a, b) == ("scaled_default", "default") and len(p):
+                keep = [changed.get((al, f)) is True for al, f in zip(p["algo"], p["fold"])]
+                subsets.append(("e1_changed_only", p[keep]))
+            if len(p):
+                support += point_support_rows(p, f"{a}-{b}", metric)
+                subsets.append((POINT_IDENTICAL_SUBSET, point_identical_pairs(p)))
+            for subset, q in subsets:
+                tag = {"contrast": f"{a}-{b}", "metric": metric, "subset": subset}
+                agg = AS.aggregate_contrast(q, threshold, n_boot, boot_seed)
+                pairs.append(q.assign(**tag))
+                for name, store in (("cells", cells), ("algo_blocks", algo_blocks), ("blocks", blocks),
+                                    ("groups", groups)):
+                    if len(agg[name]):
+                        store.append(agg[name].assign(**tag, question=what))
+    cat = lambda xs: pd.concat(xs, ignore_index=True) if xs else pd.DataFrame()  # noqa: E731
+    expected = None
+    camp = Path(out_dir) / "campaign" / "manifest.json"
+    if camp.exists():
+        inv = json.loads(camp.read_text(encoding="utf-8")).get("inventory", {})
+        expected = {}
+        for j in inv.get("jobs", []):
+            expected[j["arm"]] = expected.get(j["arm"], 0) + 1
+    return {"pairs": cat(pairs), "cells": cat(cells), "algo_blocks": cat(algo_blocks), "blocks": cat(blocks),
+            "groups": cat(groups), "point_support": pd.DataFrame(support, columns=POINT_SUPPORT_COLS),
+            "coverage": AS.coverage(runs, tw, expected),
+            "filled": pd.DataFrame({"algo": filled, "scaled_default_read_from": "default"})}
+
+
+#: The subset of a contrast read only on the windows whose points are verified identical on both
+#: sides: a supplementary reading, never the primary one (which is the common window support).
+POINT_IDENTICAL_SUBSET = "point_identical_only"
+POINT_SUPPORT_COLS = [
+    "contrast", "metric", "group", "n_replicate_pairs", "n_pair_windows", "n_point_identical", "n_point_differs",
+    "n_point_undetermined", "n_window_id_differs", "share_point_identical", "share_point_undetermined",
+    "n_pairs_all_identical", "n_pairs_any_identical", "status",
+]
+
+
+def point_identical_pairs(p: pd.DataFrame) -> pd.DataFrame:
+    """``paired_contrast`` rows read on their verified-identical windows only (``delta_point_identical``);
+    a pair without such a window keeps its row, undefined."""
+    q = p.copy()
+    q["delta"], q["a_mean"], q["b_mean"] = q["delta_point_identical"], q["a_mean_point_identical"], q["b_mean_point_identical"]
+    q["n_common"] = pd.to_numeric(q["n_point_identical"], errors="coerce")
+    q["n_point_differs"] = q["n_point_undetermined"] = 0
+    q["note"] = q["note"].astype(object)
+    q.loc[q["delta"].isna() & q["note"].isna(), "note"] = "no window with verified identical point support"
+    return q
+
+
+def point_support_rows(p: pd.DataFrame, contrast: str, metric: str) -> list[dict]:
+    """Per stream group (and ``all``): the common windows of every replicate pair by point support.
+    ``status`` says what the contrast may be called: ``verified identical`` only when every common window
+    is; ``undetermined`` when a window has no record (logs without the per-point fingerprint); else
+    ``differs on some windows``."""
+    rows = []
+    q = p.dropna(subset=["delta"])
+    for group in [*C.STREAM_GROUPS, "all"]:
+        sub = q if group == "all" else q[q["group"] == group]
+        if sub.empty:
+            continue
+        n = {c: int(pd.to_numeric(sub[c], errors="coerce").fillna(0).sum())
+             for c in ("n_common", "n_point_identical", "n_point_differs", "n_point_undetermined", "n_window_id_differs")}
+        status = ("verified identical" if n["n_point_identical"] == n["n_common"] else
+                  "undetermined" if n["n_point_undetermined"] else "differs on some windows")
+        rows.append({
+            "contrast": contrast, "metric": metric, "group": group, "n_replicate_pairs": int(len(sub)),
+            "n_pair_windows": n["n_common"], **{k: n[k] for k in ("n_point_identical", "n_point_differs",
+                                                                 "n_point_undetermined", "n_window_id_differs")},
+            "share_point_identical": n["n_point_identical"] / n["n_common"] if n["n_common"] else np.nan,
+            "share_point_undetermined": n["n_point_undetermined"] / n["n_common"] if n["n_common"] else np.nan,
+            "n_pairs_all_identical": int((pd.to_numeric(sub["n_point_identical"], errors="coerce") == sub["n_common"]).sum()),
+            "n_pairs_any_identical": int((pd.to_numeric(sub["n_point_identical"], errors="coerce") > 0).sum()),
+            "status": status,
+        })
+    return rows
+
+
+def write_contrasts(out_dir: Path, rep_dir: Path | None = None, threshold: float = C.MIN_CEILING_GAIN) -> list[Path]:
+    """``contrast_tables`` into ``<rep>/contrasts/``: one CSV per level, ``coverage.csv`` and ``contrasts.md``."""
+    out_dir = Path(out_dir)
+    rep = (Path(rep_dir) if rep_dir is not None else out_dir / C.REPORT_DIR.name) / "contrasts"
+    rep.mkdir(parents=True, exist_ok=True)
+    t = contrast_tables(out_dir, threshold)
+    paths = []
+    for name, df in t.items():
+        path = rep / f"{name}.csv"
+        df.to_csv(path, index=False)
+        paths.append(path)
+    g = t["groups"]
+    lines = [
+        "# Paired contrasts of the mechanism campaign (E1, E2, E5)", "",
+        f"Out dir `{out_dir}`. Each contrast `a-b` is read per replicate on the tail windows both arms read "
+        "(the common support): two online arms pair by tuner seed and model seed, a fixed arm's window mean (over its runs) "
+        "stands beside every replicate of the online arm, two fixed arms are one replicate. Then per "
+        "(algorithm, stream), per (algorithm, source block) with a block's variants averaged first, per block "
+        "the mean over algorithms, and per stream group the mean over blocks: seeds never add a block. ARI is "
+        "primary, NMI a sensitivity. The interval resamples source blocks (three or more); a difference "
+        f"without significance is not read as equivalence. Practical threshold {threshold:g}: the share of "
+        "(algorithm, stream) cells beyond +threshold and below -threshold is reported beside the continuous "
+        "means. A failed job (error, timeout, oom) has no reading and is counted in `coverage.csv`, never "
+        "scored. `confstream-random_online` keeps the search space, ensemble size and the schedule of births "
+        "and evaluations; it caps no compute, so it is not a matched-compute comparison.", "",
+        "**Point support.** Two arms are paired on common windows, not on common points. Per common window "
+        "(`point_support.csv`), the points each side's reading rests on are compared through the fingerprint "
+        "of their positions (`lag_external_support_sha`, logged since 2026-11-04): `identical`, `differs`, or "
+        "`undetermined` when a side has no record (logs written before). A count of points is never read as "
+        "the same points. The primary reading stays on the common windows; the subset "
+        f"`{POINT_IDENTICAL_SUBSET}` reads the windows with verified identical points only, a supplementary "
+        "reading whose coverage is `share_point_identical`. A contrast with undetermined windows is not "
+        "point-matched, and nothing here is recomputed on the intersection of points.", "",
+    ]
+    present = set(t["cells"]["algo"]) if len(t["cells"]) else set()
+    for v, ref in sorted(C.LABEL_VARIANTS.items()):
+        if v in present and ref in present:
+            lines += [f"**{v} and {ref} are both here.** {v} is {ref} under other labels: every mean over "
+                      "algorithms counts that model twice. Read the `per_algorithm` rows, or one of the two.", ""]
+    ps = t["point_support"]
+    for a, b, what in CONTRASTS:
+        sub = g[(g["contrast"] == f"{a}-{b}") & (g["level"] == "group")] if len(g) else g
+        lines += [f"## `{a}-{b}`", "", what, ""]
+        cols = ["metric", "subset", "unit", "delta_block_mean", "delta_block_median", "ci_low", "ci_high",
+                "n_blocks", "n_blocks_above_0", "n_blocks_below_0", "n_algorithms", "n_cells",
+                "share_cells_above_threshold", "share_cells_below_threshold", "n_pair_windows"]
+        main = sub[sub["subset"] != POINT_IDENTICAL_SUBSET] if len(sub) else sub
+        if len(main):
+            lines += [_md_table(main, cols, 4), ""]
+        else:
+            lines += ["No common reading: one of the arms did not run here.", ""]
+        psub = ps[ps["contrast"] == f"{a}-{b}"] if len(ps) else ps
+        if len(psub):
+            lines += ["Point support of the common windows (replicate-pair windows):", "",
+                      _md_table(psub, [c for c in POINT_SUPPORT_COLS if c != "contrast"], 4), ""]
+        supp = sub[sub["subset"] == POINT_IDENTICAL_SUBSET] if len(sub) else sub
+        if len(supp):
+            lines += ["Supplementary, windows with verified identical point support only (the rest left out; "
+                      "coverage above):", "", _md_table(supp, cols, 4), ""]
+    lines += ["## Coverage per arm", "",
+              "Three member-window rates are kept apart, because a member can fail more than one way at once: "
+              "`share_partition_*`, the sequential partition without a silhouette whatever the caps did (over "
+              "`n_member_windows_partition_read`, the member-windows whose member ran); `share_infeasible_*`, "
+              "shed by a cap whatever the partition (over `n_member_windows`, with the shed ones whose partition "
+              "was valid or undefined counted apart); `share_member_error`. `share_floor_score` is the share "
+              "scored at the floor for any reason, what the selection saw.", "",
+              _md_table(t["coverage"], list(t["coverage"].columns), 4), ""]
+    (rep / "contrasts.md").write_text("\n".join(lines), encoding="utf-8")
+    paths.append(rep / "contrasts.md")
+    return paths
+
+
+def main(argv=None) -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--out-dir", default=str(C.OUT))
-    args = parser.parse_args()
+    parser.add_argument("--contrasts", action="store_true",
+                        help="write the mechanism campaign's paired contrasts (E1, E2, E5) into <out-dir>/report/contrasts/ "
+                             "instead of the report")
+    parser.add_argument("--threshold", type=float, default=C.MIN_CEILING_GAIN,
+                        help="with --contrasts: the practical-effect threshold (default the pre-declared 0.05)")
+    args = parser.parse_args(argv)
+    if args.contrasts:
+        for p in write_contrasts(Path(args.out_dir), threshold=args.threshold):
+            print(p)
+        return
     for p in write_report(Path(args.out_dir)):
         print(p)
 

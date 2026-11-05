@@ -176,7 +176,7 @@ def arm_means(out_dir: Path, seeds=None, algos=None, folds=None) -> pd.DataFrame
     runs = report.current_runs(Path(out_dir))
     if runs.empty:
         return pd.DataFrame(columns=cols)
-    runs = runs[runs["arm"].isin(list(VARIANT_ARMS)) & ~runs["algo"].isin(list(C.IMPL_VARIANTS))]
+    runs = runs[runs["arm"].isin(list(VARIANT_ARMS)) & ~runs["algo"].isin(list(C.variant_algos()))]
     if report.is_split(runs):
         # A fixed arm's runs are not tuner seeds: its mean stands beside every tuner seed (report.replicate_view).
         ok = runs[runs["status"] == "ok"]

@@ -31,7 +31,7 @@ import dataclasses
 
 from benchmark.tuning.space import Param, ParamSpace
 
-from ._common import river_defaults
+from ._common import RIVER_CLASS, river_defaults
 
 SPACES: dict[str, ParamSpace] = {
     "DenStream": ParamSpace(
@@ -126,6 +126,9 @@ SPACES: dict[str, ParamSpace] = {
 #: fast one as DenStream's implementation variant (``_common.IMPL_VARIANTS``).
 SPACES["DenStreamPatched"] = dataclasses.replace(SPACES["DenStream"], algo="DenStreamPatched")
 SPACES["DenStreamPatchedFast"] = dataclasses.replace(SPACES["DenStream"], algo="DenStreamPatchedFast")
+#: HPStreamStableLabels (GAP-6: labels never reused) tunes HPStream's space; it is HPStream's
+#: label variant (``_common.LABEL_VARIANTS``), never a protocol algorithm of its own.
+SPACES["HPStreamStableLabels"] = dataclasses.replace(SPACES["HPStream"], algo="HPStreamStableLabels")
 
 
 #: River's HPStream projects on this share of the dimensions when
@@ -158,7 +161,7 @@ def start_params(algo: str, h: int, d: int | None = None) -> dict:
     for name in INIT_BUFFER_PARAMS:
         if name in params:
             params[name] = _snap_choice(space, name, min(params[name], h))
-    if algo == "HPStream" and params.get("n_projected_dimensions") is None:
+    if RIVER_CLASS.get(algo, algo) == "HPStream" and params.get("n_projected_dimensions") is None:
         if d is None:
             raise ValueError("HPStream's start needs the feature count d to write out River's 60%")
         params["n_projected_dimensions"] = max(1, int(round(HPSTREAM_DEFAULT_PROJECTION * d)))

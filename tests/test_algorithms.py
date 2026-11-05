@@ -30,6 +30,8 @@ FRAMEWORK_ENTRIES = {
     "DenStreamPatched": ("DenStream", False),            # RIVER_BUGS.md BUG-7, BUG-8
     "DenStreamPatchedFast": ("DenStreamPatched", True),  # GAP-3
     "CluStreamPyramidal": ("CluStream", True),           # GAP-4, without a horizon
+    # GAP-6: the same clusters under labels never reused, so a sequential (prequential) partition differs
+    "HPStreamStableLabels": ("HPStream", False),
 }
 
 
@@ -38,7 +40,7 @@ def test_registry_covers_every_river_clusterer():
 
     The deliberate exceptions are the framework subclasses in
     ``FRAMEWORK_ENTRIES``: ``DenStreamPatched`` (RIVER_BUGS.md BUG-7/BUG-8),
-    ``DenStreamPatchedFast`` (GAP-3) and ``CluStreamPyramidal`` (GAP-4), each
+    ``DenStreamPatchedFast`` (GAP-3), ``CluStreamPyramidal`` (GAP-4) and ``HPStreamStableLabels`` (GAP-6), each
     registered under its own name per AGENTS.md rule 1.3 and kept out of the
     vendored river tree on purpose, so none is a member of ``river.cluster``
     and ``discover_clusterers`` will never see them. Everything river actually
@@ -62,7 +64,7 @@ def test_capability_filters_split_the_registry_correctly():
     assert set(algorithms_for()) == {
         "BIRCH", "CluStream", "CluStreamPyramidal", "DBSTREAM", "DCUStream",
         "DDStream", "DStream", "DenStream", "DenStreamPatched", "DenStreamPatchedFast",
-        "HPStream", "ImprovedBIRCH", "KMeans", "MRStream", "RepStream", "SOStream",
+        "HPStream", "HPStreamStableLabels", "ImprovedBIRCH", "KMeans", "MRStream", "RepStream", "SOStream",
         "STREAMKMeans",
     }
     # ...and the property behind it, which cannot go stale: the default filter is

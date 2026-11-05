@@ -444,3 +444,18 @@ def test_the_manifest_is_checked_again_once_its_lock_is_held(tmp_path):
         with M.locked_session(tmp_path, first, "conf_pipeline.run"):
             pass
     assert not (tmp_path / "manifest.json.lock").exists()
+
+
+def test_describe_dir_digests_the_lifecycle_logs_apart_from_the_member_logs(tmp_path):
+    from conf_pipeline import manifest as MM
+
+    (tmp_path / "members").mkdir()
+    (tmp_path / "lifecycle").mkdir()
+    (tmp_path / "members" / "a.jsonl").write_text('{"window": 1}\n')
+    (tmp_path / "lifecycle" / "a.jsonl").write_text('{"event": "birth"}\n')
+    files = {f["name"]: f for f in MM.describe_dir(tmp_path)["files"]}
+    assert files["members/"]["files"] == 1 and files["lifecycle/"]["files"] == 1
+    before = files["lifecycle/"]["sha256"]
+    (tmp_path / "lifecycle" / "a.jsonl").write_text('{"event": "decision"}\n')
+    after = {f["name"]: f for f in MM.describe_dir(tmp_path)["files"]}
+    assert after["lifecycle/"]["sha256"] != before and after["members/"]["sha256"] == files["members/"]["sha256"]

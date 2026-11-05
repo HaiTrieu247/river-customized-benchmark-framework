@@ -86,14 +86,14 @@ def _algos(summary: pd.DataFrame | None) -> list[str]:
     """Every protocol algo in ``summary``, over all arms, sorted (no implementation variant)."""
     if summary is None or "algo" not in summary:
         return []
-    return sorted(set(summary["algo"].dropna().unique()) - set(C.IMPL_VARIANTS))
+    return sorted(set(summary["algo"].dropna().unique()) - set(C.variant_algos()))
 
 
 def _protocol(summary: pd.DataFrame | None) -> pd.DataFrame | None:
     """``summary`` without the rows of implementation variants."""
     if summary is None or "algo" not in summary:
         return summary
-    return summary[~summary["algo"].isin(list(C.IMPL_VARIANTS))]
+    return summary[~summary["algo"].isin(list(C.variant_algos()))]
 
 
 def _arms_in(summary: pd.DataFrame | None) -> list[str]:
@@ -400,7 +400,7 @@ def impl_table(summary: pd.DataFrame, metric: str = TAIL) -> pd.DataFrame:
     rows = []
     complete = _complete(summary)
     algos = _algos(summary)
-    for variant, reference in C.IMPL_VARIANTS.items():
+    for variant, reference in C.variant_algos().items():
         if reference not in algos:
             continue
         for arm in _arms_in(summary):

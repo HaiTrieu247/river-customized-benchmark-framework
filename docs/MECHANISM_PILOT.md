@@ -1,5 +1,17 @@
 # Mechanism pilot (giai đoạn 3 của PAPER_IMPROVEMENT_PLAN): chờ chốt trước khi chạy
 
+> Cập nhật 04/11/2026: chiến dịch sáu arm (E1, E2, E5) trên đúng 12 luồng ở mục 2, seed theo phương án C,
+> không gate, tie-break `micro_clusters`, có `--log-members --signals stability`, timeout 43 200 giây, đã
+> có cấu hình `conf_pipeline/campaigns/mechanism_pilot.json` và lệnh `conf_pipeline.campaign`; protocol thực
+> tế, kiểm tra và lệnh ở `docs/MECHANISM_CAMPAIGN.md`. Hai arm E4 không nằm trong chiến dịch đó và có thể
+> thêm sau dưới cùng protocol. Phần dưới giữ nguyên như đã viết ngày 23/10.
+>
+> Cập nhật lần hai cùng ngày: LOBO đọc bảng huấn luyện mong đợi từ kế hoạch và báo `ineligible` khi thiếu;
+> log mới ghi tập điểm được chấm và `report --contrasts` phân loại support ở cấp điểm; `HPStreamStableLabels`
+> sửa việc dùng lại nhãn của HPStream, và theo quyết định của người dùng chiến dịch chạy nó thay HPStream. Bốn
+> thuật toán còn trạng thái đo `open` (GAP-6), nên chiến dịch chưa đủ điều kiện làm bằng chứng xác nhận paper:
+> `docs/MECHANISM_CAMPAIGN.md` mục 8.
+
 Ngày 23/10/2026. Giai đoạn 1 (audit/log-only) và 2 (engineering smoke) của kế hoạch đã xong;
 code của E1, E2, E4, E5 đã có và đã chạy thử. Tài liệu này là đề xuất thiết kế, chưa phải
 kết quả. Theo AGENTS.md, chọn tập luồng và seed là quyết định nghiên cứu của người dùng:

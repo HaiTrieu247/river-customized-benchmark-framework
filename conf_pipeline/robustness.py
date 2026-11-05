@@ -76,7 +76,7 @@ class Inputs:
 def _protocol(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty or "algo" not in df:
         return df
-    return df[~df["algo"].isin(list(C.IMPL_VARIANTS))].reset_index(drop=True)
+    return df[~df["algo"].isin(list(C.variant_algos()))].reset_index(drop=True)
 
 
 def load_inputs(out_dir: Path) -> Inputs:
@@ -1082,7 +1082,7 @@ def seedless_pairs(tunable: dict, summary: pd.DataFrame) -> dict:
     algorithms only: ``Inputs.tunable`` also holds the implementation variants' pairs."""
     from benchmark.algorithms.registry import accepts_seed
 
-    tunable = {k: v for k, v in tunable.items() if k[0] not in C.IMPL_VARIANTS}
+    tunable = {k: v for k, v in tunable.items() if k[0] not in C.variant_algos()}
     algos = sorted({a for a, _ in tunable})
     seedless = [a for a in algos if not accepts_seed(a)]
     ref = summary[(summary["arm"] == "oracle_static") & summary["algo"].isin(seedless)]

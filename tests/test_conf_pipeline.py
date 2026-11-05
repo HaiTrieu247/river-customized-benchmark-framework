@@ -1012,3 +1012,76 @@ def test_the_job_count_names_why_jobs_are_skipped(tmp_path):
                 "--out-dir", str(tmp_path), "--dry-run")
     assert proc.returncode == 0, proc.stderr
     assert "2 skipped (2 no absolute-distance parameter)" in proc.stdout and "no oracle point" not in proc.stdout
+
+
+# --- lifecycle log, diagnostic counts and file names (mechanism campaign) -----------------------------
+
+def test_the_lifecycle_log_lies_beside_the_member_log_and_the_summary_counts_births_and_evaluations(tmp_path):
+    from benchmark.tuning.confstream import LIFECYCLE_SCHEMA
+
+    mlog, llog = tmp_path / "members" / "m.jsonl", tmp_path / "lifecycle" / "m.jsonl"
+    rows = _toy_run(log=mlog, lifecycle_log=llog)
+    (s,) = [r for r in rows if r["kind"] == "run"]
+    events = [json.loads(l) for l in llog.read_text().splitlines()]
+    members = [json.loads(l) for l in mlog.read_text().splitlines()]
+    assert all(e["kind"] == "lifecycle" and e["schema"] == LIFECYCLE_SCHEMA and e["algo"] == "KMeans" for e in events)
+    assert not any("event" in m for m in members)                      # no lifecycle row among the member rows
+    births = [e for e in events if e["event"] == "birth"]
+    assert s["n_births"] == len(births) == 3 + 4 and s["births_by_origin"] == {"start": 1, "initial_offspring": 2,
+                                                                              "evolutionary": 4}
+    assert s["n_member_evaluations"] == len(members) == sum(s["member_status_counts"].values())
+    assert [e["window"] for e in events if e["event"] == "decision"] == [1, 2, 3, 4]
+    assert s["tie_break_rule"] == ["score", "usable", "micro_clusters", "incumbent", "member_id"]
+    for k in ("n_member_windows_sentinel", "n_member_windows_fallback", "n_member_windows_snapshot",
+              "n_member_windows_stability", "n_member_windows_diag_error"):
+        assert s[k] == 0
+    assert all(m["score_status"] in ("valid", "undefined_single_label", "undefined_one_label_per_point") for m in members)
+
+
+def test_stability_logging_counts_the_snapshot_readings_and_moves_nothing(tmp_path):
+    def cfg_run(signals):
+        ds = make_scenario("static_easy", n_samples=1500, n_features=2, n_clusters=3, seed=3)
+        cfg = EnsembleConfig(e_size=3, e_test=1, lam=0.1, p_reset=0.0, runtime_factor=None, log_signals=signals)
+        return run_ensemble(algo="KMeans", space=TOY, start=[{"n_clusters": 2, "halflife": 0.5}], dataset=ds,
+                            fold="toy", seed=1, arm="confstream", cfg=cfg, h=300, n_samples=1500)
+    off, on = cfg_run(()), cfg_run(("stability",))
+    key = lambda rows: [(r.get("incumbent_id"), r.get("pred_sha"), r.get("lag_pred_sha"), r.get("score"))  # noqa: E731
+                        for r in rows if r["kind"] == "window"]
+    assert key(off) == key(on)
+    s_on = on[-1]
+    assert s_on["n_member_windows_snapshot"] == s_on["n_member_evaluations"] > 0
+    assert off[-1]["n_member_windows_snapshot"] == 0
+
+
+def test_job_names_give_a_seedless_run_seedx_and_put_lifecycle_logs_outside_members(tmp_path):
+    job = {"algo": "DenStream", "fold": "covtype", "seed": None, "arm": "default", "config_id": None}
+    assert run.job_name(job) == "DenStream__covtype__seedx__default"
+    assert run._member_log_path(tmp_path, job).endswith("members/DenStream__covtype__seedx__default.jsonl")
+    assert run._lifecycle_log_path(tmp_path, job).endswith("lifecycle/DenStream__covtype__seedx__default.jsonl")
+    args = run.build_parser().parse_args(["--algos", "DenStream,HPStream", "--folds", "covtype", "--arms",
+                                          "default,confstream", "--out-dir", str(tmp_path), "--log-members"])
+    jobs, skipped, _, _ = run.plan_jobs(args)
+    assert not skipped and len(jobs) == 2 * (1 + 3)
+    assert all("/lifecycle/" in j["lifecycle_log"] and "/members/" in j["member_log"] for j in jobs)
+    assert {(j["algo"], j["seed"]) for j in jobs if j["arm"] == "default"} == {("DenStream", None), ("HPStream", 201)}
+
+
+def test_the_summary_counts_each_partition_whatever_the_caps_did_and_crossed_with_them():
+    ds = make_scenario("static_easy", n_samples=1500, n_features=2, n_clusters=3, seed=3)
+    shed = EnsembleConfig(e_size=3, e_test=1, lam=0.1, p_reset=0.0, runtime_factor=None, max_memory_mb=1e-9)
+    kept = EnsembleConfig(e_size=3, e_test=1, lam=0.1, p_reset=0.0, runtime_factor=None)
+    runs = []
+    for cfg in (shed, kept):
+        rows = run_ensemble(algo="KMeans", space=TOY, start=[{"n_clusters": 2, "halflife": 0.5}], dataset=ds,
+                            fold="toy", seed=1, arm="confstream", cfg=cfg, h=300, n_samples=1500)
+        runs.append([r for r in rows if r["kind"] == "run"][0])
+    s, k = runs
+    # every member-window is shed by the memory cap, so the score status says only that ...
+    assert set(s["member_status_counts"]) == {"infeasible_memory"}
+    # ... while the partitions are counted as what they were, the same as without the cap
+    assert s["member_silhouette_reason_counts"] == k["member_silhouette_reason_counts"]
+    assert s["member_silhouette_reason_counts"].get("valid", 0) > 0
+    assert sum(s["member_reason_feasibility_counts"].values()) == s["n_member_evaluations"]
+    assert {key.split("|")[1] for key in s["member_reason_feasibility_counts"]} == {"memory"}
+    assert {key.split("|")[1] for key in k["member_reason_feasibility_counts"]} == {"feasible"}
+

@@ -15,6 +15,9 @@ at one cluster) and cannot feed a roulette wheel that needs "higher is better".
 
 from __future__ import annotations
 
+import hashlib
+from collections import Counter
+from dataclasses import dataclass
 from typing import Sequence
 
 import numpy as np
@@ -31,13 +34,57 @@ from ..datasets.base import IterableDataset
 UNDEFINED_SCORE = -1.0
 
 
+#: Why a window's silhouette reads what it does (``silhouette_status``): the partition had a
+#: value, or which condition left it without one. ``UNDEFINED_SCORE`` is the score of every
+#: reason but ``"valid"``; the reason is what tells them apart in the logs.
+SILHOUETTE_REASONS: tuple[str, ...] = ("valid", "insufficient_points", "single_label", "one_label_per_point")
+
+
+@dataclass(frozen=True)
+class SilhouetteStatus:
+    """What ``batch_silhouette`` saw: the score, whether it is defined and why, the points it
+    kept (a ``None`` prediction is left out), the ``None`` predictions, the distinct labels
+    among the kept points and the share of the kept points under the largest label."""
+
+    score: float
+    defined: bool
+    reason: str
+    n_points: int
+    n_none: int
+    n_labels: int
+    max_label_share: float | None
+
+
+def silhouette_status(xs: Sequence[dict], labels: Sequence) -> SilhouetteStatus:
+    """``batch_silhouette`` with its reason (``SILHOUETTE_REASONS``) and the counts behind it.
+
+    The score and ``defined`` are exactly ``batch_silhouette``'s; an exception of
+    scikit-learn's is not caught, as it is not there either.
+    """
+    keep = [i for i, lab in enumerate(labels) if lab is not None]
+    n_none = len(labels) - len(keep)
+    kept_labels = [labels[i] for i in keep]
+    counts = Counter(kept_labels)
+    n_labels = len(counts)
+    share = (max(counts.values()) / len(keep)) if keep else None
+    if len(keep) < 2:
+        return SilhouetteStatus(UNDEFINED_SCORE, False, "insufficient_points", len(keep), n_none, n_labels, share)
+    if n_labels < 2:
+        return SilhouetteStatus(UNDEFINED_SCORE, False, "single_label", len(keep), n_none, n_labels, share)
+    if n_labels >= len(keep):
+        return SilhouetteStatus(UNDEFINED_SCORE, False, "one_label_per_point", len(keep), n_none, n_labels, share)
+    score = _silhouette(xs, keep, kept_labels)
+    return SilhouetteStatus(score, True, "valid", len(keep), n_none, n_labels, share)
+
+
 def batch_silhouette(xs: Sequence[dict], labels: Sequence) -> tuple[float, bool]:
     """Silhouette of ``labels`` over ``xs``; ``(score, defined)``.
 
     A ``None`` label (a prediction the adapter could not make) drops that point
     from the score rather than becoming a cluster of its own. With fewer than two
     distinct labels, or with as many labels as points, the silhouette has no
-    value and :data:`UNDEFINED_SCORE` is returned with ``defined=False``.
+    value and :data:`UNDEFINED_SCORE` is returned with ``defined=False``
+    (``silhouette_status`` says which).
     """
     keep = [i for i, lab in enumerate(labels) if lab is not None]
     if len(keep) < 2:
@@ -46,13 +93,42 @@ def batch_silhouette(xs: Sequence[dict], labels: Sequence) -> tuple[float, bool]
     n_labels = len(set(kept_labels))
     if n_labels < 2 or n_labels >= len(keep):
         return UNDEFINED_SCORE, False
+    return _silhouette(xs, keep, kept_labels), True
+
+
+#: Tag of ``support_fingerprint``'s encoding; a fingerprint is compared only with one of the same tag.
+SUPPORT_FINGERPRINT_VERSION = "p1"
+
+
+def silhouette_support(labels: Sequence) -> list[bool]:
+    """The points ``silhouette_status`` reads, by position: every point whose prediction is not
+    ``None``. A sentinel (DenStream's ``-1``, kept as a label unless the adapter drops it) and a
+    fallback label (``0``) are labels, so they are read."""
+    return [lab is not None for lab in labels]
+
+
+def external_support(ys: Sequence, labels: Sequence) -> list[bool]:
+    """The points the windowed external metrics of ``run_once`` (ARI, NMI, purity) read, by position:
+    a true label and a prediction, both not ``None`` (``runner.run_once``'s update rule)."""
+    return [y is not None and lab is not None for y, lab in zip(ys, labels)]
+
+
+def support_fingerprint(mask: Sequence[bool]) -> str:
+    """A process-independent identity of a set of positions in a window: SHA-256 over the tag, the
+    window length and the mask as ``0``/``1`` characters, the first 16 hex digits after the tag.
+    Two masks of one length with the same count of points but other positions differ here."""
+    body = f"{SUPPORT_FINGERPRINT_VERSION}:{len(mask)}:" + "".join("1" if m else "0" for m in mask)
+    return f"{SUPPORT_FINGERPRINT_VERSION}-" + hashlib.sha256(body.encode("ascii")).hexdigest()[:16]
+
+
+def _silhouette(xs: Sequence[dict], keep: list[int], kept_labels: list) -> float:
     keys = sorted(xs[keep[0]].keys())
     X = np.asarray([[float(xs[i].get(k, 0.0)) for k in keys] for i in keep], dtype=float)
     # Labels can be any hashable (DenStream hands out ints, TextClust strings);
     # scikit-learn wants an array it can compare, so map them to dense ids.
     ids = {lab: j for j, lab in enumerate(dict.fromkeys(kept_labels))}
     y = np.asarray([ids[lab] for lab in kept_labels])
-    return float(silhouette_score(X, y)), True
+    return float(silhouette_score(X, y))
 
 
 class WindowBuffer:

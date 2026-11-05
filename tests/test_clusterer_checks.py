@@ -633,6 +633,7 @@ _EXTENDS = {
     "DenStreamPatched": "DenStream",
     "DenStreamPatchedFast": "DenStreamPatched",
     "CluStreamPyramidal": "CluStream",
+    "HPStreamStableLabels": "HPStream",
 }
 
 

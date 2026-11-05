@@ -253,3 +253,12 @@ def test_runs_without_any_readable_window_are_reported_as_such(tmp_path):
     assert row["n_pairs_covered"] == 0 and row["coverage"] == 0.0 and row["recovered_note"] == "no window compared"
     screen.write_screen(out, rep_dir=tmp_path / "rep")
     assert "nothing to compare" not in (tmp_path / "rep" / "screen.md").read_text()
+
+
+def test_lifecycle_logs_beside_the_member_logs_change_no_pick(tmp_path):
+    plain = screen.signal_picks(_out_dir(tmp_path / "plain"))
+    out = _out_dir(tmp_path / "with")
+    _jsonl(out / "lifecycle" / "DenStream__covtype__seed1__confstream.jsonl",
+           [{"kind": "lifecycle", "schema": 1, "event": "birth", "window": 0, "member_id": 0, "algo": "DenStream",
+             "fold": "covtype", "seed": 1, "arm": "confstream"}])
+    pd.testing.assert_frame_equal(screen.signal_picks(out), plain)

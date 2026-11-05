@@ -109,10 +109,24 @@ target x band x selector x fold), ``groups.csv``, ``selection.md`` and
 ``F_selection_regret.png`` (per-fold tau beside the regret of the default pick under
 ``confstream``). No tuning run is made.
 
+``--lobo`` writes the mechanism campaign's selection reading instead (``lobo_real``): real sources
+only, each held out with its whole block, every training block weighted once (variants first), one
+training panel and candidate set for ``lobo_default``, ``lobo_scaled_default``, ``lobo_target`` and the
+exact uniform expectation, ties to the name that sorts first, and the primary difference
+``Q_confstream,test(a_lobo_target) - Q_confstream,test(a_lobo_scaled_default)`` with per-source rows and
+leave-one-source-out sensitivity. The panel it expects is read from a plan before any result
+(``read_lobo_plan``: ``--campaign-config``, the dir's campaign manifest, or its run manifest), and a
+held-out block whose training panel misses a regime, a job or a common window chooses nothing and says
+why (``lobo_status.csv``); the mean over blocks stays undefined unless every expected block is whole.
+``--reduced-panel`` adds the sensitivity that excludes what is missing, apart. Under the split seed policy
+the held-out-seed variant of ``write_selection`` is read only on seeds given explicitly
+(``resolve_heldout_seeds``).
+
 Run from the repo root::
 
     python -m conf_pipeline.selection --out-dir conf_pipeline/out/full [--band 0.05] [--top-k 3]
     python -m conf_pipeline.selection --out-dir <dir> --selecting-arm scaled_default
+    python -m conf_pipeline.selection --out-dir <dir> --lobo [--metric nmi] [--campaign-config <json>] [--reduced-panel]
 """
 
 from __future__ import annotations
@@ -147,6 +161,24 @@ TOP_K = 3
 BAND = C.MIN_CEILING_GAIN
 SELECT_SEEDS: tuple[int, ...] = (1,)
 EVAL_SEEDS: tuple[int, ...] = (2, 3)
+#: Why the held-out-seed split is not read on a split-policy dir unless its seeds are given: the legacy
+#: 1/2/3 are job seeds of the shared policy, and a fixed arm's seed there is not a tuner seed.
+NO_HELDOUT_SEEDS_NOTE = ("split seed policy: the held-out-seed split needs --select-seeds and --eval-seeds given "
+                         "explicitly (tuner seeds); the legacy 1/2/3 are not assumed")
+
+
+def resolve_heldout_seeds(runs: pd.DataFrame, select_seeds=None, eval_seeds=None) -> tuple:
+    """The held-out-seed split's seeds: as given; when not given, the legacy ``SELECT_SEEDS``/``EVAL_SEEDS``
+    for a shared-policy dir and None (the split is not read, ``NO_HELDOUT_SEEDS_NOTE``) for a split one."""
+    if select_seeds is not None and eval_seeds is not None:
+        return tuple(select_seeds), tuple(eval_seeds)
+    if report.is_split(runs):
+        return None, None
+    return tuple(select_seeds or SELECT_SEEDS), tuple(eval_seeds or EVAL_SEEDS)
+
+
+def _seeds_text(seeds) -> str:
+    return ",".join(map(str, seeds)) if seeds is not None else "(not given)"
 
 
 def selectors(selecting_arm: str = SELECTING_ARM) -> tuple[str, ...]:
@@ -440,7 +472,7 @@ def seed_values(runs: pd.DataFrame, arms=ARMS) -> pd.DataFrame:
     cols = ["algo", "fold", "arm", "seed", "value"]
     if runs.empty or TAIL not in runs:
         return pd.DataFrame(columns=cols)
-    ok = runs[(runs["status"] == "ok") & runs["arm"].isin(list(arms)) & ~runs["algo"].isin(list(C.IMPL_VARIANTS))]
+    ok = runs[(runs["status"] == "ok") & runs["arm"].isin(list(arms)) & ~runs["algo"].isin(list(C.variant_algos()))]
     out = ok[["algo", "fold", "arm", "seed"]].copy()
     out["value"] = pd.to_numeric(ok[TAIL], errors="coerce")
     out = out.dropna(subset=["value"]).reset_index(drop=True)
@@ -456,7 +488,8 @@ def wide(values: pd.DataFrame, arm: str, seeds=None) -> pd.DataFrame:
     algos = sorted(set(values["algo"])) if len(values) else []
     sub = values[values["arm"] == arm]
     if seeds is not None:
-        sub = sub[sub["seed"].astype(int).isin([int(s) for s in seeds])]
+        wanted = {int(s) for s in seeds}
+        sub = sub[sub["seed"].map(lambda v: report._seed_key(v) in wanted)]
     if sub.empty:
         out = pd.DataFrame(index=pd.Index([], name="fold"), columns=algos, dtype=float)
     else:
@@ -479,17 +512,19 @@ def half_values(windows: pd.DataFrame, tail_from: dict) -> pd.DataFrame:
     df = windows[["algo", "fold", "arm", "seed", "window", "lag_ari_win"]].copy()
     df["window"] = pd.to_numeric(df["window"], errors="coerce")
     df["lag_ari_win"] = pd.to_numeric(df["lag_ari_win"], errors="coerce")
-    start = [int(tail_from.get(k, C.FREEZE_AFTER_WINDOW))
-             for k in zip(df["algo"], df["fold"], df["seed"], df["arm"])]
+    tail_from = {(a, f, report._seed_key(sd), arm): v for (a, f, sd, arm), v in tail_from.items()}
+    start = [int(tail_from.get((a, f, report._seed_key(sd), arm), C.FREEZE_AFTER_WINDOW))
+             for a, f, sd, arm in zip(df["algo"], df["fold"], df["seed"], df["arm"])]
     df = df[df["window"] >= np.array(start, dtype=float)]
     if df.empty:
         return pd.DataFrame(columns=cols)
     df = df.drop_duplicates(["algo", "fold", "arm", "seed", "window"])
     job = ["algo", "fold", "arm", "seed"]
-    pos = df.groupby(job)["window"].rank(method="first") - 1
-    n = df.groupby(job)["window"].transform("size")
+    # A deterministic fixed run has no seed (None under the split policy): kept as a group of its own.
+    pos = df.groupby(job, dropna=False)["window"].rank(method="first") - 1
+    n = df.groupby(job, dropna=False)["window"].transform("size")
     df["half"] = np.where(pos < (n // 2), HALVES[0], HALVES[1])
-    out = df.groupby(job + ["half"], sort=True)["lag_ari_win"].mean().rename("value").reset_index()
+    out = df.groupby(job + ["half"], sort=True, dropna=False)["lag_ari_win"].mean().rename("value").reset_index()
     return out.dropna(subset=["value"])[cols].reset_index(drop=True)
 
 
@@ -497,8 +532,10 @@ def variant_tables(values: pd.DataFrame, halves: pd.DataFrame | None, targets=TA
                    select_seeds=SELECT_SEEDS, eval_seeds=EVAL_SEEDS, selecting_arm: str = SELECTING_ARM) -> dict:
     """variant -> ``(sel, {target: folds x algos}, note)``: what each variant selects on and
     evaluates on. ``sel`` is None, with the reason in ``note``, for a variant the logs do
-    not support; a target absent from the runs is left out of the dict."""
-    if set(map(int, select_seeds)) & set(map(int, eval_seeds)):
+    not support; a target absent from the runs is left out of the dict. ``select_seeds`` or
+    ``eval_seeds`` None: the held-out-seed split is not read (``resolve_heldout_seeds``)."""
+    seeds_given = select_seeds is not None and eval_seeds is not None
+    if seeds_given and set(map(int, select_seeds)) & set(map(int, eval_seeds)):
         raise ValueError(f"selection seeds {tuple(select_seeds)} and evaluation seeds {tuple(eval_seeds)} overlap")
     present = set(values["arm"]) if len(values) else set()
     out = {}
@@ -510,14 +547,17 @@ def variant_tables(values: pd.DataFrame, halves: pd.DataFrame | None, targets=TA
         return {v: (None, {}, reason) for v in VARIANTS}
     out["same_data"] = (wide(values, selecting_arm), {t: wide(values, t) for t in targets if t in present}, None)
 
-    sel = wide(values, selecting_arm, select_seeds)
-    tgts = {t: wide(values, t, eval_seeds) for t in targets if t in present}
-    tgts = {t: w for t, w in tgts.items() if not w.empty}
-    if sel.empty or not tgts:
-        out["heldout_seeds"] = (None, {}, f"no `{selecting_arm}` run on seeds {tuple(select_seeds)} or no target "
-                                          f"run on seeds {tuple(eval_seeds)}")
+    if not seeds_given:
+        out["heldout_seeds"] = (None, {}, NO_HELDOUT_SEEDS_NOTE)
     else:
-        out["heldout_seeds"] = (sel, tgts, None)
+        sel = wide(values, selecting_arm, select_seeds)
+        tgts = {t: wide(values, t, eval_seeds) for t in targets if t in present}
+        tgts = {t: w for t, w in tgts.items() if not w.empty}
+        if sel.empty or not tgts:
+            out["heldout_seeds"] = (None, {}, f"no `{selecting_arm}` run on seeds {tuple(select_seeds)} or no "
+                                              f"target run on seeds {tuple(eval_seeds)}")
+        else:
+            out["heldout_seeds"] = (sel, tgts, None)
 
     if halves is None:
         out["prefix_suffix"] = (None, {}, "windows.jsonl not found: no per-window reading to split in time")
@@ -548,8 +588,9 @@ def load_windows(out_dir: Path, runs: pd.DataFrame, arms=ARMS) -> pd.DataFrame |
         return None
     ok = runs[(runs["status"] == "ok") & runs["arm"].isin(list(arms))] if not runs.empty else runs
     cid = ok["config_id"] if "config_id" in ok else pd.Series([None] * len(ok), index=ok.index)
-    jobs = {(a, f, int(s), arm, report._cid(c)) for a, f, s, arm, c in
-            zip(ok["algo"], ok["fold"], ok["seed"], ok["arm"], cid) if a not in C.IMPL_VARIANTS}
+    # A deterministic fixed run has no seed (None/NaN under the split policy): keyed as None, never cast.
+    jobs = {(a, f, report._seed_key(s), arm, report._cid(c)) for a, f, s, arm, c in
+            zip(ok["algo"], ok["fold"], ok["seed"], ok["arm"], cid) if a not in C.variant_algos()}
     rows = []
     with open(path, encoding="utf-8") as handle:
         for line in handle:
@@ -559,7 +600,8 @@ def load_windows(out_dir: Path, runs: pd.DataFrame, arms=ARMS) -> pd.DataFrame |
             r = json.loads(line)
             if r.get("kind", "window") != "window" or r.get("arm") not in arms:
                 continue
-            key = (r.get("algo"), r.get("fold"), int(r.get("seed")), r.get("arm"), report._cid(r.get("config_id")))
+            key = (r.get("algo"), r.get("fold"), report._seed_key(r.get("seed")), r.get("arm"),
+                   report._cid(r.get("config_id")))
             if key in jobs:
                 rows.append(tuple(r.get(k) for k in WINDOW_KEYS))
     return pd.DataFrame(rows, columns=list(WINDOW_KEYS))
@@ -615,8 +657,8 @@ def report_dir_name(selecting_arm: str = SELECTING_ARM) -> str:
     return "selection" if selecting_arm == SELECTING_ARM else f"selection_{selecting_arm}"
 
 
-def write_selection(out_dir: Path, band: float = BAND, top_k: int = TOP_K, select_seeds=SELECT_SEEDS,
-                    eval_seeds=EVAL_SEEDS, rep_dir: Path | None = None, selecting_arm: str = SELECTING_ARM,
+def write_selection(out_dir: Path, band: float = BAND, top_k: int = TOP_K, select_seeds=None,
+                    eval_seeds=None, rep_dir: Path | None = None, selecting_arm: str = SELECTING_ARM,
                     fill: bool = True) -> list[Path]:
     """Every variant on ``out_dir``: ``selection_regret.csv``, ``groups.csv``, ``selection.md``
     and the figure in ``<rep>/<report_dir_name(selecting_arm)>/``, ``<rep>`` being
@@ -632,6 +674,7 @@ def write_selection(out_dir: Path, band: float = BAND, top_k: int = TOP_K, selec
         read.append(IDENTICAL_TO[selecting_arm])  # the arm the copies come from
     arms = tuple(dict.fromkeys((*read, *TARGETS)))
     runs = report.current_runs(out_dir)
+    select_seeds, eval_seeds = resolve_heldout_seeds(runs, select_seeds, eval_seeds)
     values = seed_values(runs, arms)
     windows = load_windows(out_dir, runs, arms)
     halves = half_values(windows, report._tail_from_by_job(runs)) if windows is not None else None
@@ -997,8 +1040,8 @@ def _markdown(out_dir, values, tables, rows, groups, band, k, select_seeds, eval
         "sensitivity. It reads the same-data seed means of the other blocks in every variant: it never sees "
         "the test fold, so it is out of sample on it whichever way that fold is split.",
         "- The band is applied to ARI scores only; a rank score's pick set is its exact best at every band.",
-        f"- Held-out seeds: select on `{arm}` seed(s) {','.join(map(str, select_seeds))}, evaluate every "
-        f"target on seeds {','.join(map(str, eval_seeds))} (its maximum too). `oracle_static`, rerun on seeds 2-4, "
+        f"- Held-out seeds: select on `{arm}` seed(s) {_seeds_text(select_seeds)}, evaluate every "
+        f"target on seeds {_seeds_text(eval_seeds)} (its maximum too). `oracle_static`, rerun on seeds 2-4, "
         "is read on the same evaluation seeds so every target averages the same number of seeds; seed 4 is left out.",
         "- Prefix/suffix: each run's tail windows are split at their middle by window index (the suffix takes the "
         "odd one); single-class windows count in the split but not in the means.",
@@ -1053,7 +1096,7 @@ def _markdown(out_dir, values, tables, rows, groups, band, k, select_seeds, eval
         "## Out-of-sample variants (target `confstream`)",
         "",
         f"`heldout_seeds` is out of sample in seeds: selection on `{arm}` seed(s) "
-        f"{','.join(map(str, select_seeds))}, evaluation on seeds {','.join(map(str, eval_seeds))}. "
+        f"{_seeds_text(select_seeds)}, evaluation on seeds {_seeds_text(eval_seeds)}. "
         "`prefix_suffix` is out of sample in time: selection on the first half of each run's tail windows, "
         "evaluation on the second.",
         "",
@@ -1166,25 +1209,801 @@ def _figure(rep: Path, rows: pd.DataFrame, band: float, variant: str = "same_dat
     return path
 
 
-def main() -> None:
+# --- LOBO on real sources, each source block weighted once (the campaign's primary selection reading) ---
+#
+# ``write_selection`` above is the published P1.1 reading (fold-weighted global choices over every
+# stream group). ``lobo_real`` is the mechanism campaign's: the global choice is made from the real
+# sources other than the held-out one, every training source block weighs the same (its variants are
+# averaged first), every selector reads the same training panel (the same sources, variants, windows
+# and candidate algorithms), and the held-out source is never read before the choice is made.
+
+#: The selectors of ``lobo_real`` and the regime each one picks by (None: a uniform pick).
+LOBO_SELECTORS: dict[str, str | None] = {
+    "lobo_default": "default", "lobo_scaled_default": "scaled_default", "lobo_target": PRIMARY_TARGET, "random": None,
+}
+#: The regimes the training panel must hold for an algorithm to be a candidate.
+LOBO_REGIMES: tuple[str, ...] = ("default", "scaled_default", PRIMARY_TARGET)
+#: The primary difference: ``Q_online,test(a_lobo_target) - Q_online,test(a_lobo_scaled_default)``.
+LOBO_PRIMARY: tuple[str, str] = ("lobo_target", "lobo_scaled_default")
+#: Further paired differences reported beside it.
+LOBO_CONTRASTS: tuple[tuple[str, str], ...] = (
+    LOBO_PRIMARY, ("lobo_target", "lobo_default"), ("lobo_scaled_default", "lobo_default"), ("lobo_target", "random"),
+)
+#: Two training scores closer than this are tied; a tie goes to the algorithm whose name sorts first.
+LOBO_TIE_TOL = 1e-12
+LOBO_TIE_POLICY = (f"highest training score; scores within {LOBO_TIE_TOL:g} are tied and the tie goes to the "
+                   "algorithm name that sorts first; the held-out source is never read")
+LOBO_FOLD_COLS = [
+    "analysis", "variant", "held_out", "selector", "regime", "panel_status", "pick", "n_tied", "tied", "band_set",
+    "train_score", "n_candidates", "candidates", "excluded", "expected_train_blocks", "incomplete_train_blocks",
+    "n_train_blocks", "train_blocks", "excluded_train_blocks", "n_train_folds", "train_windows",
+    "excluded_train_folds", "missing", "test_status", "test_missing", "test_folds", "test_windows", "q_test",
+    "best_test", "best_test_algos", "regret", "n_test_defined", "note",
+]
+LOBO_STATUS_COLS = [
+    "variant", "analysis", "plan_source", "analysis_status", "n_blocks_expected", "n_blocks_eligible",
+    "n_blocks_test_available", "expected_blocks", "incomplete_blocks", "blocks_without_test", "missing_regimes",
+    "missing", "n_windows_partial_replicates", "partial_replicates", "reason",
+]
+#: What a reduced-panel summary row says it is: never the primary reading.
+REDUCED_STATUS = "sensitivity: reduced panel"
+#: A leave-one-source-out row of a variant whose primary reading is not eligible: not computed.
+LOSO_NOT_READ = "not read: primary not eligible"
+
+
+# --- the expected panel: read from the plan, before any result ------------------------------------
+
+def lobo_plan(algos, folds, *, source: str, regimes=LOBO_REGIMES, jobs: dict | None = None,
+              planned=None) -> dict:
+    """The panel the LOBO reading expects, from a plan rather than from the results on file:
+    ``source`` (where the plan was read), ``algos``, ``blocks`` (real source block -> its folds) and
+    ``cells``: (algo, real fold, regime) -> ``{"jobs": [job identities] or None, "via": regime, "planned": bool}``.
+    ``jobs`` maps a cell to the job identities the plan runs for it (None: the plan names cells only, and
+    every run of the cell on file must be ok). ``scaled_default`` of an algorithm without an absolute-distance
+    parameter reads its ``default`` cell (``via``), as ``run.py`` skips it as identical. ``planned``: the
+    (algo, fold, arm) cells the plan runs (None: every cell); one it does not is required all the same.
+    ``problems``: why the plan cannot carry a primary reading at all (a label variant beside its reference;
+    ``read_lobo_plan`` adds a config's protocol mismatches)."""
+    from .spaces import distance_params
+
+    real = sorted({f for f in folds if _real(f)}, key=_fold_key)
+    blocks: dict[str, list[str]] = {}
+    for f in real:
+        blocks.setdefault(C.source_block(f), []).append(f)
+    algos = sorted({a for a in algos if a not in C.IMPL_VARIANTS})
+    problems = [f"{v} and {ref} are both candidates: {v} is {ref} under other labels, so the same model would "
+                f"count twice; a plan reads one of them" for v, ref in sorted(C.LABEL_VARIANTS.items())
+                if v in algos and ref in algos]
+    cells = {}
+    for a in algos:
+        for f in real:
+            for r in regimes:
+                via = "default" if r == "scaled_default" and not distance_params(a) else r
+                cells[(a, f, r)] = {"via": via, "jobs": None if jobs is None else list(jobs.get((a, f, via), [])),
+                                    "planned": planned is None or (a, f, via) in planned}
+    return {"source": source, "algos": algos, "blocks": blocks, "cells": cells, "problems": problems}
+
+
+def plan_from_inventory(inv: dict, source: str) -> dict:
+    """``lobo_plan`` from a campaign inventory (``campaign.inventory``: ``jobs``, ``skipped``): the job
+    identities of every cell, the algorithms and real folds it plans."""
+    from .analysis_support import seed_key
+
+    jobs: dict[tuple, list] = {}
+    for j in inv.get("jobs", []):
+        if j["arm"] in LOBO_REGIMES:
+            ident = (j["algo"], j["fold"], j["arm"], seed_key(j.get("seed")), seed_key(j.get("model_seed")),
+                     seed_key(j.get("config_id")))
+            jobs.setdefault((j["algo"], j["fold"], j["arm"]), []).append(ident)
+    every = list(inv.get("jobs", [])) + list(inv.get("skipped", []))
+    algos = {j["algo"] for j in every}
+    folds = {j["fold"] for j in every}
+    return lobo_plan(algos, folds, source=source, jobs=jobs, planned=set(jobs))
+
+
+def read_lobo_plan(out_dir: Path, config: Path | None = None) -> dict | None:
+    """The expected panel of ``out_dir``: a campaign config given (``config``), else the campaign manifest
+    in the dir (its inventory names every job), else the run manifest (algorithms x streams x arms, cell
+    level). None when the dir holds no plan at all."""
+    from . import campaign as CP
+    from . import manifest as M
+
+    out_dir = Path(out_dir)
+    if config is not None:
+        cfg = CP.load_config(Path(config))
+        plan = plan_from_inventory(CP.inventory(cfg, out_dir), source=f"campaign config {config}")
+        plan["problems"] = plan["problems"] + plan_protocol_problems(cfg, out_dir)
+        return plan
+    camp = CP.load_manifest(out_dir)
+    if camp is not None:
+        return plan_from_inventory(camp.get("inventory", {}), source=f"campaign manifest {out_dir / CP.CAMPAIGN_MANIFEST}")
+    rm = M.load(out_dir)
+    if rm is None:
+        return None
+    folds = {str(k).split("/", 1)[0] for k in rm.get("streams", {})}
+    arms = set(rm.get("arms", {}))
+    planned = {(a, f, r) for a in rm.get("algorithms", {}) for f in folds for r in arms}
+    return lobo_plan(rm.get("algorithms", {}), folds, source=f"run manifest {out_dir / M.MANIFEST} (cell level)",
+                     planned=planned)
+
+
+#: Campaign protocol keys the run manifest records under the same name (``manifest.json``'s ``protocol``).
+_PLAN_PROTOCOL_KEYS = ("h", "freeze_after_window", "n_samples", "half_life_frac", "lam", "data_seed", "seed_policy",
+                       "max_memory_mb", "max_micro_clusters")
+
+
+def plan_protocol_problems(cfg: dict, out_dir: Path) -> list[str]:
+    """Why a campaign config given from outside may not be the plan of ``out_dir``'s results: a job is
+    named by (algo, fold, arm, seeds, config) only, so a dir run under another protocol would otherwise
+    satisfy it. Compared: the dir's campaign manifest's config hash, and the run manifest's protocol (the
+    keys both record, and the runtime gate). A dir without a run manifest cannot be checked."""
+    from . import campaign as CP
+    from . import manifest as M
+
+    out = []
+    camp = CP.load_manifest(out_dir)
+    if camp is not None and camp.get("config_sha256") != CP.config_sha256(cfg):
+        out.append(f"the dir's campaign manifest was made from another config ({str(camp.get('config_sha256'))[:12]})")
+    rm = M.load(out_dir)
+    if rm is None:
+        return out + ["the dir has no run manifest: its protocol cannot be checked against the plan"]
+    have, want = rm.get("protocol", {}), cfg["protocol"]
+    for k in _PLAN_PROTOCOL_KEYS:
+        if k in have and k in want and have[k] != want[k]:
+            out.append(f"protocol.{k}: the dir ran {have[k]!r}, the plan says {want[k]!r}")
+    if "runtime_factor" in have and (have["runtime_factor"] is not None) != bool(want.get("runtime_gate")):
+        out.append(f"runtime gate: the dir ran runtime_factor={have['runtime_factor']!r}, the plan says "
+                   f"runtime_gate={want.get('runtime_gate')!r}")
+    # what each arm ran under (``manifest.json``'s ``arms``): none of it is in a job's identity either
+    for arm in cfg.get("arms", []):
+        got = rm.get("arms", {}).get(arm)
+        if got is None:
+            continue
+        expect = {"log_signals": sorted(want.get("signals") or []), "signal_noise": want.get("signal_noise"),
+                  "cmm": bool(want.get("cmm"))}
+        seen = {"log_signals": sorted(got.get("log_signals") or []), "signal_noise": got.get("signal_noise"),
+                "cmm": "cmm" in (got.get("external_metrics") or [])}
+        if arm not in C.FIXED_ARMS:
+            expect.update(e_size=want.get("e_size"), e_test=want.get("e_test"), p_reset=want.get("p_reset"),
+                          tie_break=want.get("tie_break"))
+            seen.update({k: got.get(k) for k in ("e_size", "e_test", "p_reset", "tie_break")})
+        for k, v in expect.items():
+            if k in ("signal_noise",) and seen[k] is None:
+                continue
+            if seen[k] != v:
+                out.append(f"arms.{arm}.{k}: the dir ran {seen[k]!r}, the plan says {v!r}")
+        if (got.get("runtime_factor") is not None) != bool(want.get("runtime_gate")):
+            out.append(f"arms.{arm}.runtime_factor: the dir ran {got.get('runtime_factor')!r}, the plan says "
+                       f"runtime_gate={want.get('runtime_gate')!r}")
+    return out
+
+
+def _latest_status(runs: pd.DataFrame) -> dict[tuple, str]:
+    """Job identity (``analysis_support.IDENTITY``) -> the status of its latest attempt; skips left out."""
+    from .analysis_support import IDENTITY, seed_key
+
+    latest: dict[tuple, str] = {}
+    if len(runs):
+        for r in runs.to_dict("records"):
+            if r.get("status") == "skipped":
+                continue
+            latest[tuple(seed_key(r[k]) if k in ("seed", "model_seed", "config_id") else r[k] for k in IDENTITY)] = (
+                r.get("status"))
+    return latest
+
+
+def cell_jobs(plan: dict, runs: pd.DataFrame) -> dict[tuple, list[tuple]]:
+    """(algo, fold, regime) -> the job identities the cell needs (arm: the regime it is read through).
+    A plan with job lists (a campaign's) names them. A plan that names cells only (a run manifest's, which
+    records the union of the seeds over all jobs, not per algorithm) expects, for each (algo, arm), every
+    replicate (seed, model seed, config) that pair ran on any planned real fold: a replicate one fold
+    lacks is then a missing job, though a replicate run nowhere cannot be told from one never planned."""
+    folds = {f for fs in plan["blocks"].values() for f in fs}
+    reps: dict[tuple, set] = {}
+    for a, f, arm, *rep in _latest_status(runs):
+        if f in folds:
+            reps.setdefault((a, arm), set()).add(tuple(rep))
+    out = {}
+    for (a, f, r), cell in plan["cells"].items():
+        via = cell["via"]
+        if cell["jobs"] is not None:
+            out[(a, f, r)] = [tuple(j) for j in cell["jobs"]]
+        else:
+            out[(a, f, r)] = [(a, f, via, *rep) for rep in sorted(reps.get((a, via), ()), key=repr)]
+    return out
+
+
+def cell_gaps(plan: dict, runs: pd.DataFrame) -> dict[tuple, str]:
+    """(algo, fold, regime) -> why the plan's cell has no usable job: ``not planned``, ``not on file`` or
+    the statuses of its jobs that are not ok (``error``, ``timeout``, ``oom``, ``not on file``) with
+    their count (``cell_jobs``). A cell whose jobs are all ok is absent. Never read as a score."""
+    latest = _latest_status(runs)
+    jobs = cell_jobs(plan, runs)
+    out = {}
+    for (a, f, r), cell in plan["cells"].items():
+        via = cell["via"]
+        if not cell["planned"]:
+            out[(a, f, r)] = "not planned"
+            continue
+        statuses = [latest.get(j, "not on file") for j in jobs[(a, f, r)]]
+        if not statuses:
+            out[(a, f, r)] = "not on file"
+            continue
+        bad = [s for s in statuses if s != "ok"]
+        if bad:
+            kinds = sorted(set(bad))
+            out[(a, f, r)] = (", ".join(kinds) if len(kinds) > 1 else kinds[0]) + f" ({len(bad)} of {len(statuses)} jobs)"
+            if via != r:
+                out[(a, f, r)] += f", read through {via}"
+    return out
+
+
+def planned_windows(tw: pd.DataFrame, plan: dict, runs: pd.DataFrame, metric: str) -> tuple[pd.DataFrame, dict]:
+    """``tw`` kept to the plan's jobs (``cell_jobs``; a run the plan does not name is never averaged in) and
+    to the windows every job of the cell reads (a window some replicate of the cell does not read is left
+    out of that cell, never averaged over the replicates that do); and per (algo, fold, regime) how many
+    windows that left out. A row ``fill_identical_windows`` copied stands for the job it was copied from."""
+    from .analysis_support import seed_key
+
+    if tw.empty:
+        return tw, {}
+    jobs = cell_jobs(plan, runs)
+    wanted = {j for js in jobs.values() for j in js}
+    src = tw["filled_from"] if "filled_from" in tw else pd.Series([None] * len(tw), index=tw.index)
+    keys = [(a, f, s if isinstance(s, str) else arm, seed_key(sd), seed_key(ms), seed_key(cid))
+            for a, f, arm, s, sd, ms, cid in zip(tw["algo"], tw["fold"], tw["arm"], src, tw["seed"],
+                                                  tw["model_seed"], tw["config_id"])]
+    sub = tw[[k in wanted for k in keys]]
+    sub = sub[sub[metric].notna()]
+    n = sub.groupby(["algo", "fold", "arm", "window"]).size().to_dict()
+    need = {k: len(v) for k, v in jobs.items()}
+    full = [n[(a, f, r, w)] == need.get((a, f, r), -1) for a, f, r, w in zip(sub["algo"], sub["fold"], sub["arm"],
+                                                                             sub["window"])]
+    kept = sub[full]
+    partial = {}
+    for (a, f, r), g in sub[[not x for x in full]].groupby(["algo", "fold", "arm"]):
+        partial[(a, f, r)] = int(g["window"].nunique())
+    return kept, partial
+
+
+def regime_window_values(tw: pd.DataFrame, regime: str, metric: str) -> dict[tuple, pd.Series]:
+    """(algo, fold) -> window -> ``regime``'s reading of ``metric``: the mean over its replicates on the
+    window (``analysis_support.arm_windows``: tuner seeds of an online arm, the fixed runs of a fixed one)."""
+    from .analysis_support import arm_windows
+
+    aw = arm_windows(tw, regime, metric)
+    out = {}
+    for (algo, fold), g in aw.groupby(["algo", "fold"], sort=True):
+        out[(algo, fold)] = g.groupby("window")["value"].mean().sort_index()
+    return out
+
+
+def _lobo_pick(scores: dict[str, float], band: float) -> dict:
+    """The pick of a score dict under ``LOBO_TIE_POLICY``, the algorithms tied with it, and the band set."""
+    if not scores:
+        return {"pick": None, "tied": [], "band_set": [], "train_score": np.nan}
+    top = max(scores.values())
+    tied = sorted(a for a, v in scores.items() if v >= top - LOBO_TIE_TOL)
+    return {"pick": tied[0], "tied": tied, "train_score": float(top),
+            "band_set": sorted(a for a, v in scores.items() if v >= top - band - LOBO_TIE_TOL)}
+
+
+def _half(windows: list, half: str | None) -> list:
+    if half is None:
+        return windows
+    k = len(windows) // 2
+    return windows[:k] if half == "prefix" else windows[k:]
+
+
+def _has(values: dict, regime: str, algo: str, fold: str) -> bool:
+    s = values.get(regime, {}).get((algo, fold))
+    return s is not None and not s.dropna().empty
+
+
+def lobo_once(values: dict[str, dict[tuple, pd.Series]], blocks: dict[str, list[str]], algos: list[str],
+              held_out: str, band: float = BAND, test_half: str | None = None, variant: str = "same_data",
+              gaps: dict[tuple, str] | None = None, via: dict[tuple, str] | None = None, reduced: bool = False,
+              plan_known: bool = True, plan_problems=()) -> tuple[list[dict], list[dict]]:
+    """One held-out source block: ``(rows, training_scores)``.
+
+    ``blocks`` and ``algos`` are the plan's (``lobo_plan``), never what the results hold, and ``gaps``
+    the plan's cells without a usable job (``cell_gaps``). The training panel is every fold of every
+    other block, every algorithm and every regime of ``LOBO_REGIMES``. In the primary reading a cell of
+    it without an ok job or without a tail reading, or a training fold without a window every algorithm
+    reads under every regime, makes the block's panel ``ineligible``: its rows choose nothing and say
+    why (``missing``, ``incomplete_train_blocks``). ``reduced`` (a sensitivity, asked for by name)
+    instead excludes such an algorithm for every selector alike and leaves such a fold out, and says
+    what it left out (``excluded``, ``excluded_train_blocks``, ``excluded_train_folds``).
+    ``plan_known`` False (no plan on file) makes every primary panel ineligible; a ``plan_problems`` entry
+    (``plan_protocol_problems``: the plan is not the dir's protocol) makes the reduced panel ineligible too.
+
+    On each training fold the windows are those every candidate reads under every regime. A regime's
+    training score of an algorithm is the mean over training blocks of the mean over the block's folds;
+    ties follow ``LOBO_TIE_POLICY``. The test reads ``PRIMARY_TARGET`` on the held-out block only, on the
+    windows every candidate reads there (``test_half``: the first or second half of them). A candidate
+    whose test job is missing or failed, or that has no reading there, leaves the block's test quality
+    ``unavailable`` with the reason (``test_missing``); the choice and the candidates stay what the
+    training data made them, and nothing is imputed.
+    """
+    gaps, via = gaps or {}, via or {}
+    regimes = list(LOBO_REGIMES)
+    train_blocks = {b: fs for b, fs in blocks.items() if b != held_out}
+    train_folds = [f for b in sorted(train_blocks) for f in train_blocks[b]]
+    block_of = {f: b for b, fs in train_blocks.items() for f in fs}
+
+    def gap(a, f, r):
+        why = gaps.get((a, f, r))
+        if why is None and not _has(values, r, a, f):
+            why = "ok job without a tail reading" + (f" (read through {via[(a, f, r)]})"
+                                                     if via.get((a, f, r), r) != r else "")
+        return why
+
+    missing, incomplete, bad_algo = [], set(), {}
+    if not plan_known:
+        missing.append("no plan on file: the expected panel cannot be checked")
+    missing += [f"plan: {why}" for why in plan_problems]
+    for f in train_folds:
+        for a in algos:
+            for r in regimes:
+                why = gap(a, f, r)
+                if why is not None:
+                    missing.append(f"{a}/{f}/{r}: {why}")
+                    incomplete.add(block_of[f])
+                    bad_algo.setdefault(a, f"{r} on {f}: {why}")
+    excluded = bad_algo if reduced else {}
+    cands = [a for a in algos if a not in excluded]
+    support, dropped = {}, []
+    for f in train_folds:
+        sets = [set(values[r][(a, f)].dropna().index) for a in cands for r in regimes if _has(values, r, a, f)]
+        complete = bool(cands) and len(sets) == len(cands) * len(regimes)
+        common = set.intersection(*sets) if complete else set()
+        if common:
+            support[f] = sorted(common)
+        else:
+            dropped.append(f)
+            if complete:
+                missing.append(f"{f}: no tail window every candidate reads under every regime")
+                incomplete.add(block_of[f])
+    choose = (reduced and not plan_problems) or not missing
+    panel_status = "eligible" if not missing else ("reduced" if reduced and choose else "ineligible")
+    scores_rows = []
+    block_scores: dict[str, dict[str, dict[str, float]]] = {r: {a: {} for a in cands} for r in regimes}
+    if choose:
+        for r in regimes:
+            for a in cands:
+                for b, fs in sorted(train_blocks.items()):
+                    qs = [float(values[r][(a, f)].loc[support[f]].mean()) for f in fs if f in support]
+                    if qs:
+                        block_scores[r][a][b] = float(np.mean(qs))
+                        scores_rows.append({"analysis": "reduced_panel" if reduced else "primary", "variant": variant,
+                                            "held_out": held_out, "regime": r, "algo": a, "train_block": b,
+                                            "n_folds": len(qs), "score": block_scores[r][a][b]})
+    used_blocks = sorted({b for r in regimes for a in cands for b in block_scores[r][a]})
+
+    test_folds = blocks.get(held_out, [])
+    tgt = values.get(PRIMARY_TARGET, {})
+    test_missing = [] if test_folds else ["the held-out source has no real fold in the plan"]
+    for f in test_folds:
+        for a in cands:
+            why = gap(a, f, PRIMARY_TARGET)
+            if why is not None:
+                test_missing.append(f"{a}/{f}/{PRIMARY_TARGET}: {why}")
+    q_fold: dict[str, dict[str, float]] = {a: {} for a in cands}
+    test_windows = 0
+    if not test_missing and cands:
+        for f in test_folds:
+            common = set.intersection(*[set(tgt[(a, f)].dropna().index) for a in cands])
+            wins = _half(sorted(common), test_half)
+            if not wins:
+                test_missing.append(f"{f}: no {PRIMARY_TARGET} window every candidate reads"
+                                    + (f" ({test_half} half)" if test_half else ""))
+                continue
+            test_windows += len(wins)
+            for a in cands:
+                q_fold[a][f] = float(tgt[(a, f)].loc[wins].mean())
+    test_ok = bool(cands) and not test_missing
+    q_test = {a: (float(np.mean([q_fold[a][f] for f in test_folds])) if test_ok else np.nan) for a in cands}
+    defined = {a: v for a, v in q_test.items() if not np.isnan(v)}
+    best = max(defined.values()) if defined else np.nan
+    best_algos = sorted(a for a, v in defined.items() if v >= best - LOBO_TIE_TOL) if defined else []
+    rows = []
+    base = {"analysis": "reduced_panel" if reduced else "primary", "variant": variant, "held_out": held_out,
+            "panel_status": panel_status, "n_candidates": len(cands), "candidates": ";".join(cands),
+            "excluded": ";".join(f"{a} ({why})" for a, why in sorted(excluded.items())),
+            "expected_train_blocks": ";".join(sorted(train_blocks)),
+            "incomplete_train_blocks": ";".join(sorted(incomplete)),
+            "n_train_blocks": len(used_blocks), "train_blocks": ";".join(used_blocks),
+            "excluded_train_blocks": ";".join(sorted(set(train_blocks) - set(used_blocks))),
+            "n_train_folds": len(support) if choose else 0,
+            "train_windows": int(sum(len(v) for v in support.values())) if choose else 0,
+            "excluded_train_folds": ";".join(dropped), "missing": "; ".join(missing),
+            "test_status": "available" if test_ok else "unavailable", "test_missing": "; ".join(test_missing),
+            "test_folds": ";".join(test_folds), "test_windows": test_windows, "best_test": best,
+            "best_test_algos": ";".join(best_algos), "n_test_defined": len(defined)}
+    for selector, regime in LOBO_SELECTORS.items():
+        row = {**base, "selector": selector, "regime": regime}
+        notes = []
+        if not choose:
+            row.update(pick=None, n_tied=None, tied=None, band_set=None, train_score=np.nan, q_test=np.nan)
+            notes.append("primary analysis not eligible: the expected training panel is incomplete (see missing); "
+                         "nothing is chosen from a narrowed panel")
+        elif selector == "random":
+            row.update(pick=None, n_tied=len(cands), tied=";".join(cands), band_set=";".join(cands),
+                       train_score=np.nan)
+            row["q_test"] = float(np.mean(list(defined.values()))) if test_ok else np.nan
+        else:
+            scores = {a: float(np.mean(list(block_scores[regime][a].values())))
+                      for a in cands if block_scores[regime][a]}
+            p = _lobo_pick(scores, band)
+            row.update(pick=p["pick"], n_tied=len(p["tied"]), tied=";".join(p["tied"]),
+                       band_set=";".join(p["band_set"]), train_score=p["train_score"])
+            row["q_test"] = q_test.get(p["pick"], np.nan) if p["pick"] is not None else np.nan
+            if p["pick"] is None:
+                notes.append("no candidate")
+        if choose and not test_ok:
+            notes.append("test quality unavailable, the choice kept: " + "; ".join(test_missing or ["no candidate"]))
+        row["regret"] = (best - row["q_test"]) if not np.isnan(row["q_test"]) and not np.isnan(best) else np.nan
+        row["note"] = "; ".join(notes) or None
+        rows.append(row)
+    return rows, scores_rows
+
+
+def _lobo_differences(rows: pd.DataFrame) -> pd.DataFrame:
+    """Per (variant, held-out block): the paired test differences ``LOBO_CONTRASTS``, each regret, and
+    the block's panel and test status."""
+    out = []
+    for (variant, held), g in rows.groupby(["variant", "held_out"], sort=True):
+        q = dict(zip(g["selector"], g["q_test"]))
+        picks = dict(zip(g["selector"], g["pick"]))
+        row = {"variant": variant, "held_out": held, "panel_status": g["panel_status"].iloc[0],
+               "test_status": g["test_status"].iloc[0],
+               **{f"pick_{s}": picks.get(s) for s in LOBO_SELECTORS if s != "random"}}
+        for a, b in LOBO_CONTRASTS:
+            qa, qb = q.get(a, np.nan), q.get(b, np.nan)
+            row[f"{a}_minus_{b}"] = (qa - qb) if not (pd.isna(qa) or pd.isna(qb)) else np.nan
+        for s in LOBO_SELECTORS:
+            row[f"regret_{s}"] = g.loc[g["selector"] == s, "regret"].iloc[0] if (g["selector"] == s).any() else np.nan
+        out.append(row)
+    return pd.DataFrame(out)
+
+
+def _lobo_summary(diffs: pd.DataFrame, threshold: float = BAND, label: str = "all sources",
+                  n_expected: int | None = None, reduced: bool = False) -> list[dict]:
+    """The mean over held-out blocks of every difference and regret. The primary reading is
+    ``eligible`` only when every expected block (``n_expected``) has a complete training panel and a
+    test reading; otherwise its numbers are left undefined and ``analysis_status`` says so. A reduced
+    panel (``reduced``) is summarised over the blocks it defines and labelled ``REDUCED_STATUS``."""
+    from .analysis_support import block_bootstrap
+
+    out = []
+    for variant, g in diffs.groupby("variant", sort=True):
+        n_exp = len(g) if n_expected is None else int(n_expected)
+        whole = (len(g) == n_exp and (g["panel_status"] == "eligible").all() and (g["test_status"] == "available").all())
+        status = REDUCED_STATUS if reduced else ("eligible" if whole else "ineligible")
+        read = reduced or whole
+        reason = None if whole else (
+            f"{int((g['panel_status'] != 'eligible').sum())} of {n_exp} held-out blocks lack a complete training "
+            f"panel, {int((g['test_status'] != 'available').sum())} lack a test reading")
+        for col in [f"{a}_minus_{b}" for a, b in LOBO_CONTRASTS] + [f"regret_{s}" for s in LOBO_SELECTORS]:
+            v = pd.to_numeric(g[col], errors="coerce").dropna()
+            row = {"variant": variant, "analysis": label, "difference": col, "analysis_status": status,
+                   "n_blocks_expected": n_exp, "n_blocks": int(len(v)), "n_blocks_undefined": int(g[col].isna().sum()),
+                   "status_reason": reason}
+            if read:
+                row.update(mean=float(v.mean()) if len(v) else np.nan, median=float(v.median()) if len(v) else np.nan)
+                if not col.startswith("regret_"):
+                    lo, hi = block_bootstrap(v)
+                    row.update(ci_low=lo, ci_high=hi, n_above_0=int((v > _EPS).sum()), n_below_0=int((v < -_EPS).sum()),
+                               n_above_threshold=int((v > threshold + _EPS).sum()),
+                               n_below_threshold=int((v < -threshold - _EPS).sum()))
+            else:
+                row.update(mean=np.nan, median=np.nan)
+            out.append(row)
+    return out
+
+
+def _lobo_status(rows: pd.DataFrame, plan: dict, blocks: dict, analysis: str, reduced: bool,
+                 partial: dict | None = None) -> list[dict]:
+    """One row per variant: whether the reading is eligible, over which expected blocks, and what is missing;
+    ``partial`` (``planned_windows``): the windows left out of a cell because a replicate did not read them."""
+    partial = partial or {}
+    part_text = "; ".join(f"{a}/{f}/{r}: {n}" for (a, f, r), n in sorted(partial.items()))
+    out = []
+    for variant, g in rows.groupby("variant", sort=True):
+        per = g.groupby("held_out", sort=True).first()
+        miss = sorted({m for col in ("missing", "test_missing") for v in g[col].dropna() for m in str(v).split("; ") if m})
+        regimes = sorted({m.split(":", 1)[0].split("/")[2] for m in miss if m.count("/") >= 2 and ":" in m})
+        incomplete = sorted({b for v in per["incomplete_train_blocks"].dropna() for b in str(v).split(";") if b})
+        no_test = sorted(per.index[per["test_status"] != "available"])
+        n_ok = int((per["panel_status"] == "eligible").sum())
+        n_test = int((per["test_status"] == "available").sum())
+        whole = n_ok == len(blocks) and n_test == len(blocks) and len(per) == len(blocks)
+        out.append({
+            "variant": variant, "analysis": analysis, "plan_source": plan["source"],
+            "analysis_status": REDUCED_STATUS if reduced else ("eligible" if whole else "ineligible"),
+            "n_blocks_expected": len(blocks), "n_blocks_eligible": n_ok, "n_blocks_test_available": n_test,
+            "expected_blocks": ";".join(sorted(blocks)), "incomplete_blocks": ";".join(incomplete),
+            "blocks_without_test": ";".join(no_test), "missing_regimes": ";".join(regimes), "missing": "; ".join(miss),
+            "n_windows_partial_replicates": int(sum(partial.values())), "partial_replicates": part_text,
+            "reason": ("every expected block has a complete training panel and a test reading" if whole else
+                       f"{len(blocks) - n_ok} of {len(blocks)} held-out blocks lack a complete training panel, "
+                       f"{len(blocks) - n_test} lack a test reading"),
+        })
+    return out
+
+
+def _observed_plan(tw: pd.DataFrame) -> dict:
+    folds = sorted({f for f in tw["fold"]}) if len(tw) else []
+    algos = sorted({a for a in tw["algo"]}) if len(tw) else []
+    return lobo_plan(algos, folds, source="none: read off the results on file (no plan given)")
+
+
+def lobo_real(tw: pd.DataFrame, metric: str = "lag_ari_win", band: float = BAND, folds=None,
+              sensitivity_halves: bool = True, plan: dict | None = None, runs: pd.DataFrame | None = None,
+              reduced_panel: bool = False) -> dict[str, pd.DataFrame]:
+    """The LOBO reading of tail windows ``tw`` (``analysis_support.tail_windows``, identical scaled
+    defaults filled): real folds only, each held out with its whole source block.
+
+    ``plan`` (``lobo_plan``, ``read_lobo_plan``) names the blocks, folds, algorithms and regimes the
+    reading expects and, with ``runs`` (``analysis_support.run_table``), the jobs it needs; without a
+    plan the panel is read off the results and the primary reading is never eligible.
+
+    Returns ``folds`` (one row per variant x held-out block x selector), ``training_scores``,
+    ``differences`` (per held-out block), ``summary`` (mean over blocks, undefined unless the primary
+    reading is eligible), ``status`` (per variant: eligible or not, expected and incomplete blocks,
+    missing regimes and jobs) and ``loso`` (the summary again with each source removed from the plan,
+    Shuttle included). Variants: ``same_data`` (primary: every tail window of the held-out source) and,
+    with ``sensitivity_halves``, ``suffix_eval`` (the second half of its common windows only).
+    ``reduced_panel`` adds ``reduced``: the same tables on the panel that excludes what is missing, a
+    sensitivity that never replaces the primary reading."""
+    known = plan is not None
+    plan = plan if known else _observed_plan(tw)
+    blocks = {b: [f for f in fs if folds is None or f in set(folds)] for b, fs in plan["blocks"].items()}
+    blocks = {b: fs for b, fs in blocks.items() if fs}
+    algos = list(plan["algos"])
+    gaps = cell_gaps(plan, runs) if runs is not None else {}
+    partial: dict = {}
+    if runs is not None:
+        tw, partial = planned_windows(tw, plan, runs, metric)
+    via = {k: c["via"] for k, c in plan["cells"].items()}
+    values = {r: regime_window_values(tw, r, metric) for r in LOBO_REGIMES if (tw["arm"] == r).any()} if len(tw) else {}
+    variants = [("same_data", None)] + ([("suffix_eval", "suffix")] if sensitivity_halves else [])
+
+    def run(bl: dict[str, list[str]], reduced: bool = False):
+        rows, scores = [], []
+        for variant, half in variants:
+            for held in sorted(bl):
+                r, s = lobo_once(values, bl, algos, held, band, half, variant, gaps, via, reduced, known,
+                                 plan.get("problems", ()))
+                rows += r
+                scores += s
+        df = pd.DataFrame(rows).reindex(columns=LOBO_FOLD_COLS)
+        df["n_tied"] = pd.array(df["n_tied"], dtype="Int64")      # None where nothing was chosen
+        return df, pd.DataFrame(scores)
+
+    def tables(bl, reduced=False):
+        rows, scores = run(bl, reduced)
+        diffs = _lobo_differences(rows) if len(rows) else pd.DataFrame()
+        summary = pd.DataFrame(_lobo_summary(diffs, band, n_expected=len(bl), reduced=reduced) if len(diffs) else [])
+        status = pd.DataFrame(_lobo_status(rows, plan, bl, "reduced_panel" if reduced else "primary", reduced, partial)
+                              if len(rows) else [], columns=LOBO_STATUS_COLS)
+        return rows, scores, diffs, summary, status
+
+    rows, scores, diffs, summary, status = tables(blocks)
+    eligible = set(status.loc[status["analysis_status"] == "eligible", "variant"]) if len(status) else set()
+    loso = []
+    for gone in sorted(blocks):
+        rest = {b: fs for b, fs in blocks.items() if b != gone}
+        r2, _ = run(rest)
+        if len(r2):
+            label = f"without {gone}" + (" (drop Shuttle)" if gone == "shuttle" else "")
+            for row in _lobo_summary(_lobo_differences(r2), band, label, n_expected=len(rest)):
+                if row["variant"] not in eligible:
+                    # leaving out the block that holds the gap would be a reduced panel under another name
+                    row = {k: (np.nan if k in ("mean", "median", "ci_low", "ci_high") else v) for k, v in row.items()
+                           if k not in ("n_above_0", "n_below_0", "n_above_threshold", "n_below_threshold")}
+                    row.update(analysis_status=LOSO_NOT_READ, status_reason="the primary reading is not eligible")
+                loso.append(row)
+    out = {"folds": rows, "training_scores": scores, "differences": diffs, "summary": summary,
+           "status": status, "loso": pd.DataFrame(loso)}
+    if reduced_panel:
+        r_rows, r_scores, r_diffs, r_summary, r_status = tables(blocks, reduced=True)
+        out["reduced"] = {"folds": r_rows, "training_scores": r_scores, "differences": r_diffs,
+                          "summary": r_summary, "status": r_status}
+    return out
+
+
+def _real(fold: str) -> bool:
+    try:
+        return C.stream_group(fold) == "real"
+    except ValueError:
+        return False
+
+
+def _plan_expected_jobs(plan: dict) -> dict[str, int] | None:
+    """Per arm, the job identities the plan runs for the LOBO regimes (a cell read through another regime
+    counted once, under the arm that runs it); None when the plan names cells only."""
+    seen: dict[str, set] = {}
+    for (a, f, r), cell in plan["cells"].items():
+        if cell["jobs"] is None:
+            return None
+        if cell["planned"] and cell["via"] == r:
+            seen.setdefault(r, set()).update(cell["jobs"])
+    return {arm: len(v) for arm, v in sorted(seen.items())}
+
+
+def write_lobo(out_dir: Path, rep_dir: Path | None = None, metric: str = "ari", band: float = BAND,
+               fill: bool = True, config: Path | None = None, reduced_panel: bool = False) -> list[Path]:
+    """``lobo_real`` on ``out_dir``'s latest runs, into ``<rep>/lobo[_<metric>]/``: ``lobo_status.csv``,
+    ``lobo_folds.csv``, ``lobo_training_scores.csv``, ``lobo_differences.csv``, ``lobo_summary.csv``,
+    ``lobo_loso.csv``, ``coverage.csv`` and ``lobo.md``.
+
+    The expected panel is read before any result (``read_lobo_plan``: ``config``, a campaign config, else
+    the dir's campaign manifest, else its run manifest); without one the primary reading is never
+    eligible. ``fill``: ``scaled_default`` of an algorithm without a distance parameter reads its
+    ``default`` windows (``analysis_support.fill_identical_windows``), before any panel.
+    ``reduced_panel`` (a sensitivity, asked for by name) also writes the reduced-panel tables into
+    ``<rep>/reduced_panel/``; they never replace the primary ones."""
+    from . import analysis_support as AS
+
+    out_dir = Path(out_dir)
+    col = AS.METRICS[metric]
+    rep = (Path(rep_dir) if rep_dir is not None else out_dir / C.REPORT_DIR.name) / ("lobo" if metric == "ari" else f"lobo_{metric}")
+    rep.mkdir(parents=True, exist_ok=True)
+    plan = read_lobo_plan(out_dir, config)
+    runs = AS.run_table(out_dir, arms=LOBO_REGIMES)
+    tw = AS.tail_windows(out_dir, runs, metrics=(col,))
+    filled: list[str] = []
+    if fill:
+        tw, filled = AS.fill_identical_windows(tw)
+    res = lobo_real(tw, col, band, plan=plan, runs=runs, reduced_panel=reduced_panel)
+    paths = []
+    for name in ("status", "folds", "training_scores", "differences", "summary", "loso"):
+        path = rep / f"lobo_{name}.csv"
+        res[name].to_csv(path, index=False)
+        paths.append(path)
+    if reduced_panel:
+        red = rep / "reduced_panel"
+        red.mkdir(exist_ok=True)
+        for name in ("status", "folds", "training_scores", "differences", "summary"):
+            path = red / f"lobo_{name}.csv"
+            res["reduced"][name].to_csv(path, index=False)
+            paths.append(path)
+    real = {f for fs in plan["blocks"].values() for f in fs} if plan is not None else {f for f in runs["fold"] if _real(f)}
+    cov_runs = runs[runs["fold"].isin(real)] if len(runs) else runs
+    cov_tw = tw[tw["fold"].isin(real) & (tw["filled_from"].isna() if "filled_from" in tw else True)] if len(tw) else tw
+    cov = AS.coverage(cov_runs, cov_tw, expected=_plan_expected_jobs(plan) if plan is not None else None)
+    cov.to_csv(rep / "coverage.csv", index=False)
+    paths.append(rep / "coverage.csv")
+    md = rep / "lobo.md"
+    md.write_text(_lobo_markdown(out_dir, res, metric, band, filled, fill, runs, plan), encoding="utf-8")
+    paths.append(md)
+    return paths
+
+
+def _status_lines(status: pd.DataFrame, heading: str) -> list[str]:
+    """The eligibility of each variant, in words, with what the panel expected and what it lacks."""
+    lines = [heading, ""]
+    if status.empty:
+        return lines + ["No real source block in the plan: nothing to read.", ""]
+    for st in status.to_dict("records"):
+        lines.append(f"- `{st['variant']}`: **{st['analysis_status']}**. {st['reason']}. Expected blocks: "
+                     f"{st['expected_blocks'] or 'none'} ({st['n_blocks_expected']}); with a complete training panel: "
+                     f"{st['n_blocks_eligible']}; with a test reading: {st['n_blocks_test_available']}.")
+        if st["incomplete_blocks"]:
+            lines.append(f"  - Training blocks with a gap: {st['incomplete_blocks']}.")
+        if st["blocks_without_test"]:
+            lines.append(f"  - Held-out blocks without a test reading: {st['blocks_without_test']}.")
+        if st["missing_regimes"]:
+            lines.append(f"  - Regimes with a missing cell: {st['missing_regimes']}.")
+        if st.get("n_windows_partial_replicates"):
+            lines.append(f"  - Windows left out of a cell because one of its replicates did not read them: "
+                         f"{st['n_windows_partial_replicates']} ({st['partial_replicates']}).")
+        if st["missing"]:
+            miss = str(st["missing"]).split("; ")
+            more = f" (and {len(miss) - 12} more, in `lobo_status.csv`)" if len(miss) > 12 else ""
+            lines.append(f"  - Missing: {'; '.join(miss[:12])}{more}.")
+    return lines + [""]
+
+
+def _n_tuner_seeds(runs: pd.DataFrame) -> int:
+    """Distinct tuner seeds of the online runs (a fixed run's model seed is no tuner seed)."""
+    if not len(runs):
+        return 0
+    col = runs["tuner_seed"] if "tuner_seed" in runs else runs.loc[~runs["arm"].isin(list(C.FIXED_ARMS)), "seed"]
+    return int(pd.Series([v for v in col if v is not None and not (isinstance(v, float) and np.isnan(v))]).nunique())
+
+
+def _lobo_markdown(out_dir, res, metric, band, filled, fill, runs, plan=None) -> str:
+    summ, diffs, rows = res["summary"], res["differences"], res["folds"]
+    primary = f"{LOBO_PRIMARY[0]}_minus_{LOBO_PRIMARY[1]}"
+    lines = [
+        f"# LOBO selection on real sources ({metric.upper()}, tail windows)", "",
+        f"Out dir `{out_dir}`. Each real source block is held out whole; the global choice is made from the "
+        "other real blocks only, each block weighing the same (its variants averaged first), and every selector "
+        "reads the same training panel: the same blocks, folds, windows and candidate algorithms. The held-out "
+        f"source is read only after the choice, under `{PRIMARY_TARGET}`. Tie policy: {LOBO_TIE_POLICY}. "
+        "`random` is the exact expectation of a uniform pick over the candidates.", "",
+        f"Expected panel read from: {plan['source'] if plan is not None else 'no plan on file (the primary reading cannot be eligible)'}. "
+        "A held-out block whose training panel misses a cell (a regime, a job, or a window every candidate reads) "
+        "chooses nothing; a missing or failed test job keeps the choice and leaves its test quality unavailable. "
+        "Nothing is imputed, and no number of a narrowed panel stands in for the primary reading.", "",
+        f"Primary difference: `Q_{PRIMARY_TARGET},test(a_lobo_target) - Q_{PRIMARY_TARGET},test(a_lobo_scaled_default)` "
+        f"(`{primary}`), per held-out block, then the mean over blocks. Seeds never add a block: {_n_tuner_seeds(runs)} "
+        f"tuner seeds feed {diffs['held_out'].nunique() if len(diffs) else 0} blocks. With so few blocks the "
+        "interval is coarse (resampled blocks, three or more); no difference here is read as equivalence when "
+        "it is not significant.", "",
+    ]
+    if fill:
+        lines.append(f"- `scaled_default` read from `default` (no absolute-distance parameter): "
+                     f"{', '.join(filled) if filled else 'none'}.")
+    lines.append(f"- Practical threshold: {band:g} {metric.upper()}.")
+    lines.append("")
+    lines += _status_lines(res["status"], "## Status of the primary reading")
+    if len(summ):
+        whole = (summ["analysis_status"] == "eligible").all()
+        lines += ["## Mean over held-out blocks" + ("" if whole else " (not eligible: means left undefined)"), "",
+                  _table(summ), ""]
+    if len(diffs):
+        lines += ["## Per held-out source", "", _table(diffs), ""]
+    if len(rows):
+        keep = ["variant", "held_out", "selector", "panel_status", "pick", "n_tied", "tied", "band_set", "train_score",
+                "n_candidates", "excluded", "n_train_blocks", "n_train_folds", "train_windows", "test_status",
+                "test_windows", "q_test", "regret", "note"]
+        lines += ["## Choices per fold", "", _table(rows[keep]), ""]
+    if len(res["loso"]):
+        lo = res["loso"]
+        lines += ["## Leave one source out (the whole analysis rerun without it)", "",
+                  _table(lo[lo["difference"] == primary]), ""]
+    if "reduced" in res:
+        red = res["reduced"]
+        lines += ["## Sensitivity: reduced panel (asked for with `--reduced-panel`; not the primary reading)", "",
+                  "Each held-out block's panel leaves out what is missing: an algorithm with a gap is excluded for "
+                  "every selector alike, a training fold without a common window is dropped. Its tables are in "
+                  "`reduced_panel/`; none of its numbers replaces a primary one.", ""]
+        lines += _status_lines(red["status"], "### Status")
+        if len(red["summary"]):
+            lines += ["### Mean over the blocks it defines", "", _table(red["summary"]), ""]
+    return "\n".join(lines)
+
+
+def main(argv=None) -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--out-dir", default=str(C.OUT))
     parser.add_argument("--band", type=float, default=BAND,
                         help="practical-effect band in tail ARI (0 = exact ties only); default the study's "
                              "pre-declared smallest effect of interest")
     parser.add_argument("--top-k", type=int, default=TOP_K)
-    parser.add_argument("--select-seeds", default=",".join(map(str, SELECT_SEEDS)),
-                        help="selecting-arm seeds the held-out split selects on")
-    parser.add_argument("--eval-seeds", default=",".join(map(str, EVAL_SEEDS)),
-                        help="seeds the held-out split evaluates every target on")
+    parser.add_argument("--select-seeds", default=None,
+                        help="selecting-arm seeds the held-out split selects on (default: 1 on a shared-policy dir; "
+                             "on a split-policy dir the split is not read unless both seed lists are given)")
+    parser.add_argument("--eval-seeds", default=None,
+                        help="seeds the held-out split evaluates every target on (default: 2,3 on a shared-policy dir)")
     parser.add_argument("--selecting-arm", default=SELECTING_ARM,
                         help="the arm whose per-fold best is picked, e.g. scaled_default (E1); any arm other than "
                              "default writes to <out-dir>/report/selection_<arm>/")
     parser.add_argument("--no-fill-identical", action="store_true",
                         help="do not let an arm's runs stand in for a selecting arm run.py skipped as identical "
                              "(scaled_default of HPStream and RepStream is their default)")
-    args = parser.parse_args()
-    seeds = lambda s: tuple(int(x) for x in s.split(",") if x.strip())  # noqa: E731
+    parser.add_argument("--lobo", action="store_true",
+                        help="write the campaign's LOBO reading instead (real sources only, each source block "
+                             "weighted once, one training panel for every selector) into <out-dir>/report/lobo/")
+    parser.add_argument("--metric", default="ari", choices=("ari", "nmi"),
+                        help="with --lobo: the lagged reading (ARI primary, NMI a sensitivity, into report/lobo_nmi/)")
+    parser.add_argument("--campaign-config", default=None,
+                        help="with --lobo: read the expected panel from this campaign config (default: the dir's "
+                             "campaign manifest, else its run manifest; with neither the primary reading is never eligible)")
+    parser.add_argument("--reduced-panel", action="store_true",
+                        help="with --lobo: also write the reduced-panel sensitivity (what is missing excluded for every "
+                             "selector alike) into report/lobo/reduced_panel/; it never replaces the primary reading")
+    args = parser.parse_args(argv)
+    if args.lobo:
+        for p in write_lobo(Path(args.out_dir), metric=args.metric, band=args.band, fill=not args.no_fill_identical,
+                            config=Path(args.campaign_config) if args.campaign_config else None,
+                            reduced_panel=args.reduced_panel):
+            print(p)
+        return
+    seeds = lambda s: tuple(int(x) for x in s.split(",") if x.strip()) if s else None  # noqa: E731
     for p in write_selection(Path(args.out_dir), band=args.band, top_k=args.top_k,
                              select_seeds=seeds(args.select_seeds), eval_seeds=seeds(args.eval_seeds),
                              selecting_arm=args.selecting_arm, fill=not args.no_fill_identical):

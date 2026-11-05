@@ -22,7 +22,9 @@ from pathlib import Path
 import numpy as np
 
 from benchmark.algorithms.registry import accepts_seed, get_algorithm
-from benchmark.tuning.confstream import TIE_BREAKS, ConfStreamEnsemble, EnsembleConfig, WindowOutcome
+from benchmark.tuning.confstream import (
+    LIFECYCLE_SCHEMA, TIE_BREAKS, TIE_LEVELS, ConfStreamEnsemble, EnsembleConfig, WindowOutcome,
+)
 from benchmark.tuning.recluster import common_recluster, micro_centers
 from benchmark.tuning.signals import NOISE_POLICIES, SIGNALS, check_signals
 from benchmark.tuning.space import ParamSpace, SpaceContext
@@ -118,6 +120,14 @@ def _incumbent_fields(o: WindowOutcome, prefix: str = "") -> dict:
         f"{prefix}n_pred_labels": o.n_pred_labels,
         f"{prefix}n_sentinel": o.n_sentinel,
         f"{prefix}n_fallback": o.n_fallback,
+        f"{prefix}n_none": o.n_none,
+        f"{prefix}n_points_input": o.n_points_input,
+        f"{prefix}n_points_scored": o.n_points_scored,
+        f"{prefix}support_sha": o.support_sha,
+        f"{prefix}n_points_external": o.n_points_external,
+        f"{prefix}external_support_sha": o.external_support_sha,
+        f"{prefix}silhouette_reason": o.silhouette_reason,
+        f"{prefix}score_status": o.score_status,
         f"{prefix}error": o.error,
         **{f"{prefix}{k}": v for k, v in _external(o).items()},
         f"{prefix}cmm_error": o.cmm_error,
@@ -247,6 +257,7 @@ def run_ensemble(
     model_seed: int | None = None,
     calibration_seed: int | None = None,
     seed_fields: dict | None = None,
+    lifecycle_log: Path | None = None,
 ) -> list[dict]:
     """Run one ensemble over ``dataset`` and return its window rows + summary row.
 
@@ -256,6 +267,9 @@ def run_ensemble(
     on, which draws from the tuner's generator when None. All three None-defaults together are
     the ``shared`` seed policy of the runs made before 2026-10-24, one job seed for everything.
     ``seed_fields`` is merged into every row (and member row), e.g. the policy and each seed.
+    ``lifecycle_log`` receives the ensemble's lifecycle events (births, challenges, decisions, the
+    freeze; ``confstream.LIFECYCLE_SCHEMA``), one JSON row each with the job's fields; the summary
+    counts them whether or not they are written.
 
     ``unit_override`` replaces the start by a point of the unit cube: a
     dimension it leaves out keeps the start's *unit* value --
@@ -323,6 +337,32 @@ def run_ensemble(
     scaled_params: dict | None = None
     calibration_s = 0.0
     win_t0 = time.perf_counter()
+    #: The start as River's defaults give it, before ``scaled_default`` rescales it.
+    baseline_start = dict(start[0]) if start else None
+    births: dict[str, int] = {}
+    n_births = n_births_ok = 0
+    member_status: dict[str, int] = {}
+    #: Every member-window's sequential partition (``silhouette_reason``; ``none`` for a member that
+    #: raised, which read no partition) whatever the caps did, and the same crossed with feasibility
+    #: (``"<reason>|<feasible or the cap>"``): partition validity is read from these, never from the
+    #: score status, where a cap takes precedence over an undefined partition.
+    member_reasons: dict[str, int] = {}
+    member_reason_feasibility: dict[str, int] = {}
+    decided_by: dict[str, int] = {}
+    #: Member-windows with a sentinel or fallback prediction, with a snapshot reading (``stability`` on),
+    #: and with a diagnostic that failed: what the coverage tables count against ``n_member_evaluations``.
+    diag_counts = {"sentinel": 0, "fallback": 0, "snapshot": 0, "stability": 0, "diag_error": 0}
+
+    def log_lifecycle() -> None:
+        """Count the ensemble's new events, and write them when a lifecycle log is asked for."""
+        nonlocal n_births, n_births_ok
+        for event in ensemble.drain_events():
+            if event["event"] == "birth":
+                n_births += 1
+                n_births_ok += event["error"] is None
+                births[event["origin"]] = births.get(event["origin"], 0) + 1
+            if lifecycle_log is not None:
+                C.append_jsonl(lifecycle_log, {"kind": "lifecycle", "schema": LIFECYCLE_SCHEMA, **base, **event})
 
     def log_members(report) -> float:
         """Write the window's member rows; the seconds it took."""
@@ -367,6 +407,7 @@ def run_ensemble(
                 for extra in calibration[1:]:
                     ensemble.replay(extra)
                 window_index = len(calibration) - 1
+                log_lifecycle()
             calibration_s += time.perf_counter() - t_cal
             buffer = WindowBuffer(h)
             window_index += 1
@@ -387,6 +428,22 @@ def run_ensemble(
         report = ensemble.process_window(buffer, window_index)
         wall = time.perf_counter() - win_t0
         log_s = log_members(report)
+        log_lifecycle()
+        counts = report.status_counts
+        for k, v in counts.items():
+            member_status[k] = member_status.get(k, 0) + v
+        for o in report.outcomes:
+            reason = o.silhouette_reason or "none"
+            member_reasons[reason] = member_reasons.get(reason, 0) + 1
+            joint = f"{reason}|{'feasible' if o.feasible else o.feasible_reason}"
+            member_reason_feasibility[joint] = member_reason_feasibility.get(joint, 0) + 1
+            diag_counts["sentinel"] += bool(o.n_sentinel)
+            diag_counts["fallback"] += bool(o.n_fallback)
+            diag_counts["snapshot"] += o.snapshot.get("snap_silhouette_reason") is not None
+            diag_counts["stability"] += o.signals.get("stability") is not None
+            diag_counts["diag_error"] += o.diag_error is not None
+        if report.decision.get("decided_by"):
+            decided_by[report.decision["decided_by"]] = decided_by.get(report.decision["decided_by"], 0) + 1
         inc = report.incumbent
         if last_incumbent_id is not None and inc.member_id != last_incumbent_id:
             n_switches += 1
@@ -429,6 +486,12 @@ def run_ensemble(
             "table_a_runtime_s": table_a_s, "log_runtime_s": log_s,
             **{f"cmm_{k}": v for k, v in report.cmm_window.items()},
             "frozen": report.frozen,
+            #: The window's members per ``confstream.SCORE_STATUSES`` (the member-window denominator of
+            #: the invalid-partition rates), how the incumbent was named, and the children that failed.
+            "status_counts": counts,
+            "decided_by": report.decision.get("decided_by"), "n_top_ties": report.decision.get("n_top_ties"),
+            "n_evaluated": report.decision.get("n_evaluated"), "n_evaluated_ok": report.decision.get("n_evaluated_ok"),
+            "n_birth_errors": report.n_birth_errors,
         }
         if report.frozen and frozen_at_window is None:
             frozen_at_window, frozen_idx = window_index, len(window_rows)
@@ -554,8 +617,42 @@ def run_ensemble(
         "params_override": params_override,
         #: ``scaled_default``: each distance parameter's default, the unit and their product.
         "scaled_params": scaled_params,
+        #: E1's record: River's start before scaling, and which distance parameters the scaling
+        #: actually moved (a zero default, BIRCH's ``threshold``, stays put).
+        "baseline_params": baseline_start,
+        "scaled_changed": sorted(k for k, v in (scaled_params or {}).items() if v["value"] != v["default"])
+        if scaled_params is not None else None,
+        "scaled_unchanged": sorted(k for k, v in (scaled_params or {}).items() if v["value"] == v["default"])
+        if scaled_params is not None else None,
+        #: What the ensemble did: members built (the starts, their offspring and every child) and how
+        #: many of them built and warm-started without error, per origin; member evaluations (every
+        #: member scored on every window) and those that ran; every member-window per score status.
+        "n_births": n_births, "n_births_ok": n_births_ok, "births_by_origin": births,
+        "n_member_evaluations": int(sum(member_status.values())),
+        "n_member_evaluations_ok": int(sum(member_status.values()) - member_status.get("member_error", 0)),
+        "member_status_counts": member_status,
+        "member_silhouette_reason_counts": member_reasons,
+        "member_reason_feasibility_counts": member_reason_feasibility,
+        "n_member_windows_sentinel": diag_counts["sentinel"], "n_member_windows_fallback": diag_counts["fallback"],
+        "n_member_windows_snapshot": diag_counts["snapshot"], "n_member_windows_stability": diag_counts["stability"],
+        "n_member_windows_diag_error": diag_counts["diag_error"],
+        "lag_score_status_counts": _counts(r.get("lag_score_status") for r in lag_rows),
+        "lag_silhouette_reason_counts": _counts(r.get("lag_silhouette_reason") for r in lag_rows),
+        "decided_by_counts": decided_by,
+        #: The incumbent's key, level by level (``confstream.TIE_LEVELS``); runtime never enters it
+        #: under ``micro_clusters``. A member whose micro-cluster count is unknown counts 0.
+        "tie_break_rule": list(TIE_LEVELS[cfg.tie_break]),
+        "lifecycle_schema": LIFECYCLE_SCHEMA if lifecycle_log is not None else None,
     }
     return [*window_rows, summary]
+
+
+def _counts(values) -> dict:
+    out: dict = {}
+    for v in values:
+        key = "none" if v is None else str(v)
+        out[key] = out.get(key, 0) + 1
+    return out
 
 
 # --- CLI: parent + child -------------------------------------------------------------
@@ -607,14 +704,29 @@ def _model_seed_of(d: dict):
     return d.get("seed") if _accepts_seed(d.get("algo", "")) else None
 
 
-def _member_log_path(out: Path, job: dict) -> str:
-    """Where one job's member outcomes go: its own file under ``<out>/members/``; a run without a seed
+#: Where the lifecycle events go (``run_ensemble(lifecycle_log=...)``): one file per job, beside and
+#: never inside ``members/``, whose readers take every row for a member-window.
+LIFECYCLE_DIR = M.LIFECYCLE_DIR
+
+
+def job_name(job: dict) -> str:
+    """A job's file name stem: ``<algo>__<fold>__seed<seed>__<arm>[__cfg<id>]``; a run without a seed
     of its own (a deterministic fixed configuration under the split policy) is ``seedx``."""
     seed = "x" if job["seed"] is None else job["seed"]
     name = f"{job['algo']}__{job['fold']}__seed{seed}__{job['arm']}"
     if job.get("config_id") is not None:
         name += f"__cfg{job['config_id']}"
-    return str(out / C.MEMBERS_DIR.name / f"{name}.jsonl")
+    return name
+
+
+def _member_log_path(out: Path, job: dict) -> str:
+    """Where one job's member outcomes go: its own file under ``<out>/members/``."""
+    return str(out / C.MEMBERS_DIR.name / f"{job_name(job)}.jsonl")
+
+
+def _lifecycle_log_path(out: Path, job: dict) -> str:
+    """Where one job's lifecycle events go: its own file under ``<out>/lifecycle/``."""
+    return str(out / LIFECYCLE_DIR / f"{job_name(job)}.jsonl")
 
 
 def _job_key(job: dict) -> tuple:
@@ -655,12 +767,14 @@ def _run_one_child() -> None:
     dataset = C.load_fold(fold, n_samples=job["n_samples"], data_seed=data_seed)
     cfg = job_config(job)
     member_log = Path(job["member_log"]) if job.get("member_log") else None
-    if member_log is not None:
-        # A retried job (--retry-failed) reuses the same path a failed attempt
-        # already wrote to; truncate before this attempt's first append so its
-        # rows do not pile up behind the failed attempt's partial ones.
-        member_log.parent.mkdir(parents=True, exist_ok=True)
-        member_log.open("w").close()
+    lifecycle_log = Path(job["lifecycle_log"]) if job.get("lifecycle_log") else None
+    for path in (member_log, lifecycle_log):
+        if path is not None:
+            # A retried job (--retry-failed) reuses the same path a failed attempt
+            # already wrote to; truncate before this attempt's first append so its
+            # rows do not pile up behind the failed attempt's partial ones.
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.open("w").close()
     d = getattr(dataset, "n_features", None)
     if d is None:
         first = next(iter(dataset))
@@ -682,7 +796,7 @@ def _run_one_child() -> None:
         lam=job["lam"], member_log=member_log, unit_override=job.get("unit_override"),
         freeze_after_window=job.get("freeze_after_window"), config_id=job.get("config_id"),
         params_override=job.get("params_override"), model_seed=model, calibration_seed=calibration,
-        seed_fields=fields,
+        seed_fields=fields, lifecycle_log=lifecycle_log,
     )
     rows[-1].update(stream_sha256=stream.digest.hexdigest(), stream_n_samples=stream.digest.n, code_sha256=code_sha,
                     data_seed=data_seed if C.is_synthetic(fold) else None)
@@ -730,7 +844,7 @@ def _csv(value: str) -> list[str]:
     return [v.strip() for v in value.split(",") if v.strip()]
 
 
-def main() -> None:
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--run-one", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--algos", default=",".join(C.ALGOS))
@@ -798,14 +912,15 @@ def main() -> None:
     parser.add_argument("--retry-failed", action="store_true")
     parser.add_argument("--force", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
-    args = parser.parse_args()
+    return parser
 
-    if args.run_one:
-        _run_one_child()
-        return
 
+def plan_jobs(args: argparse.Namespace) -> tuple[list[dict], list[tuple[dict, dict]], Path, dict]:
+    """The jobs a ``run`` command with ``args`` runs, and the ones it writes down as skipped (each with its
+    row): ``(jobs, skipped, oracle_file, oracle)``. Nothing is read from the out dir but the oracle file,
+    and no data is loaded, so a campaign inventory (``conf_pipeline.campaign``) is built by this same code.
+    Raises ``SystemExit`` on the inconsistencies ``main`` refuses."""
     out = Path(args.out_dir)
-    runs_path, windows_path = out / "runs.jsonl", out / "windows.jsonl"
     algos = _csv(args.algos)
     unknown = [a for a in algos if a not in SPACES]
     if unknown:
@@ -896,10 +1011,53 @@ def main() -> None:
                 picked.append(f"{algo}/{fold} model seed {job['model_seed']}")
         if args.log_members:
             job["member_log"] = _member_log_path(out, job)
+        job["lifecycle_log"] = _lifecycle_log_path(out, job)
         jobs.append(job)
     if picked:
         raise SystemExit("the reference would be rerun on a model seed that picked it:\n  " + "\n  ".join(picked)
                          + "\nGive --fixed-model-seeds other than the sweep's (oracle_static.json select_seeds).")
+    return jobs, skipped, oracle_file, oracle
+
+
+#: The campaign record of an out dir made by ``conf_pipeline.campaign`` (``campaign.CAMPAIGN_MANIFEST``).
+CAMPAIGN_MANIFEST = Path("campaign") / "manifest.json"
+
+
+def check_campaign_limits(out: Path, args: argparse.Namespace) -> None:
+    """In an out dir a campaign made, refuse a ``run`` whose operational limits differ from the campaign's:
+    the run manifest keeps the timeout and the address-space limit in its history only, and a job that
+    timed out under one limit is not the same result as one under another."""
+    path = Path(out) / CAMPAIGN_MANIFEST
+    if not path.exists():
+        return
+    limits = json.loads(path.read_text(encoding="utf-8")).get("operational", {})
+    mine = operational_limits(args)
+    diff = [f"{k}: campaign {limits[k]!r}, this command {mine[k]!r}" for k in sorted(mine)
+            if k in limits and limits[k] != mine[k]]
+    if diff:
+        raise SystemExit(f"{out} belongs to a campaign ({path}) run under other operational limits:\n  "
+                         + "\n  ".join(diff) + "\nRun it through conf_pipeline.campaign, or write into a new --out-dir.")
+
+
+def operational_limits(args: argparse.Namespace) -> dict:
+    """The limits a job runs under that are not in the run manifest's protocol: the timeout and the child's
+    address-space limit (``_common.MEMORY_LIMIT_BYTES``; ``RLIMIT_AS``, not enforced where the platform
+    refuses it), beside the per-member caps that are."""
+    return {"timeout_s": int(args.timeout), "memory_limit_bytes": int(C.MEMORY_LIMIT_BYTES),
+            "max_memory_mb": float(args.max_memory_mb), "max_micro_clusters": int(args.max_micro_clusters),
+            "runtime_factor": None if args.no_runtime_gate else float(args.runtime_factor)}
+
+
+def main(argv=None) -> None:
+    args = build_parser().parse_args(argv)
+    if args.run_one:
+        _run_one_child()
+        return
+    out = Path(args.out_dir)
+    runs_path, windows_path = out / "runs.jsonl", out / "windows.jsonl"
+    jobs, skipped, oracle_file, oracle = plan_jobs(args)
+    arms = _csv(args.arms)
+    check_campaign_limits(out, args)
     described = jobs + [j for j, _ in skipped]
     if not described:
         print("0 jobs")
@@ -910,7 +1068,7 @@ def main() -> None:
         history.update(oracle_file=str(oracle_file), oracle_sha256=M.fingerprint(oracle))
     new_manifest = M.build(described)
     guard = dict(adopt_legacy=args.adopt_legacy, allow_code_change=args.allow_code_change, **history)
-    session_manifest, event = M.check(out, new_manifest, "conf_pipeline.run", **guard)
+    session_manifest, event = M.check(out, new_manifest, "conf_pipeline.run", argv=argv, **guard)
     done = _done_keys(runs_path)
     # A rerun of the reference is keyed by its config_id, which names a point only within one
     # sweep: an oracle file from another design can name another point under the same id.
@@ -958,10 +1116,10 @@ def main() -> None:
     if not todo and not new_skips:
         return
 
-    with M.locked_session(out, new_manifest, "conf_pipeline.run", force=args.force, **guard) as session, \
+    with M.locked_session(out, new_manifest, "conf_pipeline.run", force=args.force, argv=argv, **guard) as session, \
             JsonlLockPair(runs_path, windows_path, force=args.force):
         if todo:
-            C.record_environment(out, "conf_pipeline.run")
+            C.record_environment(out, "conf_pipeline.run", argv=argv)
         for job, row in new_skips:
             C.append_jsonl(runs_path, session.stamp(job, row))
             print(f"[skipped] {row['algo']} {row['fold']} seed={row['seed']} arm={row['arm']}: {row['error']}",

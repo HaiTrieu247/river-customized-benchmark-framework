@@ -234,12 +234,26 @@ def estimate_scale(xs, rng: np.random.Generator, subsample: int = SCALE_SUBSAMPL
 
 
 #: Algorithms registered under a project name whose constructor is a River class.
-RIVER_CLASS = {"DenStreamPatched": "DenStream", "DenStreamPatchedFast": "DenStream"}
+RIVER_CLASS = {"DenStreamPatched": "DenStream", "DenStreamPatchedFast": "DenStream",
+               "HPStreamStableLabels": "HPStream"}
 #: Implementation variants run beside the River class they re-implement (spec
 #: 4.6, table T7): never ranked with the protocol algorithms, read against
 #: their reference instead. DenStreamPatchedFast fixes BUG-7/BUG-8 and returns
-#: what DenStreamPatched returns at a fraction of the cost (GAP-3).
+#: what DenStreamPatched returns at a fraction of the cost (GAP-3). The notebook's presets run these.
 IMPL_VARIANTS = {"DenStreamPatchedFast": "DenStream"}
+#: Variants that change only how a River class names its clusters (RIVER_BUGS.md GAP-6): never ranked in the
+#: OTB tables, read against their reference there (``analyze.impl_table``), and in no preset or campaign
+#: inventory unless named; a campaign that names one reads it under its own name, and a LOBO plan holding it
+#: beside its reference is not eligible. HPStreamStableLabels is HPStream with labels that are never reused.
+LABEL_VARIANTS = {"HPStreamStableLabels": "HPStream"}
+
+
+def variant_algos() -> dict[str, str]:
+    """Every variant the OTB readers never rank (``analyze``, ``robustness``, ``variants``, P1.1
+    ``selection``): ``IMPL_VARIANTS`` and ``LABEL_VARIANTS``, read when called. The campaign readers
+    (``analysis_support.run_table``, LOBO) drop the implementation variants only: a label variant a
+    campaign names is read there under its own name."""
+    return {**IMPL_VARIANTS, **LABEL_VARIANTS}
 #: ``config_id`` of a sweep point that reruns an online arm's incumbent with its
 #: exact parameters (``sweep.incumbent_candidates``): above every Sobol index.
 INCUMBENT_ID_BASE = 1_000_000

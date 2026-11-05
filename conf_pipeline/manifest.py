@@ -115,7 +115,7 @@ def algorithm_spec(algo: str) -> dict:
         #: Whether a model seed reaches it at all; which seed does is the protocol's seed policy.
         "accepts_seed": seeded,
     }
-    if algo == "HPStream":
+    if C.RIVER_CLASS.get(algo, algo) == "HPStream":
         out["default_projection"] = HPSTREAM_DEFAULT_PROJECTION
     return _plain(out)
 
@@ -502,6 +502,9 @@ RECORDED_FIELDS = ("h", "n_samples_cap", "half_life_frac", "e_size", "e_test", "
                    "selection_signal", "log_signals", "tie_break", "reinit_after_freeze", "data_seed",
                    "seed_policy", "tuner_seed", "model_seed", "calibration_seed")
 ALL_FILES = RESULT_FILES + ("windows.jsonl", "sweep_windows.jsonl", "oracle_static.json", "environment.jsonl")
+#: Where ``run.py`` writes each job's lifecycle events (``run.LIFECYCLE_DIR``; kept here so this module
+#: does not import the driver).
+LIFECYCLE_DIR = "lifecycle"
 
 
 def _sha256_file(path: Path) -> str:
@@ -528,13 +531,16 @@ def describe_dir(out_dir: Path) -> dict:
         if path.exists():
             rows = sum(1 for _ in C.read_jsonl(path)) if name.endswith(".jsonl") else None
             files.append({"name": name, "bytes": path.stat().st_size, "rows": rows, "sha256": _sha256_file(path)})
-    members = out_dir / C.MEMBERS_DIR.name
-    if members.is_dir():
-        logs = sorted(members.glob("*.jsonl"))
-        digest = hashlib.sha256()
-        for p in logs:
-            digest.update(p.name.encode() + b"\0" + _sha256_file(p).encode())
-        files.append({"name": f"{C.MEMBERS_DIR.name}/", "files": len(logs), "sha256": digest.hexdigest()})
+    # One digest per directory of per-job logs: the member-window logs and, apart, the lifecycle events
+    # (``run.LIFECYCLE_DIR``: births, challenges, decisions, the freeze).
+    for sub in (C.MEMBERS_DIR.name, LIFECYCLE_DIR):
+        folder = out_dir / sub
+        if folder.is_dir():
+            logs = sorted(folder.glob("*.jsonl"))
+            digest = hashlib.sha256()
+            for p in logs:
+                digest.update(p.name.encode() + b"\0" + _sha256_file(p).encode())
+            files.append({"name": f"{sub}/", "files": len(logs), "sha256": digest.hexdigest()})
     recorded: dict = {}
     for name in RESULT_FILES:
         for r in C.read_jsonl(out_dir / name):
