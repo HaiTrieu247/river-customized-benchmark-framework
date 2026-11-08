@@ -204,6 +204,7 @@ def job_config(job: dict) -> EnsembleConfig:
         log_signals=tuple(job.get("log_signals") or ()),
         tie_break=job.get("tie_break") or "micro_clusters",
         signal_noise=job.get("signal_noise") or "label",
+        shadow_size=int(job.get("shadow_size") or 0),
     )
 
 
@@ -224,6 +225,8 @@ def arm_config(arm: str, cfg: EnsembleConfig, freeze_after_window: int | None) -
         over = dict(sampler="uniform")
     elif arm == "frozen_reinit":
         over = dict(freeze_after_window=freeze_after_window, reinit_after_freeze=True)
+    elif arm in C.BRANCH_ARMS:
+        over = dict(freeze_after_window=freeze_after_window, freeze_mode=C.BRANCH_ARMS[arm])
     elif arm in C.SIGNAL_ARMS or arm in C.DIAGNOSTIC_ARMS:
         over = dict(selection_signal=arm.removeprefix("confstream_"))
     elif arm == "frozen_prefix":
@@ -258,8 +261,21 @@ def run_ensemble(
     calibration_seed: int | None = None,
     seed_fields: dict | None = None,
     lifecycle_log: Path | None = None,
+    shadow_log: Path | None = None,
+    prediction_log: Path | None = None,
+    prefix_scaling: str | None = None,
+    pins: dict | None = None,
 ) -> list[dict]:
     """Run one ensemble over ``dataset`` and return its window rows + summary row.
+
+    ``shadow_log`` receives the shadow members' rows (``EnsembleConfig.shadow_size``), apart from the
+    member log, whose readers take every row for a member of the ensemble. ``prediction_log`` receives
+    every member's per-point predictions on every window, one row per member-window (E1); it changes
+    nothing the ensemble does. ``prefix_scaling="standard"`` standardises every feature with the mean
+    and standard deviation of the first window, then holds them fixed (``PrefixStandardised``, E4): the
+    distance unit and every model see the transformed coordinates. ``pins`` (E9, ``--pin``) sets
+    constructor parameters on every member, the start and every child, after the initialisation buffers
+    are capped: a value above ``h`` (HPStream's own 2 000-sample initialisation) is kept as given.
 
     Randomness: ``seed`` seeds the tuner's generator (every draw of the search); ``model_seed``
     is passed to every member's constructor (algorithms that take a seed), and is ``seed``
@@ -304,6 +320,11 @@ def run_ensemble(
     calibration_rng = rng if calibration_seed is None else np.random.default_rng(calibration_seed)
     if model_seed is None:
         model_seed = seed
+    if prefix_scaling not in (None, "none", *PREFIX_SCALINGS):
+        raise ValueError(f"prefix_scaling must be one of {('none',) + PREFIX_SCALINGS}, got {prefix_scaling!r}")
+    scaled_stream = None
+    if prefix_scaling not in (None, "none"):
+        dataset = scaled_stream = PrefixStandardised(dataset, h)
 
     try:
         length = len(dataset)
@@ -365,12 +386,24 @@ def run_ensemble(
                 C.append_jsonl(lifecycle_log, {"kind": "lifecycle", "schema": LIFECYCLE_SCHEMA, **base, **event})
 
     def log_members(report) -> float:
-        """Write the window's member rows; the seconds it took."""
-        if member_log is None:
+        """Write the window's member rows (and its shadow and prediction rows, when asked for); the
+        seconds it took."""
+        if member_log is None and shadow_log is None and prediction_log is None:
             return 0.0
         t0 = time.perf_counter()
-        for o in report.outcomes:
-            C.append_jsonl(member_log, {**base, **o.to_dict(), **_external(o)})
+        if member_log is not None:
+            for o in report.outcomes:
+                C.append_jsonl(member_log, {**base, **o.to_dict(), **_external(o)})
+        if shadow_log is not None:
+            for o in report.shadow_outcomes:
+                C.append_jsonl(shadow_log, {**base, **o.to_dict(), **_external(o)})
+        if prediction_log is not None:
+            for o in list(report.outcomes) + list(report.shadow_outcomes):
+                C.append_jsonl(prediction_log, {
+                    **base, "window": report.window_index, "member_id": o.member_id, "is_test": o.is_test,
+                    "is_shadow": o.is_shadow, "pred_sha": o.pred_sha,
+                    "predictions": list(o.predictions) if o.predictions is not None else None,
+                })
         return time.perf_counter() - t0
 
     for x, y in dataset:
@@ -397,11 +430,13 @@ def run_ensemble(
                 elif arm == "scaled_default":
                     scaled, scaled_params = scaled_defaults(algo, start[0], s_online)
                     start = [scaled]
-                start = [clamp_init_buffers(algo, p, h) for p in start]
+                pinned = dict(pins or {})
+                start = [{**clamp_init_buffers(algo, p, h), **pinned} for p in start]
                 ensemble = ConfStreamEnsemble(
                     space=space, ctx=ctx, make_adapter=_make_adapter_factory(algo, h),
                     start_params=start, config=cfg, rng=rng, seed=model_seed,
-                    post_resolve=lambda params: clamp_init_buffers(algo, params, h),
+                    post_resolve=lambda params: {**clamp_init_buffers(algo, params, h), **pinned},
+                    keep_predictions=prediction_log is not None,
                 )
                 ensemble.initialise(calibration[0], window_index=0)
                 for extra in calibration[1:]:
@@ -493,6 +528,8 @@ def run_ensemble(
             "n_evaluated": report.decision.get("n_evaluated"), "n_evaluated_ok": report.decision.get("n_evaluated_ok"),
             "n_birth_errors": report.n_birth_errors,
         }
+        if cfg.shadow_size > 0:
+            row.update(n_shadow=len(report.shadow_outcomes), shadow_runtime_s=report.shadow_runtime_s)
         if report.frozen and frozen_at_window is None:
             frozen_at_window, frozen_idx = window_index, len(window_rows)
         window_rows.append(row)
@@ -643,8 +680,93 @@ def run_ensemble(
         #: under ``micro_clusters``. A member whose micro-cluster count is unknown counts 0.
         "tie_break_rule": list(TIE_LEVELS[cfg.tie_break]),
         "lifecycle_schema": LIFECYCLE_SCHEMA if lifecycle_log is not None else None,
+        #: E10: the cost per observation, from each window's measured time divided by its size (window
+        #: means, so not the tail of single predictions), for the incumbent alone and for the ensemble.
+        **_per_observation_ms(window_rows, h),
     }
+    if cfg.freeze_mode != "single":
+        summary["freeze_mode"] = cfg.freeze_mode
+    if cfg.shadow_size > 0:
+        summary.update(shadow_size=cfg.shadow_size,
+                       shadow_runtime_s=float(sum(r.get("shadow_runtime_s", 0.0) for r in window_rows)))
+    if scaled_stream is not None:
+        summary.update(prefix_scaling=prefix_scaling, prefix_scaling_stats=scaled_stream.summary())
+    if prediction_log is not None:
+        summary["prediction_log"] = True
+    if pins:
+        summary["pins"] = dict(pins)
     return [*window_rows, summary]
+
+
+def _per_observation_ms(window_rows: list[dict], h: int) -> dict:
+    """Median, 95th and 99th percentile over windows of the milliseconds per observation, for the
+    incumbent (``runtime_s``) and the whole ensemble (``ensemble_runtime_s``)."""
+    out = {}
+    for name, key in (("incumbent", "runtime_s"), ("ensemble", "ensemble_runtime_s")):
+        vals = np.asarray([r[key] for r in window_rows if r.get(key) is not None], dtype=float) * 1000.0 / h
+        for q in (50, 95, 99):
+            out[f"{name}_ms_per_obs_p{q}"] = float(np.percentile(vals, q)) if len(vals) else None
+    return out
+
+
+#: Stream-level preprocessing fitted on the first window and then held fixed (E4).
+PREFIX_SCALINGS: tuple[str, ...] = ("standard",)
+
+
+class PrefixStandardised:
+    """A stream whose numeric features are standardised with the mean and the (population) standard
+    deviation of its first ``h`` samples, then held fixed for the rest of the stream (E4): the
+    transformation uses no observation after the first window. A feature that is constant on that
+    window is centred and keeps unit scale; a key the first window never held, and any non-numeric
+    value, passes through unchanged and is counted (``summary``). Every model and the distance unit
+    ``s`` see the transformed coordinates; the labels are untouched."""
+
+    def __init__(self, dataset, h: int):
+        self.dataset, self.h = dataset, int(h)
+        self.mean: dict | None = None
+        self.scale: dict | None = None
+        self.n_constant = 0
+        self.n_passthrough = 0
+
+    def __len__(self):
+        return len(self.dataset)
+
+    def _fit(self, head) -> None:
+        cols: dict[str, list[float]] = {}
+        for x, _ in head:
+            for k, v in x.items():
+                if isinstance(v, (int, float, np.integer, np.floating)) and not isinstance(v, bool):
+                    cols.setdefault(k, []).append(float(v))
+        self.mean, self.scale = {}, {}
+        for k, vals in cols.items():
+            arr = np.asarray(vals, dtype=float)
+            sd = float(arr.std())
+            self.mean[k] = float(arr.mean())
+            self.scale[k] = sd if sd > 0 else 1.0
+            self.n_constant += sd <= 0
+
+    def transform(self, x: dict) -> dict:
+        out = {}
+        for k, v in x.items():
+            if k in self.mean and isinstance(v, (int, float, np.integer, np.floating)) and not isinstance(v, bool):
+                out[k] = (float(v) - self.mean[k]) / self.scale[k]
+            else:
+                out[k] = v
+                self.n_passthrough += 1
+        return out
+
+    def __iter__(self):
+        from itertools import chain, islice
+
+        it = iter(self.dataset)
+        head = list(islice(it, self.h))
+        self._fit(head)
+        for x, y in chain(head, it):
+            yield self.transform(x), y
+
+    def summary(self) -> dict:
+        return {"fitted_on_samples": self.h, "n_features": len(self.mean or {}),
+                "n_constant_features": int(self.n_constant), "n_passthrough_values": int(self.n_passthrough)}
 
 
 def _counts(values) -> dict:
@@ -729,6 +851,20 @@ def _lifecycle_log_path(out: Path, job: dict) -> str:
     return str(out / LIFECYCLE_DIR / f"{job_name(job)}.jsonl")
 
 
+#: Where the shadow members' rows (``--shadow-size``) and every member's predictions
+#: (``--log-predictions``) go: one file per job each, beside ``members/`` and never inside it.
+SHADOW_DIR = Path("shadow")
+PREDICTIONS_DIR = Path("predictions")
+
+
+def _shadow_log_path(out: Path, job: dict) -> str:
+    return str(out / SHADOW_DIR / f"{job_name(job)}.jsonl")
+
+
+def _prediction_log_path(out: Path, job: dict) -> str:
+    return str(out / PREDICTIONS_DIR / f"{job_name(job)}.jsonl")
+
+
 def _job_key(job: dict) -> tuple:
     return (job["algo"], job["fold"], job["seed"], job["arm"], job["n_samples"], job.get("config_id"),
             _model_seed_of(job))
@@ -768,7 +904,9 @@ def _run_one_child() -> None:
     cfg = job_config(job)
     member_log = Path(job["member_log"]) if job.get("member_log") else None
     lifecycle_log = Path(job["lifecycle_log"]) if job.get("lifecycle_log") else None
-    for path in (member_log, lifecycle_log):
+    shadow_log = Path(job["shadow_log"]) if job.get("shadow_log") else None
+    prediction_log = Path(job["prediction_log"]) if job.get("prediction_log") else None
+    for path in (member_log, lifecycle_log, shadow_log, prediction_log):
         if path is not None:
             # A retried job (--retry-failed) reuses the same path a failed attempt
             # already wrote to; truncate before this attempt's first append so its
@@ -796,10 +934,19 @@ def _run_one_child() -> None:
         lam=job["lam"], member_log=member_log, unit_override=job.get("unit_override"),
         freeze_after_window=job.get("freeze_after_window"), config_id=job.get("config_id"),
         params_override=job.get("params_override"), model_seed=model, calibration_seed=calibration,
-        seed_fields=fields, lifecycle_log=lifecycle_log,
+        seed_fields=fields, lifecycle_log=lifecycle_log, shadow_log=shadow_log, prediction_log=prediction_log,
+        prefix_scaling=job.get("prefix_scaling"), pins=job.get("pins"),
     )
     rows[-1].update(stream_sha256=stream.digest.hexdigest(), stream_n_samples=stream.digest.n, code_sha256=code_sha,
                     data_seed=data_seed if C.is_synthetic(fold) else None)
+    try:
+        import resource
+
+        # E10: the child's peak resident memory (ru_maxrss is bytes on macOS, kilobytes on Linux).
+        peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        rows[-1]["peak_rss_mb"] = peak / (1024 * 1024) if sys.platform == "darwin" else peak / 1024
+    except (ImportError, OSError, ValueError):
+        rows[-1]["peak_rss_mb"] = None
     for row in rows:
         row["n_samples_cap"] = job["n_samples"]
         sys.stdout.write(json.dumps(row, default=C._json_default) + "\n")
@@ -903,6 +1050,21 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--data-seed", type=int, default=C.DATA_SEED,
                         help="seed of the synthetic streams' generators, one per out dir (real streams "
                              "have none)")
+    parser.add_argument("--shadow-size", type=int, default=0,
+                        help="E7: keep evaluating up to this many members the tuner removed (rejected challengers, "
+                             "replaced victims, members a freeze discards), never selecting by them; their rows go "
+                             f"to <out-dir>/{SHADOW_DIR}/ (needs --log-members). 0, the default, keeps none")
+    parser.add_argument("--log-predictions", action="store_true",
+                        help=f"E1: write every member's per-point predictions on every window to <out-dir>/{PREDICTIONS_DIR}/, "
+                             "one file per job (large: about members x samples integers per job)")
+    parser.add_argument("--pin", action="append", default=[], metavar="ALGO.PARAM=VALUE",
+                        help="E9: set a constructor parameter of one algorithm on every member (repeatable), e.g. "
+                             "HPStream.n_samples_init=2000 or BIRCH.n_macro_clusters=8; VALUE is read as JSON when it "
+                             "parses, else as a string. The value is the user's choice, not a recommendation; the "
+                             "manifest records it per algorithm")
+    parser.add_argument("--prefix-scaling", default="none", choices=("none",) + PREFIX_SCALINGS,
+                        help="E4: standardise every feature with the first window's mean and standard deviation, "
+                             "then hold them fixed (a protocol of its own: write into a new --out-dir)")
     parser.add_argument("--adopt-legacy", action="store_true",
                         help="resume into an out dir that holds results but no manifest, recording that "
                              "their protocol is unknown")
@@ -913,6 +1075,24 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--force", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     return parser
+
+
+def parse_pins(specs: list[str], algos: list[str]) -> dict[str, dict]:
+    """``--pin ALGO.PARAM=VALUE`` entries as ``{algo: {param: value}}``; VALUE is JSON when it parses."""
+    out: dict[str, dict] = {}
+    for spec in specs:
+        key, sep, raw = spec.partition("=")
+        algo, dot, param = key.partition(".")
+        if not sep or not dot or not algo or not param:
+            raise SystemExit(f"--pin {spec!r}: expected ALGO.PARAM=VALUE")
+        if algo not in algos:
+            raise SystemExit(f"--pin {spec!r}: {algo} is not among --algos {algos}")
+        try:
+            value = json.loads(raw)
+        except json.JSONDecodeError:
+            value = raw
+        out.setdefault(algo, {})[param] = value
+    return out
 
 
 def plan_jobs(args: argparse.Namespace) -> tuple[list[dict], list[tuple[dict, dict]], Path, dict]:
@@ -959,6 +1139,12 @@ def plan_jobs(args: argparse.Namespace) -> tuple[list[dict], list[tuple[dict, di
     signals = list(check_signals(_csv(args.signals)))
     if signals and not args.log_members:
         raise SystemExit("--signals needs --log-members: the readings are written only to the member logs")
+    shadow_size = int(getattr(args, "shadow_size", 0) or 0)
+    if shadow_size and not args.log_members:
+        raise SystemExit("--shadow-size needs --log-members: the shadow readings are written only beside the member logs")
+    log_predictions = bool(getattr(args, "log_predictions", False))
+    prefix_scaling = getattr(args, "prefix_scaling", "none") or "none"
+    pins = parse_pins(getattr(args, "pin", None) or [], algos)
     jobs, skipped = [], []
     picked = []
     planned = [(algo, fold, arm, seeds_of) for algo, fold, arm in product(algos, _csv(args.folds), arms)
@@ -977,6 +1163,12 @@ def plan_jobs(args: argparse.Namespace) -> tuple[list[dict], list[tuple[dict, di
             "log_signals": signals, "tie_break": args.tie_break, "cmm": not args.no_cmm,
             "data_seed": args.data_seed, "signal_noise": args.signal_noise,
         }
+        if shadow_size:
+            job["shadow_size"] = shadow_size
+        if prefix_scaling != "none":
+            job["prefix_scaling"] = prefix_scaling
+        if pins.get(algo):
+            job["pins"] = dict(pins[algo])
         if arm == "scaled_default" and not distance_params(algo):
             # Nothing to scale: the run would be the default arm's again, not a new reading.
             skipped.append((job, _failed_row(
@@ -1011,6 +1203,10 @@ def plan_jobs(args: argparse.Namespace) -> tuple[list[dict], list[tuple[dict, di
                 picked.append(f"{algo}/{fold} model seed {job['model_seed']}")
         if args.log_members:
             job["member_log"] = _member_log_path(out, job)
+            if shadow_size:
+                job["shadow_log"] = _shadow_log_path(out, job)
+        if log_predictions:
+            job["prediction_log"] = _prediction_log_path(out, job)
         job["lifecycle_log"] = _lifecycle_log_path(out, job)
         jobs.append(job)
     if picked:

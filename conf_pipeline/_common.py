@@ -96,23 +96,41 @@ DRIFT_VARIANT_FOLDS: tuple[str, ...] = (
 X7_FOLDS: tuple[str, ...] = NATURAL_DRIFT_FOLDS + DRIFT_VARIANT_FOLDS
 
 
+def _e8_folds() -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """E8's drift streams (the same-id variants of ``k_drift``/``mixed_drift`` and the factorial
+    design) and its stationary controls (``param_drift`` module docstring), run with ``--folds`` into
+    an out dir of their own; ``FOLDS`` leaves them out. Imported lazily, as ``load_fold`` does."""
+    from benchmark.datasets.synthetic.param_drift import (
+        E8_FACTORIAL_SCENARIOS, E8_SAME_ID_SCENARIOS, E8_STATIONARY_SCENARIOS,
+    )
+    return E8_SAME_ID_SCENARIOS + E8_FACTORIAL_SCENARIOS, E8_STATIONARY_SCENARIOS
+
+
 def stream_group(fold: str) -> str:
     """``real``, ``param_drift`` or ``other_synth``; a fold in none of the lists raises,
     so a new stream is assigned its group explicitly rather than by a guess. The natural-drift
     streams are real ones; the drift variants change their best parameters as the
-    parameter-drift folds do."""
+    parameter-drift folds do. E8's drift streams join ``param_drift`` and its stationary controls
+    ``other_synth`` (a grouping for the reports, the researchers' to change)."""
     if fold in REAL_FOLDS or fold in NATURAL_DRIFT_FOLDS:
         return "real"
     if fold in PARAM_DRIFT_FOLDS or fold in DRIFT_VARIANT_FOLDS:
         return "param_drift"
     if fold in SYNTH_FOLDS:
         return "other_synth"
+    e8_drift, e8_controls = _e8_folds()
+    if fold in e8_drift:
+        return "param_drift"
+    if fold in e8_controls:
+        return "other_synth"
     raise ValueError(f"fold {fold!r} has no stream group: add it to REAL_FOLDS or SYNTH_FOLDS")
 
 
-#: Drift variants that only change a parameter of one design keep that design's block.
+#: Drift variants that only change a parameter of one design keep that design's block; the same-id
+#: variants are the same points as their design, so they are the same block too.
 _VARIANT_OF: dict[str, str] = {
     "scale_drift_x1_5": "scale_drift", "scale_drift_x8": "scale_drift", "scale_drift_gradual": "scale_drift",
+    "k_drift_same_ids": "k_drift", "mixed_drift_same_ids": "mixed_drift",
 }
 
 
@@ -156,7 +174,17 @@ SIGNAL_ARMS: tuple[str, ...] = tuple(f"confstream_{s}" for s in SELECTABLE if s 
 #: ``scaled_default`` (E1) runs River's defaults with every absolute-distance parameter
 #: multiplied by the distance unit ``s`` (``spaces.scaled_defaults``): one fixed configuration,
 #: never tuned, which tells failures of units from failures of the configuration.
-OPTIONAL_ARMS: tuple[str, ...] = ("random_online", "frozen_reinit", "scaled_default") + SIGNAL_ARMS
+#: The mechanism study's branches (E3, ``confstream.FREEZE_MODES``): each runs the tuner up to
+#: ``FREEZE_AFTER_WINDOW`` exactly as ``confstream`` and ``frozen_prefix`` do, then ``frozen_ensemble``
+#: keeps the whole portfolio and only goes on selecting among its existing models,
+#: ``portfolio_renewal`` keeps the portfolio's configurations and renews their models (each fresh model
+#: meets only the model of its own configuration), and ``random_after_prefix`` goes on tuning with
+#: children drawn uniformly. Under a deterministic protocol (``--no-runtime-gate``, the default
+#: tie-break) and one tuner and model seed, every branch and ``confstream``/``frozen_prefix``/
+#: ``frozen_reinit`` share the same ensemble up to the boundary (``followup prefix-identity`` checks it).
+BRANCH_ARMS: dict[str, str] = {"frozen_ensemble": "ensemble", "portfolio_renewal": "portfolio",
+                               "random_after_prefix": "random"}
+OPTIONAL_ARMS: tuple[str, ...] = ("random_online", "frozen_reinit", "scaled_default") + tuple(BRANCH_ARMS) + SIGNAL_ARMS
 #: Single-configuration arms driven by a file: the sweep's points and its winner.
 EXTRA_ARMS: tuple[str, ...] = ("oracle_static", "sweep")
 #: Diagnostic arms (E4), never deployable and in no report's default list: the tuner with its

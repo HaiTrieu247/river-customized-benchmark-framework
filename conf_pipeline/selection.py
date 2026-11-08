@@ -1229,6 +1229,25 @@ LOBO_PRIMARY: tuple[str, str] = ("lobo_target", "lobo_scaled_default")
 LOBO_CONTRASTS: tuple[tuple[str, str], ...] = (
     LOBO_PRIMARY, ("lobo_target", "lobo_default"), ("lobo_scaled_default", "lobo_default"), ("lobo_target", "random"),
 )
+#: E5: the frozen-prefix selector, asked for by name (``--lobo-frozen-selector``, ``enable_frozen_selector``):
+#: the global choice by the other sources' frozen-prefix readings. Its regime then joins the required
+#: training panel, so every selector still reads the same panel; a plan without the frozen-prefix arm
+#: leaves the reading ineligible rather than narrowing it. The primary difference is unchanged.
+LOBO_FROZEN_SELECTOR: tuple[str, str] = ("lobo_frozen_prefix", "frozen_prefix")
+
+
+def enable_frozen_selector() -> None:
+    """Add ``LOBO_FROZEN_SELECTOR`` to the LOBO selectors, regimes and contrasts of this process (idempotent)."""
+    global LOBO_SELECTORS, LOBO_REGIMES, LOBO_CONTRASTS
+    name, regime = LOBO_FROZEN_SELECTOR
+    if name in LOBO_SELECTORS:
+        return
+    others = {k: v for k, v in LOBO_SELECTORS.items() if k != "random"}
+    LOBO_SELECTORS = {**others, name: regime, **({"random": None} if "random" in LOBO_SELECTORS else {})}
+    LOBO_REGIMES = LOBO_REGIMES + (regime,)
+    LOBO_CONTRASTS = LOBO_CONTRASTS + (("lobo_target", name), (name, "lobo_scaled_default"))
+
+
 #: Two training scores closer than this are tied; a tie goes to the algorithm whose name sorts first.
 LOBO_TIE_TOL = 1e-12
 LOBO_TIE_POLICY = (f"highest training score; scores within {LOBO_TIE_TOL:g} are tied and the tie goes to the "
@@ -1253,7 +1272,7 @@ LOSO_NOT_READ = "not read: primary not eligible"
 
 # --- the expected panel: read from the plan, before any result ------------------------------------
 
-def lobo_plan(algos, folds, *, source: str, regimes=LOBO_REGIMES, jobs: dict | None = None,
+def lobo_plan(algos, folds, *, source: str, regimes=None, jobs: dict | None = None,
               planned=None) -> dict:
     """The panel the LOBO reading expects, from a plan rather than from the results on file:
     ``source`` (where the plan was read), ``algos``, ``blocks`` (real source block -> its folds) and
@@ -1263,9 +1282,12 @@ def lobo_plan(algos, folds, *, source: str, regimes=LOBO_REGIMES, jobs: dict | N
     parameter reads its ``default`` cell (``via``), as ``run.py`` skips it as identical. ``planned``: the
     (algo, fold, arm) cells the plan runs (None: every cell); one it does not is required all the same.
     ``problems``: why the plan cannot carry a primary reading at all (a label variant beside its reference;
-    ``read_lobo_plan`` adds a config's protocol mismatches)."""
+    ``read_lobo_plan`` adds a config's protocol mismatches). ``regimes`` defaults to ``LOBO_REGIMES`` as
+    it stands when called (``enable_frozen_selector`` extends it)."""
     from .spaces import distance_params
 
+    if regimes is None:
+        regimes = LOBO_REGIMES
     real = sorted({f for f in folds if _real(f)}, key=_fold_key)
     blocks: dict[str, list[str]] = {}
     for f in real:
@@ -1996,7 +2018,15 @@ def main(argv=None) -> None:
     parser.add_argument("--reduced-panel", action="store_true",
                         help="with --lobo: also write the reduced-panel sensitivity (what is missing excluded for every "
                              "selector alike) into report/lobo/reduced_panel/; it never replaces the primary reading")
+    parser.add_argument("--lobo-frozen-selector", action="store_true",
+                        help="with --lobo (E5): add the global choice by the frozen-prefix readings; frozen_prefix then "
+                             "joins the required training panel of every selector")
     args = parser.parse_args(argv)
+    if args.lobo_frozen_selector:
+        if not args.lobo:
+            raise SystemExit("--lobo-frozen-selector belongs to --lobo; the per-fold analysis reads another "
+                             "selecting arm with --selecting-arm frozen_prefix")
+        enable_frozen_selector()
     if args.lobo:
         for p in write_lobo(Path(args.out_dir), metric=args.metric, band=args.band, fill=not args.no_fill_identical,
                             config=Path(args.campaign_config) if args.campaign_config else None,

@@ -1376,6 +1376,13 @@ CONTRASTS: tuple[tuple[str, str, str], ...] = (
     ("confstream", "frozen_reinit", "E2: changing the configuration beyond renewal"),
     ("confstream", "random_online", "E5: evolutionary against uniform sampling of children (same schedule; not "
                                     "a matched-compute comparison)"),
+    # The mechanism branches (_common.BRANCH_ARMS), read only where a dir holds them. In the paper's
+    # numbering these are E3; the labels above keep the campaign's own numbering.
+    ("frozen_ensemble", "frozen_prefix", "branch: continued selection among the kept portfolio, no new model"),
+    ("portfolio_renewal", "frozen_ensemble", "branch: renewing the portfolio's models, its configurations fixed"),
+    ("confstream", "portfolio_renewal", "branch: changing configurations beyond renewing the portfolio"),
+    ("confstream", "random_after_prefix", "branch: evolutionary against uniform children from the same state "
+                                          "(same schedule; not a matched-compute comparison)"),
 )
 
 

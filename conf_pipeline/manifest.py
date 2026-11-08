@@ -194,13 +194,22 @@ def _seeds(jobs: list[dict]) -> dict:
             "model": sorted({f["model_seed"] for f in fields if f["model_seed"] is not None})}
 
 
+#: Ensemble fields added after manifests were first written, with the value every earlier run had:
+#: an arm spec leaves a field out while it has that value, so a dir written before the field existed
+#: still matches, and a run that sets it is a different arm.
+_LATER_ARM_FIELDS = {"freeze_mode": "single", "shadow_size": 0}
+#: Protocol fields added later, recorded only when a job sets them (absent means the earlier protocol).
+OPTIONAL_PROTOCOL_KEYS = ("prefix_scaling",)
+
+
 def arm_spec(job: dict) -> dict:
     """The ensemble configuration ``job``'s arm runs under, as the child builds it."""
     from . import run
 
     t0 = job.get("freeze_after_window")
     cfg = run.arm_config(job["arm"], run.job_config(job), C.FREEZE_AFTER_WINDOW if t0 is None else t0)
-    return _plain({k: v for k, v in dataclasses.asdict(cfg).items() if k != "lam"})
+    return _plain({k: v for k, v in dataclasses.asdict(cfg).items()
+                   if k != "lam" and not (k in _LATER_ARM_FIELDS and v == _LATER_ARM_FIELDS[k])})
 
 
 def build(jobs: list[dict], provenance: dict | None = None, sweep: dict | None = None) -> dict:
@@ -209,6 +218,10 @@ def build(jobs: list[dict], provenance: dict | None = None, sweep: dict | None =
     if not jobs:
         raise ValueError("no jobs to describe")
     protocol = {k: _shared(jobs, k) for k in PROTOCOL_KEYS}
+    for k in OPTIONAL_PROTOCOL_KEYS:
+        value = _shared(jobs, k)
+        if value not in (None, "none"):
+            protocol[k] = value
     m = {
         "schema": SCHEMA,
         "protocol": protocol,
@@ -220,7 +233,11 @@ def build(jobs: list[dict], provenance: dict | None = None, sweep: dict | None =
         if j["arm"] not in m["arms"]:
             m["arms"][j["arm"]] = arm_spec(j)
         if j["algo"] not in m["algorithms"]:
-            m["algorithms"][j["algo"]] = algorithm_spec(j["algo"])
+            spec = dict(algorithm_spec(j["algo"]))
+            if j.get("pins"):
+                # ``run --pin``: a constructor value set on every member, part of what the algorithm is here
+                spec["pins"] = _plain(j["pins"])
+            m["algorithms"][j["algo"]] = spec
         key = stream_key(j["fold"], protocol["data_seed"])
         if key not in m["streams"]:
             m["streams"][key] = stream_spec(j["fold"], protocol["n_samples"], protocol["data_seed"])

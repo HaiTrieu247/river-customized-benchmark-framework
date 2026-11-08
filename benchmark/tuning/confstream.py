@@ -118,9 +118,27 @@ TIE_LEVELS: dict[str, tuple[str, ...]] = {
 #: and the freeze, one dict each.
 LIFECYCLE_SCHEMA = 1
 #: Where a member came from (``birth`` events): one of the explicit starts, an offspring of a start
-#: drawn when the ensemble is filled, a child of the evolutionary or the uniform sampler, or a fresh
-#: copy of the frozen configuration (``reinit_after_freeze``).
-BIRTH_ORIGINS: tuple[str, ...] = ("start", "initial_offspring", "evolutionary", "uniform", "reinit_copy")
+#: drawn when the ensemble is filled, a child of the evolutionary or the uniform sampler, a fresh
+#: copy of the frozen configuration (``reinit_after_freeze``), or a fresh copy of one configuration
+#: of the frozen portfolio (``freeze_mode="portfolio"``).
+BIRTH_ORIGINS: tuple[str, ...] = ("start", "initial_offspring", "evolutionary", "uniform", "reinit_copy",
+                                  "portfolio_copy")
+#: What happens at ``freeze_after_window`` (``EnsembleConfig.freeze_mode``), the boundary every
+#: branch of the mechanism study (E3) shares. Up to and including that window every mode runs the
+#: same tuner, so with a deterministic protocol (no runtime gate, the ``micro_clusters`` tie-break)
+#: and the same tuner and model seeds the branches start from the same ensemble state:
+#:
+#: - ``single``: the ensemble collapses onto its incumbent and spawns nothing (``frozen_prefix``), or,
+#:   with ``reinit_after_freeze``, keeps renewing that one configuration (``frozen_reinit``);
+#: - ``ensemble``: the whole active portfolio is kept, selection among its existing models goes on,
+#:   and nothing new is created (no renewal, no new configuration);
+#: - ``portfolio``: the portfolio's configurations are kept, and each window ``e_test`` of them, in a
+#:   fixed round-robin order, get a fresh model warm-started on the window; a fresh model can replace
+#:   only the model of its own configuration, on a strictly higher score, so the configurations never
+#:   change and only the models are renewed;
+#: - ``random``: tuning goes on with the same schedule, but every later child is drawn uniformly
+#:   over the space (no parent, no width shrink): random search from the same state.
+FREEZE_MODES: tuple[str, ...] = ("single", "ensemble", "portfolio", "random")
 
 
 @dataclass
@@ -167,6 +185,14 @@ class EnsembleConfig:
     #: ``signals.NOISE_POLICIES``. ``"label"``, the default, reads them as one more cluster, as
     #: the tuner's own silhouette always does; the score the tuner selects by is not changed.
     signal_noise: str = "label"
+    #: What the ensemble does at ``freeze_after_window``: ``FREEZE_MODES``.
+    freeze_mode: str = "single"
+    #: Shadow evaluation (E7): up to this many members the tuner removed (rejected challengers,
+    #: replaced victims, the members a freeze discarded), the most recent ones, keep predicting,
+    #: learning and being scored every window, but take no part in any selection, victim draw or
+    #: roulette, and draw nothing from the tuner's generator. 0 (the default) keeps none. Their
+    #: readings are reported apart (``WindowReport.shadow_outcomes``) and never as members'.
+    shadow_size: int = 0
 
     def __post_init__(self):
         if self.sampler not in SAMPLERS:
@@ -182,6 +208,15 @@ class EnsembleConfig:
             raise ValueError(f"tie_break must be one of {TIE_BREAKS}, got {self.tie_break!r}")
         if self.reinit_after_freeze and self.freeze_after_window is None:
             raise ValueError("reinit_after_freeze needs freeze_after_window")
+        if self.freeze_mode not in FREEZE_MODES:
+            raise ValueError(f"freeze_mode must be one of {FREEZE_MODES}, got {self.freeze_mode!r}")
+        if self.freeze_mode != "single" and self.freeze_after_window is None:
+            raise ValueError(f"freeze_mode={self.freeze_mode!r} needs freeze_after_window")
+        if self.freeze_mode != "single" and self.reinit_after_freeze:
+            raise ValueError("reinit_after_freeze is the single-configuration renewal; use freeze_mode='portfolio' "
+                             "to renew a whole portfolio")
+        if self.shadow_size < 0:
+            raise ValueError(f"shadow_size must be >= 0, got {self.shadow_size}")
 
     @property
     def signals_needed(self) -> tuple[str, ...]:
@@ -268,6 +303,10 @@ class WindowOutcome:
     snapshot: dict = field(default_factory=dict)
     #: A diagnostic reading that failed (its message); the member and the selection go on.
     diag_error: str | None = None
+    #: The frozen portfolio's configuration this member runs (``freeze_mode="portfolio"``), else None.
+    slot: int | None = None
+    #: A shadow member's reading (``EnsembleConfig.shadow_size``): never selected, never a victim.
+    is_shadow: bool = False
 
     @property
     def memory_mb(self) -> float | None:
@@ -311,6 +350,8 @@ class WindowOutcome:
             "external_support_sha": self.external_support_sha,
             "max_label_share": round(self.max_label_share, 6) if self.max_label_share is not None else None,
             "score_status": self.score_status,
+            **({"slot": self.slot} if self.slot is not None else {}),
+            **({"is_shadow": True} if self.is_shadow else {}),
             **{f"{k}_win": v for k, v in self.window_metrics.items()},
             **self.snapshot,
             **({"diag_error": self.diag_error} if self.diag_error is not None else {}),
@@ -333,6 +374,8 @@ class Member:
     error: str | None = None
     #: Test hook: a score to report instead of the measured one, used once.
     outcome_override: float | None = None
+    #: The frozen portfolio's configuration this member runs (``freeze_mode="portfolio"``).
+    slot: int | None = None
 
 
 @dataclass
@@ -357,6 +400,11 @@ class WindowReport:
     decision: dict = field(default_factory=dict)
     #: Children built for the next window whose construction or warm start raised.
     n_birth_errors: int = 0
+    #: The shadow members' readings on this window (``EnsembleConfig.shadow_size``), apart from
+    #: ``outcomes``: no count, runtime or status of the window includes them.
+    shadow_outcomes: list[WindowOutcome] = field(default_factory=list)
+    #: Seconds the shadow members took (models and silhouettes), outside every other timer.
+    shadow_runtime_s: float = 0.0
 
     @property
     def scoring_runtime_s(self) -> float:
@@ -477,7 +525,17 @@ def victim_weights(scores) -> np.ndarray:
     return w / total
 
 
-def apply_feasibility(outcomes: list[WindowOutcome], cfg: EnsembleConfig) -> None:
+def _has_partition(o: WindowOutcome) -> bool:
+    return o.error is None and (o.partitioned if o.partitioned is not None else o.defined)
+
+
+def fastest_partition_runtime(outcomes: list[WindowOutcome]) -> float | None:
+    """The runtime reference of ``apply_feasibility``: the fastest member with a partition, None without one."""
+    return min((o.runtime_s for o in outcomes if _has_partition(o)), default=None)
+
+
+def apply_feasibility(outcomes: list[WindowOutcome], cfg: EnsembleConfig,
+                      reference: float | None | str = "own") -> None:
     """Mark the outcomes that tripped a cap; an infeasible one scores undefined.
 
     The runtime reference is the fastest member that produced a partition
@@ -487,11 +545,11 @@ def apply_feasibility(outcomes: list[WindowOutcome], cfg: EnsembleConfig) -> Non
     member on the window there is no reference, and the runtime cap is not
     applied; the memory and micro-cluster caps are. ``runtime_factor=None`` never applies it.
     Every member with a partition gets its ``runtime_ratio`` against that reference.
+    ``reference`` other than ``"own"`` is a reference taken from other outcomes (the shadow members
+    are measured against the ensemble's own fastest member, never against each other).
     """
-    def has_partition(o: WindowOutcome) -> bool:
-        return o.error is None and (o.partitioned if o.partitioned is not None else o.defined)
-
-    fastest = min((o.runtime_s for o in outcomes if has_partition(o)), default=None)
+    has_partition = _has_partition
+    fastest = fastest_partition_runtime(outcomes) if reference == "own" else reference
     for o in outcomes:
         if fastest is not None and has_partition(o):
             o.runtime_ratio = o.runtime_s / fastest if fastest > 0 else None
@@ -552,11 +610,14 @@ class ConfStreamEnsemble:
         rng: np.random.Generator,
         seed: int,
         post_resolve: Callable[[dict], dict] | None = None,
+        keep_predictions: bool = False,
     ):
         """``post_resolve`` rewrites every child's resolved parameters before
         the member records them and its model is built (e.g. the driver caps
         initialisation buffers at the window size); the identity by default.
-        The explicit starts are taken as given."""
+        The explicit starts are taken as given. ``keep_predictions`` keeps every
+        member's per-point predictions on its outcome (for a prediction log), not
+        only the previous incumbent's; it changes nothing the ensemble does."""
         if config.e_size < 1:
             raise ValueError(f"e_size must be >= 1, got {config.e_size}")
         if not start_params:
@@ -574,6 +635,13 @@ class ConfStreamEnsemble:
         self._next_id = 0
         self._last_incumbent_id: int | None = None
         self.frozen = False
+        self.keep_predictions = keep_predictions
+        #: Members the tuner removed that are still evaluated (``EnsembleConfig.shadow_size``).
+        self.shadow: list[Member] = []
+        #: ``freeze_mode="portfolio"``: the configurations kept at the boundary, by slot, and the
+        #: slot the next fresh copy is built for (round-robin).
+        self._portfolio: list[tuple] = []
+        self._next_slot = 0
         #: Lifecycle events since the last ``drain_events`` (``LIFECYCLE_SCHEMA``): what a log of
         #: births, challenges, decisions and the freeze is written from. Records only; nothing
         #: reads them back.
@@ -639,6 +707,7 @@ class ConfStreamEnsemble:
         base = dict(
             member_id=m.id, window_index=window_index, params=dict(m.params),
             parent_id=m.parent_id, born_window=m.born_window, is_test=m in self.test,
+            slot=m.slot, is_shadow=any(s is m for s in self.shadow),
         )
         if m.error is not None:
             return WindowOutcome(score=UNDEFINED_SCORE, defined=False, runtime_s=0.0,
@@ -684,7 +753,7 @@ class ConfStreamEnsemble:
         outcome.support_sha = support_fingerprint(silhouette_support(preds))
         outcome.n_points_external = sum(ext_mask)
         outcome.external_support_sha = support_fingerprint(ext_mask)
-        if m.id == self._last_incumbent_id:
+        if m.id == self._last_incumbent_id or self.keep_predictions:
             outcome.predictions = preds
         if cmm is not None:
             cmm.score_into(outcome, preds, frozenset(sentinel_labels(adapter.model)))
@@ -857,13 +926,47 @@ class ConfStreamEnsemble:
         for m, o in zip(members, outcomes):
             m.score, m.last = o.score, o
 
+        # Shadow members: scored like members against the ensemble's own runtime reference, but
+        # kept out of every list the selection reads below.
+        shadow_outcomes: list[WindowOutcome] = []
+        t_shadow = time.perf_counter()
+        if self.shadow:
+            reference = fastest_partition_runtime(outcomes)
+            shadow_outcomes = [self._run_member(m, buffer, window_index, window, cmm) for m in self.shadow]
+            apply_feasibility(shadow_outcomes, self.cfg, reference=reference)
+            for m, o in zip(self.shadow, shadow_outcomes):
+                o.score_status = score_status(o)
+                m.score, m.last = o.score, o
+        shadow_s = (time.perf_counter() - t_shadow) if self.shadow else 0.0
+
         lag = next((o for o in outcomes if o.member_id == self._last_incumbent_id), None)
 
         # Resolve the test set against the active set, one challenger at a time.
         n_tested, n_accepted, n_discarded = len(self.test), 0, 0
+        #: Members leaving the ensemble this window (candidates for the shadow pool).
+        removed: list[Member] = []
         for challenger in self.test:
             event = {"event": "challenge", "window": window_index, "challenger_id": challenger.id,
                      "challenger_score": challenger.score, "victim_id": None, "victim_score": None}
+            if challenger.slot is not None:
+                # portfolio renewal: a fresh model meets only the model of its own configuration
+                victim = next((m for m in self.active if m.slot == challenger.slot), None)
+                if victim is None:
+                    self.active.append(challenger)
+                    n_accepted += 1
+                    self.events.append({**event, "outcome": "filled", "slot": challenger.slot})
+                    continue
+                event.update(victim_id=victim.id, victim_score=victim.score, slot=challenger.slot)
+                if challenger.score > victim.score:
+                    self.active[self.active.index(victim)] = challenger
+                    removed.append(victim)
+                    n_accepted += 1
+                    self.events.append({**event, "outcome": "accepted"})
+                else:
+                    removed.append(challenger)
+                    n_discarded += 1
+                    self.events.append({**event, "outcome": "rejected"})
+                continue
             if len(self.active) < self.cfg.e_size:
                 # only after a freeze with renewal: the copies fill the ensemble back up
                 self.active.append(challenger)
@@ -873,6 +976,7 @@ class ConfStreamEnsemble:
             best = self.pick_incumbent([m.last for m in self.active], self._last_incumbent_id, self.cfg.tie_break)
             candidates = [m for m in self.active if m.id != best.member_id]
             if not candidates:
+                removed.append(challenger)
                 n_discarded += 1
                 self.events.append({**event, "outcome": "discarded_no_victim"})
                 continue
@@ -881,9 +985,11 @@ class ConfStreamEnsemble:
             event.update(victim_id=victim.id, victim_score=victim.score)
             if challenger.score > victim.score:
                 self.active[self.active.index(victim)] = challenger
+                removed.append(victim)
                 n_accepted += 1
                 self.events.append({**event, "outcome": "accepted"})
             else:
+                removed.append(challenger)
                 n_discarded += 1
                 self.events.append({**event, "outcome": "rejected"})
         self.test = []
@@ -900,30 +1006,63 @@ class ConfStreamEnsemble:
         self.events.append({"event": "decision", "window": window_index, **decision})
         self._last_incumbent_id = incumbent.member_id
 
+        mode = self.cfg.freeze_mode
         if (self.cfg.freeze_after_window is not None and not self.frozen
                 and window_index >= self.cfg.freeze_after_window):
-            self.active = [m for m in self.active if m.id == incumbent.member_id]
+            if mode == "single":
+                removed += [m for m in self.active if m.id != incumbent.member_id]
+                self.active = [m for m in self.active if m.id == incumbent.member_id]
+            elif mode == "portfolio":
+                for i, m in enumerate(self.active):
+                    m.slot = i
+                self._portfolio = [(dict(m.u), dict(m.params), m.state, m.id) for m in self.active]
             self.frozen = True
-            keep = self.active[0]
+            keep = next(m for m in self.active if m.id == incumbent.member_id)
             self._frozen_member = (dict(keep.u), dict(keep.params), keep.state, keep.id)
-            self.events.append({"event": "freeze", "window": window_index, "member_id": keep.id,
-                                "params": dict(keep.params), "reinit_after_freeze": self.cfg.reinit_after_freeze})
+            event = {"event": "freeze", "window": window_index, "member_id": keep.id,
+                     "params": dict(keep.params), "reinit_after_freeze": self.cfg.reinit_after_freeze}
+            if mode != "single":
+                event.update(freeze_mode=mode, kept_member_ids=[m.id for m in self.active])
+            self.events.append(event)
+
+        if self.cfg.shadow_size > 0:
+            for m in removed:
+                if m.error is None and not any(s is m for s in self.shadow):
+                    self.shadow.append(m)
+            self.shadow = self.shadow[-self.cfg.shadow_size:]
 
         # Spawn the next test set from the (possibly refreshed, possibly
-        # frozen) active set. A frozen ensemble spawns nothing.
+        # frozen) active set. A frozen ensemble spawns nothing, unless it renews
+        # its model(s) or goes on with random search (``freeze_mode``).
         t_spawn = time.perf_counter()
         n_reset = 0
-        n_spawn = 0 if self.frozen and not self.cfg.reinit_after_freeze else self.cfg.e_test
+        if not self.frozen or mode == "random":
+            n_spawn = self.cfg.e_test
+        elif mode == "single":
+            n_spawn = self.cfg.e_test if self.cfg.reinit_after_freeze else 0
+        elif mode == "portfolio":
+            n_spawn = self.cfg.e_test if self._portfolio else 0
+        else:
+            n_spawn = 0
         parent_w = roulette_weights([m.score for m in self.active])
         for _ in range(n_spawn):
-            if self.frozen:
+            if self.frozen and mode == "single":
                 # re-initialisation control: a fresh model of the frozen configuration
                 u, params, state, parent_id = self._frozen_member
                 self.test.append(self._new_member(u, params, state, parent_id, window_index, buffer,
                                                   origin="reinit_copy"))
                 continue
+            if self.frozen and mode == "portfolio":
+                slot = self._next_slot % len(self._portfolio)
+                self._next_slot += 1
+                u, params, state, origin_id = self._portfolio[slot]
+                child = self._new_member(u, params, state, origin_id, window_index, buffer, origin="portfolio_copy")
+                child.slot = slot
+                self.test.append(child)
+                continue
             reset = None
-            if self.cfg.sampler == "uniform":
+            sampler = "uniform" if (self.frozen and mode == "random") else self.cfg.sampler
+            if sampler == "uniform":
                 parent_id = None
                 child_u = {p.name: float(self.rng.random()) for p in self.space.params}
                 child_state = SamplerState.initial(self.space)
@@ -942,7 +1081,7 @@ class ConfStreamEnsemble:
             params = self._resolve(child_u)
             self.test.append(self._new_member(
                 child_u, params, child_state, parent_id, window_index, buffer,
-                origin=self.cfg.sampler, reset=reset,
+                origin=sampler, reset=reset,
             ))
 
         return WindowReport(
@@ -952,4 +1091,5 @@ class ConfStreamEnsemble:
             frozen=self.frozen, cmm_window=cmm.window_readings() if cmm is not None else {},
             spawn_runtime_s=(time.perf_counter() - t_spawn) if n_spawn else 0.0,
             decision=decision, n_birth_errors=sum(1 for m in self.test if m.error is not None),
+            shadow_outcomes=shadow_outcomes, shadow_runtime_s=shadow_s,
         )
