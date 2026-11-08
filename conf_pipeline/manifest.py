@@ -197,7 +197,7 @@ def _seeds(jobs: list[dict]) -> dict:
 #: Ensemble fields added after manifests were first written, with the value every earlier run had:
 #: an arm spec leaves a field out while it has that value, so a dir written before the field existed
 #: still matches, and a run that sets it is a different arm.
-_LATER_ARM_FIELDS = {"freeze_mode": "single", "shadow_size": 0}
+_LATER_ARM_FIELDS = {"freeze_mode": "single", "shadow_size": 0, "score_partition": "sequential"}
 #: Protocol fields added later, recorded only when a job sets them (absent means the earlier protocol).
 OPTIONAL_PROTOCOL_KEYS = ("prefix_scaling",)
 

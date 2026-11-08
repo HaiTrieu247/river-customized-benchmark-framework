@@ -807,7 +807,9 @@ def test_the_snapshot_reads_one_reprediction_and_is_never_the_score():
     ens._repredict = counted
     ens.initialise(_blob_window(60, seed=0), window_index=0)
     r = ens.process_window(_blob_window(60, seed=1), window_index=1)
-    assert len(calls) == len(r.outcomes)              # one reprediction per member, shared
+    # two predictions of the window per member: at its start (the external readings) and at its end
+    # (the score), the second shared with stability
+    assert len(calls) == 2 * len(r.outcomes)
     for o in r.outcomes:
         row = o.to_dict()
         assert row["snap_silhouette_reason"] in ("valid", "single_label", "one_label_per_point")
@@ -816,8 +818,10 @@ def test_the_snapshot_reads_one_reprediction_and_is_never_the_score():
 
 
 def test_a_failing_diagnostic_is_recorded_and_changes_nothing_else():
-    off = _ensemble(e_size=4, e_test=2, seed=5)
-    on = _ensemble(e_size=4, e_test=2, seed=5, log_signals=("stability", "silhouette_std"))
+    # under the sequential rule the snapshot is a diagnostic only; under the snapshot rule it is the score
+    off = _ensemble(e_size=4, e_test=2, seed=5, score_partition="sequential")
+    on = _ensemble(e_size=4, e_test=2, seed=5, log_signals=("stability", "silhouette_std"),
+                   score_partition="sequential")
 
     def boom(adapter, buffer):
         raise RuntimeError("no snapshot")

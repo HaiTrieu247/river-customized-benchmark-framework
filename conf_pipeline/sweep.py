@@ -164,6 +164,7 @@ def _protocol(protocol: dict) -> dict:
         p_reset=C.P_RESET, half_life_frac=C.HALF_LIFE_FRAC, runtime_factor=C.RUNTIME_FACTOR,
         max_memory_mb=C.MAX_MEMORY_MB, max_micro_clusters=C.MAX_MICRO_CLUSTERS,
         freeze_after_window=C.FREEZE_AFTER_WINDOW, data_seed=C.DATA_SEED,
+        score_partition=C.SCORE_PARTITION,
     )
     unknown = sorted(set(protocol) - set(defaults))
     if unknown:
@@ -187,7 +188,7 @@ def _sweep_job(algo, fold, seeds_of, n_samples, h, proto, config_id,
         "max_micro_clusters": proto["max_micro_clusters"],
         "freeze_after_window": proto["freeze_after_window"], "member_log": None,
         "config_id": config_id, "unit_override": unit_override, "params_override": params_override,
-        "data_seed": proto["data_seed"],
+        "data_seed": proto["data_seed"], "score_partition": proto["score_partition"],
     }
 
 
@@ -446,6 +447,9 @@ def main() -> None:
                         help="leave CMM (cmm, cmm_strict) out of the per-window external readings")
     parser.add_argument("--data-seed", type=int, default=C.DATA_SEED,
                         help="seed of the synthetic streams' generators (match the arms' --data-seed)")
+    parser.add_argument("--score-partition", default=C.SCORE_PARTITION, choices=("snapshot", "sequential"),
+                        help="match the arms' --score-partition: under snapshot every point's ARI reads its "
+                             "snapshot at the start of each window, the reading the oracle is picked on")
     parser.add_argument("--no-runtime-gate", action="store_true",
                         help="the protocol of arms run with --no-runtime-gate (one member is never shed "
                              "for its runtime either way; the out dir's manifest needs them to agree)")
@@ -476,6 +480,7 @@ def main() -> None:
         n_samples = args.n_samples or None
         folds = _csv(args.folds)
         gate = {"runtime_factor": None} if args.no_runtime_gate else {}
+        gate["score_partition"] = args.score_partition
         if args.seed_policy == "split":
             if args.seed is not None or args.seeds is not None:
                 raise SystemExit("--seed and --seeds are the shared policy's; under the split policy give "

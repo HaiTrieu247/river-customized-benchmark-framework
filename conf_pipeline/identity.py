@@ -190,7 +190,8 @@ def _replay(mw: pd.DataFrame, windows: list[dict], kappas, base: dict) -> pd.Dat
     """Per window t: the raw and every corrected silhouette's pick among feasible members, read on t+1."""
     if mw.empty:
         return pd.DataFrame()
-    logged = {w["window"]: w.get("lag_ari_win") for w in windows}
+    # the sequential lagged ARI: under the snapshot rule ``lag_ari_win`` reads the snapshot instead
+    logged = {w["window"]: w.get("lag_seq_ari_win", w.get("lag_ari_win")) for w in windows}
     by_w = {w: g for w, g in mw.groupby("window")}
     out = []
     for w in sorted(by_w):

@@ -29,8 +29,11 @@ def test_the_snapshot_evaluation_changes_no_decision_and_reads_every_lagged_wind
     wins = [r for r in on if r["kind"] == "window" and r.get("lag_member_id") is not None]
     assert len(wins) == 3
     for r in wins:
-        # the sequential labels scored by the snapshot block are the ones lag_ari_win reads
-        assert abs(r["lag_snap_seq_ari_win"] - r["lag_ari_win"]) < 1e-9
+        # under the snapshot rule lag_ari_win reads the lagged incumbent's snapshot at the start of the
+        # window, and lag_seq_ari_win the sequential labels the snapshot block scores as "seq"
+        assert r["ari_basis"] == "snapshot_pre" and r["lag_ari_basis"] == "snapshot_pre"
+        assert abs(r["lag_snap_pre_ari_win"] - r["lag_ari_win"]) < 1e-9
+        assert abs(r["lag_snap_seq_ari_win"] - r["lag_seq_ari_win"]) < 1e-9
         assert r["lag_snap_pre_ari_win"] is not None and r["lag_snap_post_ari_win"] is not None
         assert r["lag_snap_pre_n_labels"] >= 1 and r["snapshot_runtime_s"] >= 0
     summary = on[-1]

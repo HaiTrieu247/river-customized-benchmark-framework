@@ -47,6 +47,10 @@ E_TEST = 10
 #: Probability that a child restarts at the initial exploration width; with
 #: e_size = 20 that is 0.2 resets per window, the paper's rate.
 P_RESET = 0.01
+#: The partition the tuner scores and every ``*_win`` reading reads (``confstream.SCORE_PARTITIONS``):
+#: ``snapshot`` since 2026-11-08 (docs/SEQUENTIAL_PARTITION_AUDIT.md section 7.7); the runs before it,
+#: ``out/full`` among them, are ``sequential``.
+SCORE_PARTITION = "snapshot"
 #: The fading factor is set per fold from the number of windows: sigma halves
 #: after ``HALF_LIFE_FRAC`` of the stream's windows. A fixed lambda means
 #: "converged in the first 5% of the stream" on a 2M-sample stream and "never

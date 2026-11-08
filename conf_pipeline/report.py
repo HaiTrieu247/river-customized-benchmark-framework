@@ -48,7 +48,7 @@ from . import _common as C
 #: (Table A, the common reclusterer) are optional: runs that predate them read None,
 #: as do the cost ratios and the Table A error fields of older runs.
 SUMMARY_FIELDS = (
-    "lag_ari_win_mean", "lag_score_mean", "lag_ari_cumulative",
+    "lag_ari_win_mean", "lag_score_mean",
     "incumbent_throughput_sps", "ensemble_runtime_s", "wall_s",
     "lag_memory_mb_peak", "lag_n_pred_labels_mean", "lag_n_macro_clusters_mean",
     "n_switches", "n_accepted_total", "n_reset_total",
@@ -145,7 +145,33 @@ def current_runs(out_dir: Path, diagnostic: bool = False) -> pd.DataFrame:
     rows = [r for r in rows if not (r.get("status") == "skipped" and _job(r) in ok)]
     if not rows:
         return pd.DataFrame(columns=["algo", "fold", "seed", "arm", "status"])
+    check_one_basis(rows, Path(out_dir))
     return pd.DataFrame(rows)
+
+
+#: ``ari_basis`` of a row written before 2026-11-08, which has none: its ARIs read the sequential labels.
+LEGACY_BASIS = "sequential"
+BASIS_TEXT = {"snapshot_pre": "the snapshot of the lagged incumbent at the start of the window (one model "
+                              "state, out of sample; `lag_seq_ari_win` keeps the sequential reading)",
+              "sequential": "the sequential predict-before-learn labels (the rule before 2026-11-08)"}
+
+
+def check_one_basis(rows, where) -> str:
+    """The one ``ari_basis`` the ``ok`` rows of a dir share; a dir that mixes two cannot be read as one."""
+    bases = {r.get("ari_basis") or LEGACY_BASIS for r in rows if r.get("status") == "ok"}
+    if len(bases) > 1:
+        raise ValueError(f"{where} mixes ARI bases {sorted(bases)}: its runs scored different partitions and "
+                         "cannot be compared; read each set apart")
+    return next(iter(bases), LEGACY_BASIS)
+
+
+def _basis_text(runs) -> str:
+    try:
+        rows = runs.to_dict("records") if hasattr(runs, "to_dict") else list(runs)
+        basis = check_one_basis(rows, "this dir")
+    except ValueError as exc:
+        return str(exc)
+    return f"`{basis}`: {BASIS_TEXT.get(basis, basis)}"
 
 
 def _seed_key(v):
@@ -1102,7 +1128,7 @@ def curves(out_dir: Path) -> dict[str, pd.DataFrame]:
     win = load_windows(out_dir)
     if win.empty:
         return {}
-    cols = [c for c in ("lag_ari_win", "lag_score", "score", "lag_ari_cum", "lag_n_pred_labels",
+    cols = [c for c in ("lag_ari_win", "lag_score", "score", "lag_n_pred_labels",
                         "ensemble_runtime_s", "wall_s") if c in win]
     out = {}
     for fold, grp in win.groupby("fold"):
@@ -1161,8 +1187,9 @@ def write_report(out_dir: Path) -> list[Path]:
     lines.append(
         "Every quality number is the *lagged* reading: the incumbent named after "
         "window t-1, scored on window t. `score` is the batch silhouette in [-1, 1] "
-        "(-1 when undefined); `ari_win` is the ARI inside the window; "
-        "`lag_ari_cumulative` is the ARI over the whole stream of lagged incumbents. "
+        "(-1 when undefined); `ari_win` is the ARI inside the window. The partition these ARIs read is "
+        f"named by `ari_basis`, here {_basis_text(runs)}. No whole-stream ARI is reported: it would join the "
+        "labels of every window and of every incumbent, which name no common clusters. "
         "`*_tail_*` columns cover the windows from `tail_from` (the freeze window) on, "
         "the region every arm shares; they are the headline numbers. A window with a single "
         "true class has no external reading (ARI would only say whether the prediction had one "
@@ -1173,7 +1200,7 @@ def write_report(out_dir: Path) -> list[Path]:
     if not table.empty:
         cols = ["algo", "fold", "arm", "n_seeds", "lag_ari_win_tail_mean", "lag_ari_win_tail_sd",
                 "lag_ari_n_windows_tail", "lag_ari_win_mean", "lag_ari_win_sd", "lag_ari_n_windows",
-                "n_single_class_windows", "lag_score_mean", "lag_ari_cumulative",
+                "n_single_class_windows", "lag_score_mean", "lag_seq_ari_win_tail_mean",
                 "incumbent_throughput_sps", "ensemble_runtime_s", "tuning_overhead", "lag_memory_mb_peak",
                 "lag_n_pred_labels_mean", "n_switches", "switch_cost", "lag_undefined_share",
                 "single_class_window_share", "frozen_at_window"]

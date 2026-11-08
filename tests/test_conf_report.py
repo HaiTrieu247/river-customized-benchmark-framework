@@ -157,9 +157,10 @@ def out_dir(tmp_path):
 
 def test_summary_table_aggregates_over_seeds_per_algo_fold_arm(out_dir):
     table = report.summary_table(out_dir)
+    assert "lag_ari_cumulative" not in table.columns   # no whole-stream ARI: it names no common clusters
     assert set(table.columns) >= {
         "algo", "fold", "arm", "n_seeds", "lag_ari_win_mean", "lag_ari_win_sd",
-        "lag_score_mean", "lag_ari_cumulative", "incumbent_throughput_sps",
+        "lag_score_mean", "incumbent_throughput_sps",
         "ensemble_runtime_s", "lag_memory_mb_peak", "lag_n_pred_labels_mean",
         "n_switches", "lag_undefined_share", "single_class_window_share", "n_failed",
         "lag_ari_win_tail_mean", "lag_ari_win_tail_sd", "lag_score_tail_mean",

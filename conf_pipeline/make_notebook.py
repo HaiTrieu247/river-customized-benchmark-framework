@@ -129,7 +129,7 @@ def show(title: str, df: pd.DataFrame, cols: list[str] | None = None) -> None:
 PANEL_MD = r"""
 ## 1. Bảng điều khiển
 
-Cell dưới chọn preset theo `OTB_PRESET` (mặc định `pilot`) và thư mục kết quả theo `OTB_OUT_DIR` (mặc định `conf_pipeline/out/<preset>`), dựng sẵn danh sách cờ cho ba lệnh CLI rồi in toàn bộ thiết lập đã chốt để đối chiếu trước khi chạy. Muốn đổi một giá trị cho riêng lần chạy này thì gán lại ở chỗ đánh dấu ngay dưới các cờ, ví dụ `WORKERS = 4`; khi đổi `N_SAMPLES`, `H`, `E_SIZE`, `E_TEST` hay `FREEZE_AFTER_WINDOW` thì nên đổi cả `OTB_OUT_DIR` để hai lần chạy không trộn vào cùng một file. `FREEZE_AFTER_WINDOW` là cửa sổ mà `frozen_prefix` thôi tune và cũng là nơi phần đuôi của mọi arm bắt đầu; `tiny` đặt nó bằng 1 vì luồng chỉ có 3 cửa sổ. Preset `full` thêm `DenStreamPatchedFast` vào `ALGOS`: đây là DenStream đã sửa BUG-7 và BUG-8 với pha offline nhanh (GAP-3), được chạy như mọi thuật toán khác nhưng không bao giờ được xếp hạng chung, chỉ so với DenStream ở bảng T7. `RUN_SWEEP` và `RUN_ORACLE` bật hoặc tắt hai bước quét và chạy lại oracle, `LOG_MEMBERS` ghi kết quả của từng thành viên ensemble (cần cho `R_proxy`, `R_search` và mốc hồi phục sau drift), còn `RETRY_FAILED = True` chạy lại các job đã lỗi.
+Cell dưới chọn preset theo `OTB_PRESET` (mặc định `pilot`), thư mục kết quả theo `OTB_OUT_DIR` (mặc định `conf_pipeline/out/<preset>`) và số worker theo `OTB_WORKERS` (mặc định của preset), dựng sẵn danh sách cờ cho ba lệnh CLI rồi in toàn bộ thiết lập đã chốt để đối chiếu trước khi chạy. Muốn đổi một giá trị cho riêng lần chạy này thì gán lại ở chỗ đánh dấu ngay dưới các cờ, ví dụ `WORKERS = 4`; khi đổi `N_SAMPLES`, `H`, `E_SIZE`, `E_TEST` hay `FREEZE_AFTER_WINDOW` thì nên đổi cả `OTB_OUT_DIR` để hai lần chạy không trộn vào cùng một file. `FREEZE_AFTER_WINDOW` là cửa sổ mà `frozen_prefix` thôi tune và cũng là nơi phần đuôi của mọi arm bắt đầu; `tiny` đặt nó bằng 1 vì luồng chỉ có 3 cửa sổ. Preset `full` thêm `DenStreamPatchedFast` vào `ALGOS`: đây là DenStream đã sửa BUG-7 và BUG-8 với pha offline nhanh (GAP-3), được chạy như mọi thuật toán khác nhưng không bao giờ được xếp hạng chung, chỉ so với DenStream ở bảng T7. `RUN_SWEEP` và `RUN_ORACLE` bật hoặc tắt hai bước quét và chạy lại oracle, `LOG_MEMBERS` ghi kết quả của từng thành viên ensemble (cần cho `R_proxy`, `R_search` và mốc hồi phục sau drift), còn `RETRY_FAILED = True` chạy lại các job đã lỗi.
 """
 
 PANEL = r"""
@@ -158,6 +158,8 @@ PRESETS = {
 if PRESET not in PRESETS:
     raise SystemExit(f"OTB_PRESET={PRESET!r}; chọn một trong {sorted(PRESETS)}")
 globals().update(PRESETS[PRESET])
+# the machine's worker count without editing the notebook (OTB_WORKERS); results do not depend on it
+WORKERS = int(os.environ.get("OTB_WORKERS", WORKERS))
 RUN_SWEEP = True
 RUN_ORACLE = True
 LOG_MEMBERS = True

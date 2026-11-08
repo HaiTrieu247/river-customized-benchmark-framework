@@ -24,7 +24,7 @@ import numpy as np
 from benchmark.algorithms.registry import accepts_seed, get_algorithm
 from benchmark.tuning.cluster_identity import snapshot_labels
 from benchmark.tuning.confstream import (
-    LIFECYCLE_SCHEMA, TIE_BREAKS, TIE_LEVELS, ConfStreamEnsemble, EnsembleConfig, WindowOutcome,
+    LIFECYCLE_SCHEMA, SCORE_PARTITIONS, TIE_BREAKS, TIE_LEVELS, ConfStreamEnsemble, EnsembleConfig, WindowOutcome,
 )
 from benchmark.tuning.recluster import common_recluster, micro_centers
 from benchmark.tuning.signals import NOISE_POLICIES, SIGNALS, check_signals
@@ -99,10 +99,12 @@ def external_defined(o: WindowOutcome) -> bool:
 
 
 def _external(o: WindowOutcome) -> dict:
-    """``o``'s per-window external metrics as ``{name_win: value}``, None on a
-    window without enough true classes (``external_defined``)."""
+    """``o``'s per-window external metrics as ``{name_win: value}`` (the partition ``o.ari_basis``
+    names) and the sequential ones as ``seq_<name>_win`` where they are kept apart, None on a window
+    without enough true classes (``external_defined``)."""
     ok = external_defined(o)
-    return {f"{k}_win": (v if ok else None) for k, v in o.window_metrics.items()}
+    return {**{f"{k}_win": (v if ok else None) for k, v in o.window_metrics.items()},
+            **{f"seq_{k}_win": (v if ok else None) for k, v in o.seq_window_metrics.items()}}
 
 
 def _incumbent_fields(o: WindowOutcome, prefix: str = "") -> dict:
@@ -130,6 +132,7 @@ def _incumbent_fields(o: WindowOutcome, prefix: str = "") -> dict:
         f"{prefix}silhouette_reason": o.silhouette_reason,
         f"{prefix}score_status": o.score_status,
         f"{prefix}error": o.error,
+        f"{prefix}ari_basis": o.ari_basis,
         **{f"{prefix}{k}": v for k, v in _external(o).items()},
         f"{prefix}cmm_error": o.cmm_error,
     }
@@ -258,6 +261,8 @@ def job_config(job: dict) -> EnsembleConfig:
         tie_break=job.get("tie_break") or "micro_clusters",
         signal_noise=job.get("signal_noise") or "label",
         shadow_size=int(job.get("shadow_size") or 0),
+        # absent: a job planned before 2026-11-08, which scored the sequential labels
+        score_partition=job.get("score_partition") or "sequential",
     )
 
 
@@ -396,7 +401,9 @@ def run_ensemble(
         lam = C.lambda_for(n_windows_total, half_life_frac)
     cfg = EnsembleConfig(**{**cfg.__dict__, "lam": lam})
 
-    base = {"algo": algo, "fold": fold, "seed": seed, "arm": arm, "config_id": config_id, **(seed_fields or {})}
+    base = {"algo": algo, "fold": fold, "seed": seed, "arm": arm, "config_id": config_id, **(seed_fields or {}),
+            #: The partition every ``*_win`` external reading reads (``WindowOutcome.ari_basis``).
+            "ari_basis": "snapshot_pre" if cfg.score_partition == "snapshot" else "sequential"}
     ensemble: ConfStreamEnsemble | None = None
     calibration: list[WindowBuffer] = []
     s_online = 0.0
@@ -638,7 +645,6 @@ def run_ensemble(
     tail = [r for r in lag_rows if r["window"] >= tail_from]
     inc_runtime = sum(r["runtime_s"] for r in window_rows)
     ens_runtime = sum(r["ensemble_runtime_s"] for r in window_rows)
-    lag_cum = batch_external(lag_y, lag_pred, tuple(m for m in cfg.external_metrics if m not in C.CMM_METRICS))
     summary = {
         "kind": "run", **base, "status": "ok",
         "n_samples": n_seen, "n_samples_cap": n_samples, "h": h, "n_windows": len(window_rows),
@@ -658,6 +664,10 @@ def run_ensemble(
         "score_mean": _mean("score"), "score_median": _median("score"),
         "lag_score_mean": _mean("lag_score"), "lag_score_median": _median("lag_score"),
         "lag_ari_win_mean": _mean("lag_ari_win"), "lag_ari_win_median": _median("lag_ari_win"),
+        #: Under the snapshot rule ``lag_ari_win`` reads the lagged incumbent's snapshot; these keep the
+        #: sequential reading of the same windows beside it (None under the sequential rule).
+        "lag_seq_ari_win_mean": _mean("lag_seq_ari_win"), "lag_seq_ari_win_tail_mean": _mean("lag_seq_ari_win", tail),
+        "lag_seq_nmi_win_mean": _mean("lag_seq_nmi_win"),
         "lag_nmi_win_mean": _mean("lag_nmi_win"), "lag_purity_win_mean": _mean("lag_purity_win"),
         "lag_cmm_win_mean": _mean("lag_cmm_win"), "lag_cmm_win_tail_mean": _mean("lag_cmm_win", tail),
         "lag_cmm_strict_win_mean": _mean("lag_cmm_strict_win"),
@@ -686,7 +696,6 @@ def run_ensemble(
         "lag_table_a_first_error": next(
             (r["lag_table_a_error"] for r in lag_rows if r.get("lag_table_a_error") is not None), None
         ),
-        **{f"lag_{k}_cumulative": v for k, v in lag_cum.items()},
         "lag_n_scored": len(lag_y),
         #: Windows behind the lagged means: a window with one true class has no reading.
         "lag_ari_n_windows": sum(1 for r in window_rows if r.get("lag_ari_win") is not None),
@@ -712,6 +721,7 @@ def run_ensemble(
         ),
         "sampler": cfg.sampler,
         "selection_signal": cfg.selection_signal,
+        "score_partition": cfg.score_partition,
         "log_signals": list(cfg.log_signals),
         #: Seconds spent on the signals beyond the silhouette, the cost of logging or selecting by them.
         "signals_runtime_s": float(sum(r["signals_runtime_s"] for r in window_rows)),
@@ -1149,11 +1159,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--log-predictions", action="store_true",
                         help=f"E1: write every member's per-point predictions on every window to <out-dir>/{PREDICTIONS_DIR}/, "
                              "one file per job (large: about members x samples integers per job)")
-    parser.add_argument("--snapshot-eval", action="store_true",
-                        help="also score, for the lagged incumbent of every window, the coherent partitions of one "
-                             "model state: the model at the start of the window (out of sample) and once it has "
-                             "learned it (lag_snap_pre_*, lag_snap_post_*, beside lag_snap_seq_*); log-only, the "
-                             "tuner's decisions do not change")
+    parser.add_argument("--score-partition", default=C.SCORE_PARTITION, choices=SCORE_PARTITIONS,
+                        help="the partition every member's selection score reads: snapshot (the default, the paper's: "
+                             "the clustering the member holds once it has learned the window, every point labelled "
+                             "by that one state) or sequential (its predict-before-learn labels, the rule of the runs "
+                             "made before 2026-11-08, e.g. out/full)")
+    parser.add_argument("--snapshot-eval", action=argparse.BooleanOptionalAction, default=True,
+                        help="score, for the lagged incumbent of every window, the coherent partitions of one model "
+                             "state: the model at the start of the window (out of sample) and once it has learned it "
+                             "(lag_snap_pre_*, lag_snap_post_*, beside lag_snap_seq_*); log-only, the tuner's "
+                             "decisions do not change (on by default; --no-snapshot-eval leaves it out)")
     parser.add_argument("--pin", action="append", default=[], metavar="ALGO.PARAM=VALUE",
                         help="E9: set a constructor parameter of one algorithm on every member (repeatable), e.g. "
                              "HPStream.n_samples_init=2000 or BIRCH.n_macro_clusters=8; VALUE is read as JSON when it "
@@ -1266,6 +1281,7 @@ def plan_jobs(args: argparse.Namespace) -> tuple[list[dict], list[tuple[dict, di
             job["prefix_scaling"] = prefix_scaling
         if getattr(args, "snapshot_eval", False):
             job["snapshot_eval"] = True
+        job["score_partition"] = getattr(args, "score_partition", None) or C.SCORE_PARTITION
         if pins.get(algo):
             job["pins"] = dict(pins[algo])
         if arm == "scaled_default" and not distance_params(algo):

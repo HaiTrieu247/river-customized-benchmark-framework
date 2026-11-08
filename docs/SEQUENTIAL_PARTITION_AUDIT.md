@@ -369,3 +369,31 @@ PYTHONHASHSEED=0 OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 \
   .venv/bin/python -m conf_pipeline.identity_audit --out result/identity_audit_folds_w3 --scenarios "" \
   --folds <các fold> --fold-windows 3 --configs default,scaled_default --workers 16
 ```
+
+### 7.7 Tín hiệu chọn của bộ tune giờ đọc snapshot cuối cửa sổ (08/11/2026)
+
+Bài confStream (Carnein và cộng sự, mục 3) huấn luyện ensemble trên các điểm của cửa sổ rồi mới chấm
+chất lượng gom cụm của từng cấu hình; bản MOA chấm trên micro-cluster cuối cửa sổ. Bài không bàn tới danh
+tính nhãn, vì cách chấm đó không đọc nhãn tuần tự. Việc chấm silhouette trên nhãn tuần tự là lựa chọn riêng
+của repo, và mục 7 cho thấy nó làm điểm chấm phụ thuộc cách đặt tên của mô hình. Từ ngày này
+`EnsembleConfig.score_partition` mặc định là `snapshot`: score, `silhouette_raw`, `silhouette_reason`,
+`support_sha` và các tín hiệu chẩn đoán theo member đọc phân hoạch của mô hình sau khi đã học cửa sổ
+(`snapshot_labels`, DenStream của River được khôi phục trước mỗi điểm). Silhouette tuần tự vẫn được ghi
+cạnh đó (`seq_silhouette`, `seq_silhouette_reason`), cùng các số đo ngoài của snapshot cho từng member
+(`snap_ari_win`, `snap_nmi_win`, `snap_purity_win`, chỉ để báo cáo). Hai chỗ còn khác MOA, do API của River:
+mọi điểm đều có nhãn của `predict_one` (MOA bỏ điểm nằm ngoài bán kính mọi micro-cluster), và silhouette
+nằm trên [−1, 1] thay vì được co về [0, 1]. Quy tắc cũ là `--score-partition sequential`; một job thiếu
+trường này (lập kế hoạch trước ngày này) được đọc là `sequential`, và manifest phân biệt hai quy tắc, nên
+một out dir cũ không bị chạy tiếp bằng quy tắc mới.
+
+**Số chính của báo cáo cũng đổi theo.** Dưới quy tắc `snapshot`, mỗi member còn được gán lại cả cửa sổ bằng
+trạng thái nó có khi cửa sổ bắt đầu, và các số đo ngoài `ari_win`, `nmi_win`, `purity_win`, `cmm_win` của nó
+đọc phân hoạch đó (ngoài mẫu, một trạng thái). Vì vậy `lag_ari_win` của dòng cửa sổ là ARI của snapshot đầu
+cửa sổ của incumbent trễ, trùng với `lag_snap_pre_ari_win`, và mọi bảng của `report`, `robustness`,
+`followup`, `selection`, mọi lựa chọn oracle của `sweep` (cờ `--score-partition` của nó mặc định cũng là
+`snapshot`) đọc con số này mà không cần đổi gì. Số tuần tự vẫn được ghi cạnh đó dưới tên `seq_<metric>_win`,
+`lag_seq_<metric>_win` và `lag_seq_ari_win_mean`, với nghĩa chất lượng gán trực tuyến ở mục 7.4; riêng CMM chỉ
+được tính trên phân hoạch chính. Mỗi dòng mang `ari_basis` (`snapshot_pre` hoặc `sequential`; dòng cũ không có
+trường này được đọc là `sequential`), và `report.current_runs` từ chối một out dir trộn hai cơ sở. Số gộp cả
+luồng `lag_<metric>_cumulative` đã bị bỏ khỏi dòng tóm tắt và khỏi báo cáo: nó ghép nhãn của mọi cửa sổ và mọi
+incumbent, vốn không gọi tên chung cụm nào.

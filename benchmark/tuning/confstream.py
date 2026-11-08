@@ -4,7 +4,15 @@ An ensemble of ``e_size`` configurations of the same clusterer runs over the
 stream in lock-step, one window at a time. After every window:
 
 1. every member -- active and on test -- is scored on the window it has just
-   processed, with the batch silhouette over its own predictions;
+   processed, with the batch silhouette of the clustering it holds once it has
+   learned that window (``score_partition="snapshot"``, the paper's "after every
+   window, we evaluate the clustering quality for every configuration"): every
+   point of the window labelled by that one model state. The window's external readings
+   (``ari_win`` and the others, never selected by) read the member's snapshot as it stood
+   when the window began, out of sample. ``"sequential"`` scores
+   the member's predict-before-learn labels instead, and reads them, the rule of the runs made
+   before 2026-11-08, under which one label can name different clusters within the
+   window (``docs/SEQUENTIAL_PARTITION_AUDIT.md``);
 2. the members on test (created after the previous window and trained on this
    one alongside the active set) are resolved: each is matched against a
    victim drawn from the active set by inverse fitness and replaces it only if
@@ -16,6 +24,12 @@ stream in lock-step, one window at a time. After every window:
    active scores (shifted so the worst still has a chance), a child by the
    sampler in :mod:`benchmark.tuning.space`, a fresh model instance for it,
    warm-started on the window just processed.
+
+How a snapshot is read differs from the paper's MOA code in two ways the River API
+imposes: every point gets the label ``predict_one`` gives it (MOA counts a point in a
+micro-cluster only inside its radius and leaves the others out), and the silhouette is
+the classic one on [-1, 1] (MOA's is rescaled to [0, 1]). The rescaling cannot change which
+member ranks first; leaving points out can.
 
 Two departures from the paper, both deliberate. A child is always a fresh
 instance replayed on the last window, whatever its parameters: River models
@@ -69,6 +83,7 @@ CMM_VARIANTS: dict[str, dict] = {
 }
 from ..evaluation.runner import run_once
 from . import signals as SIG
+from .cluster_identity import snapshot_labels
 from .space import ParamSpace, SamplerState, SpaceContext
 from .window import (UNDEFINED_SCORE, WindowBuffer, external_support, silhouette_status, silhouette_support,
                      support_fingerprint, warm_start)
@@ -96,6 +111,11 @@ TIE_BREAKS = ("micro_clusters", "runtime")
 #: silhouette's gate, a member without a partition staying undefined, which isolates the signal
 #: from that gate. The silhouette is still logged (``sig_silhouette``).
 ORACLE_SIGNALS: dict[str, bool] = {"ari_oracle": False, "ari_oracle_constrained": True}
+#: Which partition of a window the selection score reads (``EnsembleConfig.score_partition``):
+#: ``"snapshot"``, every point labelled by the model once it has learned the window (the paper's
+#: evaluation, and River's DenStream restored before every point, RIVER_BUGS.md BUG-7), or
+#: ``"sequential"``, the predict-before-learn labels.
+SCORE_PARTITIONS: tuple[str, ...] = ("snapshot", "sequential")
 #: What a member's selection score rests on, after the caps (``WindowOutcome.score_status``):
 #: ``valid`` (a partition with a silhouette, within every cap, and a reading of the selection
 #: signal), ``member_error`` (the model raised), ``infeasible_<cap>`` (memory, micro_clusters,
@@ -181,6 +201,9 @@ class EnsembleConfig:
     tie_break: str = "micro_clusters"
     #: True classes a window needs for the oracle signals to read it (``ORACLE_SIGNALS``).
     min_true_classes: int = 2
+    #: ``SCORE_PARTITIONS``: the partition the selection signal reads. Members still predict every
+    #: point before learning it either way (the lagged ARI and the prediction logs read those labels).
+    score_partition: str = "snapshot"
     #: How the label-free signals read a model's sentinel labels (DenStream's -1):
     #: ``signals.NOISE_POLICIES``. ``"label"``, the default, reads them as one more cluster, as
     #: the tuner's own silhouette always does; the score the tuner selects by is not changed.
@@ -217,6 +240,8 @@ class EnsembleConfig:
                              "to renew a whole portfolio")
         if self.shadow_size < 0:
             raise ValueError(f"shadow_size must be >= 0, got {self.shadow_size}")
+        if self.score_partition not in SCORE_PARTITIONS:
+            raise ValueError(f"score_partition must be one of {SCORE_PARTITIONS}, got {self.score_partition!r}")
 
     @property
     def signals_needed(self) -> tuple[str, ...]:
@@ -298,9 +323,22 @@ class WindowOutcome:
     #: ``SCORE_STATUSES``: what the selection score rests on, set once the caps are applied.
     score_status: str | None = None
     #: Readings of the end-of-window snapshot (the window predicted again by a copy of the model
-    #: once it has learned it), computed only when ``stability`` is asked for; diagnostics, never
-    #: selected by. Keys ``snap_*``.
+    #: once it has learned it), computed when the score reads it (``score_partition="snapshot"``) or
+    #: when ``stability`` is asked for. Keys ``snap_*``; ``snap_<metric>_win`` are the external metrics
+    #: of the snapshot, read only for reporting.
     snapshot: dict = field(default_factory=dict)
+    #: ``SCORE_PARTITIONS``: the partition ``score`` and the ``silhouette_*`` and support fields read.
+    score_partition: str = "sequential"
+    #: The partition ``window_metrics`` (the ``*_win`` external readings) read: ``"snapshot_pre"``, every
+    #: point labelled by the model as it stood when the window began (under the snapshot rule), or
+    #: ``"sequential"``, the predict-before-learn labels. ``seq_window_metrics`` keeps the sequential
+    #: readings beside the snapshot ones (CMM aside, read on the primary partition only).
+    ari_basis: str = "sequential"
+    seq_window_metrics: dict = field(default_factory=dict)
+    #: The classic silhouette of the sequential partition and its reason, kept beside the score when
+    #: the score reads the snapshot.
+    seq_silhouette: float | None = None
+    seq_silhouette_reason: str | None = None
     #: A diagnostic reading that failed (its message); the member and the selection go on.
     diag_error: str | None = None
     #: The frozen portfolio's configuration this member runs (``freeze_mode="portfolio"``), else None.
@@ -350,6 +388,12 @@ class WindowOutcome:
             "external_support_sha": self.external_support_sha,
             "max_label_share": round(self.max_label_share, 6) if self.max_label_share is not None else None,
             "score_status": self.score_status,
+            "score_partition": self.score_partition,
+            "ari_basis": self.ari_basis,
+            **{f"seq_{k}_win": v for k, v in self.seq_window_metrics.items()},
+            **({"seq_silhouette": round(self.seq_silhouette, 6) if self.seq_silhouette is not None else None,
+                "seq_silhouette_reason": self.seq_silhouette_reason}
+               if self.score_partition == "snapshot" else {}),
             **({"slot": self.slot} if self.slot is not None else {}),
             **({"is_shadow": True} if self.is_shadow else {}),
             **{f"{k}_win": v for k, v in self.window_metrics.items()},
@@ -582,6 +626,36 @@ def score_status(o: WindowOutcome) -> str:
     return "valid"
 
 
+def _snapshot_external(ys, labels, metrics, min_true_classes: int) -> dict:
+    """ARI, NMI and purity of one labelling of a window against its true classes, over the points
+    with both (None on a window with fewer than ``min_true_classes`` classes; CMM is scored apart)."""
+    from collections import Counter, defaultdict
+
+    from sklearn.metrics import adjusted_rand_score, normalized_mutual_info_score
+
+    names = tuple(m for m in metrics if m not in CMM_VARIANTS)
+    pairs = [(y, p) for y, p in zip(ys, labels) if y is not None and p is not None]
+    if len({y for y, _ in pairs}) < min_true_classes or not pairs:
+        return {m: None for m in names}
+    ids: dict = {}
+    t = [y for y, _ in pairs]
+    p = [ids.setdefault(v, len(ids)) for _, v in pairs]
+    out: dict = {}
+    for m in names:
+        if m == "ari":
+            out[m] = float(adjusted_rand_score(t, p))
+        elif m == "nmi":
+            out[m] = float(normalized_mutual_info_score(t, p))
+        elif m == "purity":
+            per: dict = defaultdict(Counter)
+            for a, b in zip(t, p):
+                per[b][a] += 1
+            out[m] = sum(max(c.values()) for c in per.values()) / len(t)
+        else:
+            out[m] = None
+    return out
+
+
 class _GlobalRandomState:
     """Python's and NumPy's global generators as they were on entry, restored on exit: a
     diagnostic reading can never move a draw anything else makes from them."""
@@ -707,12 +781,23 @@ class ConfStreamEnsemble:
         base = dict(
             member_id=m.id, window_index=window_index, params=dict(m.params),
             parent_id=m.parent_id, born_window=m.born_window, is_test=m in self.test,
-            slot=m.slot, is_shadow=any(s is m for s in self.shadow),
+            slot=m.slot, is_shadow=any(s is m for s in self.shadow), score_partition=self.cfg.score_partition,
         )
         if m.error is not None:
             return WindowOutcome(score=UNDEFINED_SCORE, defined=False, runtime_s=0.0,
                                  error=m.error, feasible=False, feasible_reason="error", **base)
         adapter = m.adapter
+        pre: list | None = None
+        if self.cfg.score_partition == "snapshot":
+            # the window as the model stood when it began: what the member hands a user on this window
+            t_pre = time.perf_counter()
+            try:
+                pre = self._repredict(adapter, buffer)
+            except Exception as exc:
+                m.error = f"snapshot: {type(exc).__name__}: {exc}"
+                return WindowOutcome(score=UNDEFINED_SCORE, defined=False, runtime_s=0.0,
+                                     error=m.error, feasible=False, feasible_reason="error", **base)
+            pre_s = time.perf_counter() - t_pre
         sent0, fb0 = adapter.n_sentinel_predictions, adapter.n_fallback_predictions
         preds: list = []
         try:
@@ -727,8 +812,18 @@ class ConfStreamEnsemble:
             return WindowOutcome(score=UNDEFINED_SCORE, defined=False, runtime_s=0.0,
                                  error=m.error, feasible=False, feasible_reason="error", **base)
         t_score = time.perf_counter()
-        sil = silhouette_status(buffer.xs, preds)
+        snap: list | None = None
+        if self.cfg.score_partition == "snapshot":
+            try:
+                snap = self._repredict(adapter, buffer)
+            except Exception as exc:
+                m.error = f"snapshot: {type(exc).__name__}: {exc}"
+                return WindowOutcome(score=UNDEFINED_SCORE, defined=False, runtime_s=0.0,
+                                     error=m.error, feasible=False, feasible_reason="error", **base)
+        scored = snap if snap is not None else preds
+        sil = silhouette_status(buffer.xs, scored)
         score, defined = sil.score, sil.defined
+        seq_sil = silhouette_status(buffer.xs, preds) if snap is not None else None
         scoring_s = time.perf_counter() - t_score
         win = res.windows[0] if res.windows else None
         outcome = WindowOutcome(
@@ -748,17 +843,31 @@ class ConfStreamEnsemble:
             n_points_scored=sil.n_points, n_none=sil.n_none, max_label_share=sil.max_label_share,
             **base,
         )
-        ext_mask = external_support(buffer.ys, preds)
+        primary = preds
+        if snap is not None:
+            outcome.seq_silhouette = seq_sil.score if seq_sil.defined else None
+            outcome.seq_silhouette_reason = seq_sil.reason
+            outcome.snapshot = self._snapshot_readings(preds, snap, buffer)
+        if pre is not None:
+            primary = pre
+            outcome.seq_window_metrics = dict(outcome.window_metrics)
+            outcome.window_metrics = _snapshot_external(buffer.ys, pre, self.cfg.external_metrics,
+                                                        self.cfg.min_true_classes)
+            outcome.ari_basis = "snapshot_pre"
+            outcome.snapshot.update(pre_n_pred_labels=len({p for p in pre if p is not None}),
+                                    pre_pred_sha=prediction_hash(pre))
+            outcome.scoring_runtime_s += pre_s
+        ext_mask = external_support(buffer.ys, primary)
         outcome.n_points_input = len(preds)
-        outcome.support_sha = support_fingerprint(silhouette_support(preds))
+        outcome.support_sha = support_fingerprint(silhouette_support(scored))
         outcome.n_points_external = sum(ext_mask)
         outcome.external_support_sha = support_fingerprint(ext_mask)
         if m.id == self._last_incumbent_id or self.keep_predictions:
             outcome.predictions = preds
         if cmm is not None:
-            cmm.score_into(outcome, preds, frozenset(sentinel_labels(adapter.model)))
+            cmm.score_into(outcome, primary, frozenset(sentinel_labels(adapter.model)))
         if self.cfg.selection_signal in ORACLE_SIGNALS:
-            ari = outcome.window_metrics.get("ari")
+            ari = (outcome.snapshot.get("snap_ari_win") if snap is not None else outcome.window_metrics.get("ari"))
             readable = ari is not None and (outcome.n_true_classes is None
                                             or outcome.n_true_classes >= self.cfg.min_true_classes)
             if ORACLE_SIGNALS[self.cfg.selection_signal]:
@@ -771,7 +880,7 @@ class ConfStreamEnsemble:
             selects = self.cfg.selection_signal != "silhouette" and self.cfg.selection_signal in SIG.SIGNALS
             with _GlobalRandomState():
                 try:
-                    outcome.signals = SIG.member_signals(window, preds, needed, **noise)
+                    outcome.signals = SIG.member_signals(window, scored, needed, **noise)
                 except Exception as exc:
                     if selects:
                         raise
@@ -780,7 +889,7 @@ class ConfStreamEnsemble:
                 if "silhouette" in self.cfg.log_signals:
                     outcome.signals["silhouette"] = score if defined else None
                 if "stability" in self.cfg.signals_needed:
-                    self._snapshot_into(outcome, adapter, buffer, preds, noise, selects)
+                    self._snapshot_into(outcome, adapter, buffer, preds, noise, selects, snap)
             outcome.signals_runtime_s = time.perf_counter() - t0
             sel = self.cfg.selection_signal
             if sel != "silhouette" and sel in SIG.PER_MEMBER + SIG.MODEL_SIGNALS:
@@ -795,27 +904,10 @@ class ConfStreamEnsemble:
             m.outcome_override = None
         return outcome
 
-    def _snapshot_into(self, outcome: WindowOutcome, adapter: ClustererAdapter, buffer: WindowBuffer,
-                       preds: list, noise: dict, selects: bool) -> None:
-        """``stability`` and the snapshot's readings, from ONE prediction pass of a copy of the
-        model at the end of the window (``_repredict``). The snapshot's silhouette is the same
-        classic silhouette as the score, on the snapshot's labels (``snap_silhouette``,
-        ``snap_silhouette_defined``, ``snap_silhouette_reason``); ``snap_label_agreement`` is the
-        share of points both predictions labelled with the same raw label (a renaming lowers it
-        and leaves ``stability``, an ARI, at 1). Never selected by. A failure is recorded in
-        ``diag_error``; it is raised only when the tuner selects by ``stability`` itself."""
-        try:
-            again = self._repredict(adapter, buffer)
-            outcome.signals["stability"] = SIG.stability(preds, again, **noise)
-        except Exception as exc:
-            if selects and self.cfg.selection_signal == "stability":
-                raise
-            outcome.signals["stability"] = None
-            outcome.diag_error = f"stability: {type(exc).__name__}: {exc}"
-            outcome.snapshot = {"snap_silhouette": None, "snap_silhouette_defined": None,
-                                "snap_silhouette_reason": None, "snap_n_pred_labels": None,
-                                "snap_pred_sha": None, "snap_label_agreement": None}
-            return
+    def _snapshot_readings(self, preds: list, again: list, buffer: WindowBuffer) -> dict:
+        """The ``snap_*`` readings of an end-of-window snapshot ``again`` beside the sequential ``preds``:
+        its number of labels, hash, raw-label agreement with ``preds``, classic silhouette and, for
+        reporting only, its external metrics on the window (None on a window with too few classes)."""
         both = [(a, b) for a, b in zip(preds, again) if a is not None and b is not None]
         snap = {"snap_n_pred_labels": len({b for b in again if b is not None}),
                 "snap_pred_sha": prediction_hash(again),
@@ -824,22 +916,49 @@ class ConfStreamEnsemble:
             st = silhouette_status(buffer.xs, again)
             snap.update(snap_silhouette=round(st.score, 6) if st.defined else None,
                         snap_silhouette_defined=st.defined, snap_silhouette_reason=st.reason)
-        except Exception as exc:
+        except Exception:
             snap.update(snap_silhouette=None, snap_silhouette_defined=None, snap_silhouette_reason="scoring_error")
-            outcome.diag_error = f"snapshot silhouette: {type(exc).__name__}: {exc}"
-        outcome.snapshot = snap
+        snap.update({f"snap_{k}_win": v for k, v in _snapshot_external(buffer.ys, again,
+                                                                      self.cfg.external_metrics,
+                                                                      self.cfg.min_true_classes).items()})
+        return snap
+
+    def _snapshot_into(self, outcome: WindowOutcome, adapter: ClustererAdapter, buffer: WindowBuffer,
+                       preds: list, noise: dict, selects: bool, again: list | None = None) -> None:
+        """``stability`` and the snapshot's readings, from ONE prediction pass of a copy of the
+        model at the end of the window (``_repredict``). The snapshot's silhouette is the same
+        classic silhouette as the score, on the snapshot's labels (``snap_silhouette``,
+        ``snap_silhouette_defined``, ``snap_silhouette_reason``); ``snap_label_agreement`` is the
+        share of points both predictions labelled with the same raw label (a renaming lowers it
+        and leaves ``stability``, an ARI, at 1). Never selected by. A failure is recorded in
+        ``diag_error``; it is raised only when the tuner selects by ``stability`` itself."""
+        try:
+            if again is None:
+                again = self._repredict(adapter, buffer)
+            outcome.signals["stability"] = SIG.stability(preds, again, **noise)
+        except Exception as exc:
+            if selects and self.cfg.selection_signal == "stability":
+                raise
+            outcome.signals["stability"] = None
+            outcome.diag_error = f"stability: {type(exc).__name__}: {exc}"
+            if not outcome.snapshot:
+                outcome.snapshot = {"snap_silhouette": None, "snap_silhouette_defined": None,
+                                    "snap_silhouette_reason": None, "snap_n_pred_labels": None,
+                                    "snap_pred_sha": None, "snap_label_agreement": None}
+            return
+        if not outcome.snapshot:
+            outcome.snapshot = self._snapshot_readings(preds, again, buffer)
+            if outcome.snapshot.get("snap_silhouette_reason") == "scoring_error":
+                outcome.diag_error = "snapshot silhouette: scoring_error"
 
     @staticmethod
     def _repredict(adapter: ClustererAdapter, buffer: WindowBuffer) -> list:
-        """The window predicted again by a copy of a model that has just learned it. A copy,
-        because a prediction may change a model (RIVER_BUGS.md BUG-7), and every point is
-        handed over as a copy of its own (BUG-3)."""
-        probe = copy.deepcopy(adapter)
-        out = []
-        for x in buffer.xs:
-            x = dict(x)
-            out.append(probe.predict_one(probe.scaler.transform_one(x) if probe.scaler is not None else x))
-        return out
+        """The window predicted again by a copy of a model that has just learned it
+        (``cluster_identity.snapshot_labels``): the adapter is never touched, River's DenStream is
+        restored before every point (a prediction changes it, RIVER_BUGS.md BUG-7), and every point
+        is handed over as a copy of its own (BUG-3)."""
+        with _GlobalRandomState():
+            return snapshot_labels(adapter, buffer.xs)
 
     def replay(self, buffer: WindowBuffer) -> int:
         """Warm-start every active member on ``buffer`` (no scoring)."""

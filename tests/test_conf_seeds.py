@@ -27,7 +27,8 @@ GOLDEN = json.loads((REPO / "tests" / "fixtures" / "seed_shared_golden.json").re
 def _run(algo, arm, seed=7, log=None, dataset=None, **kw):
     ds = dataset if dataset is not None else make_scenario("static_easy", n_samples=1500, n_features=2,
                                                            n_clusters=3, seed=3)
-    cfg = EnsembleConfig(e_size=4, e_test=2, lam=0.1, p_reset=0.0, runtime_factor=None)
+    # the golden rows were recorded under the sequential rule, the only one before 2026-11-08
+    cfg = EnsembleConfig(e_size=4, e_test=2, lam=0.1, p_reset=0.0, runtime_factor=None, score_partition="sequential")
     return run.run_ensemble(algo=algo, space=SPACES[algo], start=[start_params(algo, 300)], dataset=ds,
                             fold="toy", seed=seed, arm=arm, cfg=cfg, h=300, n_samples=kw.pop("n_samples", 1500),
                             member_log=log, **kw)

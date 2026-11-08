@@ -281,7 +281,8 @@ def test_run_ensemble_scores_every_window_after_the_calibration_one():
     assert summary["status"] == "ok" and summary["n_windows"] == 4
     assert summary["s_online"] > 0 and summary["n_calibration_windows"] == 1
     assert summary["lam"] == pytest.approx(1 / max(1, round(0.1 * 5)))
-    assert 0.0 <= summary["lag_ari_cumulative"] <= 1.0
+    assert not any(k.endswith("_cumulative") for k in summary)       # no whole-stream reading
+    assert summary["ari_basis"] == "snapshot_pre" and summary["lag_seq_ari_win_mean"] is not None
     assert summary["arm"] == "confstream" and summary["algo"] == "KMeans"
     assert summary["start_params"] == {"n_clusters": 2, "halflife": 0.5}
 
@@ -1032,16 +1033,19 @@ def test_the_lifecycle_log_lies_beside_the_member_log_and_the_summary_counts_bir
     assert s["n_member_evaluations"] == len(members) == sum(s["member_status_counts"].values())
     assert [e["window"] for e in events if e["event"] == "decision"] == [1, 2, 3, 4]
     assert s["tie_break_rule"] == ["score", "usable", "micro_clusters", "incumbent", "member_id"]
-    for k in ("n_member_windows_sentinel", "n_member_windows_fallback", "n_member_windows_snapshot",
+    for k in ("n_member_windows_sentinel", "n_member_windows_fallback",
               "n_member_windows_stability", "n_member_windows_diag_error"):
         assert s[k] == 0
+    # every member-window is scored on its end-of-window snapshot, so every one has a snapshot reading
+    assert s["n_member_windows_snapshot"] == s["n_member_evaluations"]
     assert all(m["score_status"] in ("valid", "undefined_single_label", "undefined_one_label_per_point") for m in members)
 
 
 def test_stability_logging_counts_the_snapshot_readings_and_moves_nothing(tmp_path):
     def cfg_run(signals):
         ds = make_scenario("static_easy", n_samples=1500, n_features=2, n_clusters=3, seed=3)
-        cfg = EnsembleConfig(e_size=3, e_test=1, lam=0.1, p_reset=0.0, runtime_factor=None, log_signals=signals)
+        cfg = EnsembleConfig(e_size=3, e_test=1, lam=0.1, p_reset=0.0, runtime_factor=None, log_signals=signals,
+                             score_partition="sequential")
         return run_ensemble(algo="KMeans", space=TOY, start=[{"n_clusters": 2, "halflife": 0.5}], dataset=ds,
                             fold="toy", seed=1, arm="confstream", cfg=cfg, h=300, n_samples=1500)
     off, on = cfg_run(()), cfg_run(("stability",))

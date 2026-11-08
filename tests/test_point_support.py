@@ -74,7 +74,9 @@ def _member_outcome(script, ys, drop_sentinel=False):
         return ad
 
     ens = ConfStreamEnsemble(space=SPACE, ctx=SpaceContext(s=1.0, d=2), make_adapter=make,
-                             start_params=[{"n_clusters": 2}], config=EnsembleConfig(e_size=1, e_test=0),
+                             start_params=[{"n_clusters": 2}],
+                             # the support of the sequential labels is what this reads
+                             config=EnsembleConfig(e_size=1, e_test=0, score_partition="sequential"),
                              rng=np.random.default_rng(0), seed=0)
     buf = WindowBuffer(len(ys))
     for i, y in enumerate(ys):

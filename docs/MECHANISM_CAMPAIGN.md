@@ -16,10 +16,17 @@ manifest ghi lần mở rộng vào lịch sử và giữ nguyên các kiểm tr
 
 ## 1. Protocol
 
-**Tín hiệu chọn.** Mỗi member gán nhãn từng điểm theo predict-before-learn. Cuối cửa sổ t, silhouette
-cổ điển được tính trên các nhãn tuần tự đó, và incumbent chọn tại t chỉ được chấm ARI ở cửa sổ t+1
-(`lag_ari_win`). Incumbent có thể giữ nguyên hay đổi giữa các cửa sổ. `stability` và silhouette của
-snapshot cuối cửa sổ được ghi như chẩn đoán và không bao giờ vào phép chọn.
+**Tín hiệu chọn (đổi ngày 08/11/2026).** Mỗi member vẫn gán nhãn từng điểm theo predict-before-learn
+trong lúc học cửa sổ t. Cuối cửa sổ, silhouette cổ điển được tính trên cụm mà member có sau khi đã học
+xong cửa sổ: mọi điểm của cửa sổ được gán bởi đúng trạng thái đó (`score_partition = snapshot`), như bài
+confStream ("after every window, we evaluate the clustering quality for every configuration"). Trước
+ngày này, silhouette được tính trên chính các nhãn tuần tự; quy tắc đó còn chạy được bằng
+`run --score-partition sequential` (để tái lập `out/full`) và không trộn được với quy tắc mới trong một
+out dir, vì manifest ghi nó trong cấu hình của arm. Incumbent chọn tại t chỉ được chấm ARI ở cửa sổ t+1:
+`lag_ari_win` là ARI của snapshot của incumbent khi cửa sổ t+1 bắt đầu (một trạng thái, ngoài mẫu;
+`ari_basis = snapshot_pre`), `lag_seq_ari_win` là ARI trên nhãn tuần tự của cùng cửa sổ
+(`docs/SEQUENTIAL_PARTITION_AUDIT.md` mục 7.7). Không có số gộp cả luồng. Incumbent có thể giữ nguyên
+hay đổi giữa các cửa sổ. `stability` được ghi như chẩn đoán và không bao giờ vào phép chọn.
 
 **Giá trị khóa.** Các giá trị dưới đây được đọc từ hằng số của repo (`conf_pipeline/_common.py`);
 `campaign.check_config` từ chối một cấu hình lệch khỏi chúng, nên chiến dịch không tự chỉnh protocol.
