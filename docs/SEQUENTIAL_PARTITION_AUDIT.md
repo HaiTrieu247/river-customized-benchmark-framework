@@ -234,3 +234,138 @@ bằng chứng xác nhận paper. Không thuật toán nào bị bỏ khỏi thi
 Với HPStream điều kiện đã được gỡ: người dùng quyết định 04/11 đọc nó qua `HPStreamStableLabels`, chạy thay
 nó trong chiến dịch, nên còn bốn thuật toán `open`. Với bốn thuật toán đó, một quy tắc đặt tên do người dùng chọn,
 đăng ký thành biến thể và có test, hoặc báo cáo kèm giới hạn.
+
+## 7. Vòng thứ ba (08/11/2026): danh tính cụm theo sự kiện, so sánh được theo độ trễ, đánh giá snapshot
+
+Hai vòng trước đếm renaming và handoff giữa các lần dò trên luồng của protocol, và `fidelity` đã có các
+kịch bản birth, deletion, merge, split, identity_stress với sự kiện biết trước. Còn thiếu bốn điều: hành vi
+của nhãn được tách theo loại thay đổi của mô hình; một phép thử trực tiếp xem hai dự đoán cũ trong cùng cửa sổ
+có so sánh được với nhau không; một phép đánh giá riêng cho phân hoạch mạch lạc mà một trạng thái mô hình tạo
+ra; và một định nghĩa rõ cho chất lượng gán tuần tự cùng một cách giữ danh tính cụm không đọc nhãn đánh giá.
+Phần lõi nằm ở `benchmark/tuning/cluster_identity.py`, driver ở `conf_pipeline/identity_audit.py`, phần trong
+pipeline là cờ `run --snapshot-eval`. Không có quyết định nào của bộ tune đổi theo các phép đọc này.
+
+### 7.1 Bốn phân hoạch của một cửa sổ
+
+Với một member chạy predict-before-learn trên cửa sổ t, audit đọc bốn phân hoạch trên cùng các điểm:
+
+- `seq`: nhãn tuần tự mà silhouette của bộ tune và `lag_ari_win` đọc; điểm i được gán bởi mô hình đã học
+  xong các điểm 0..i-1.
+- `tracked`: cùng các dự đoán đó, nhưng mỗi nhãn thô được thay bằng danh tính mà `IdentityTracker` mang theo
+  (mục 7.4).
+- `pre`: mọi điểm của cửa sổ được gán bởi đúng một trạng thái, trạng thái của mô hình khi cửa sổ bắt đầu. Đây
+  là phân hoạch ngoài mẫu: mô hình chưa học điểm nào của cửa sổ.
+- `post`: mọi điểm được gán bởi trạng thái sau khi mô hình đã học xong cửa sổ, tức phân hoạch trong mẫu.
+
+`pre` và `post` không thể dùng lại nhãn vì chúng đến từ một trạng thái. Với DenStream của River, `predict_one`
+ghi vào trạng thái (BUG-7), nên `snapshot_labels` khôi phục trạng thái trước mỗi điểm (`PREDICT_MUTATES`);
+như vậy snapshot của DenStream giờ đúng là phân hoạch của một trạng thái, khác với snapshot ở mục 2.
+
+### 7.2 Chuyển tiếp giữa hai lần dò và nguyên nhân của nó
+
+Cứ `probe_every` điểm, audit gán lại cả cửa sổ bằng mô hình hiện tại và đọc chuyển tiếp từ lần dò trước theo
+cách phân loại của MONIC (Spiliopoulou và cộng sự, KDD 2006). Một cụm trước *tách* khi ít nhất hai cụm sau mỗi
+cụm giữ ít nhất `tau_split` điểm của nó và được tạo phần lớn (`tau`) từ nó; nếu không, nó *sống sót* vào cụm sau
+giữ ít nhất `tau` điểm của nó, hoặc bị *hấp thụ* vào cụm đó khi một cụm trước khác cũng dồn `tau` điểm vào đấy;
+còn lại là *biến mất*. Cụm sau không cụm trước nào dẫn tới là cụm *mới*. Mỗi cụm trước trao danh tính cho đúng một
+người thừa kế. Kết cục của nhãn được đọc trên các cụm sau: *giữ nhãn* khi nhãn của nó là nhãn của một người nó
+thừa kế, *đổi tên* khi nó có người thừa kế nhưng mang nhãn khác, và một nhãn có mặt ở cả hai lần mà cụm sau
+mang nó không hậu duệ của cụm trước mang nó là nhãn *bị dùng lại*. Dưới một nhãn bị dùng lại, phân hoạch tuần
+tự ghép hai cụm mà mô hình tách riêng ở cả hai thời điểm.
+
+Mỗi khoảng dò có một `cause`: `rename_only` khi phân hoạch không đổi mà nhãn đổi (macro-cluster được dựng lại
+và đánh số khác), `structural_micro` khi phân hoạch đổi và có micro-cluster sinh ra hay mất đi (đọc theo danh
+tính đối tượng, `micro_objects`), `structural_macro_only` khi phân hoạch đổi mà các micro-cluster vẫn là những
+đối tượng cũ, và `structural_unattributed` khi mô hình không cho đọc micro-cluster (STREAMKMeans). Trên kịch bản
+của `fidelity`, mỗi khoảng dò còn mang các sự kiện thật nằm trong nó, nên bảng 1b cho biết điều gì xảy ra với
+nhãn đúng lúc có birth, deletion, merge hay split.
+
+Ở thuật toán có danh tính bền (SOStream, RepStream, STREAMKMeans, HPStreamStableLabels), một cụm dịch chuyển
+trọn sang các điểm khác giữa hai lần dò cũng được đọc là nhãn bị dùng lại, nên với chúng con số này là cận trên.
+
+### 7.3 Các dự đoán cũ trong một cửa sổ có so sánh được với nhau không
+
+`pair_consistency` xét mọi cặp i < j của cửa sổ, chia theo độ trễ j − i (mặc định các khoảng [1, 10), [10,
+100), [100, 1000), [1000, ∞)). Với một phân hoạch tham chiếu, *precision* là tỉ lệ các cặp cùng nhãn tuần tự mà
+tham chiếu cũng đặt chung một cụm, *recall* là tỉ lệ các cặp tham chiếu đặt chung mà cũng cùng nhãn tuần tự.
+Nếu một nhãn gọi tên cùng một cụm suốt cửa sổ thì cả hai đường phẳng theo độ trễ. Nhãn bị dùng lại kéo
+precision xuống ở độ trễ dài, cụm bị đổi tên kéo recall xuống ở độ trễ dài. Audit đọc `seq` và `tracked` so với
+`post` và so với lớp thật, và đọc `pre`, `post` so với lớp thật làm đối chứng: một phân hoạch của một trạng thái
+không có lý do gì để suy giảm theo độ trễ, trừ khi chính các lớp thật dịch chuyển trong cửa sổ.
+
+### 7.4 Chất lượng gán tuần tự: nó đo gì, và cách giữ danh tính cụm không cần nhãn
+
+**Định nghĩa.** Chất lượng gán tuần tự của một cửa sổ (ARI hay silhouette của `seq`) đo mức khớp giữa các quyết
+định mà mô hình đưa ra trực tuyến, mỗi quyết định bởi trạng thái nó có lúc đó, với lớp thật (hay với hình học
+của dữ liệu), *với giả định rằng một nhãn thô gọi tên cùng một cụm từ điểm đầu đến điểm cuối cửa sổ*. Giả định
+này đúng với SOStream, RepStream, STREAMKMeans và HPStreamStableLabels, và sai với DenStream, BIRCH, DBSTREAM,
+CluStream và HPStream của River (mục 1 và 6). Khi giả định sai, con số trộn chất lượng gom cụm với cách mô hình
+đặt tên: đổi tên tách một cụm thành hai nhãn và hạ điểm, dùng lại nhãn ghép hai cụm và làm điểm lệch theo hướng
+không đoán trước được. Con số gộp cả run (`lag_ari_cumulative`, hay `cum_ari_seq` trong audit) còn ghép nhãn qua
+mọi cửa sổ, nên nó chịu cả những lần đánh số lại giữa các cửa sổ; với các chế độ tune trực tuyến nó còn ghép nhãn
+của những mô hình khác nhau sau mỗi lần đổi incumbent, và không cách giữ danh tính nào làm nó mạch lạc được.
+
+**Cách giữ danh tính không dùng nhãn đánh giá** (`IdentityTracker`). Mỗi danh tính giữ vài *điểm neo*, là những
+điểm gần nhất được gán cho nó (`anchors_per_id`, tổng tối đa `max_anchors`, ưu tiên danh tính được dùng gần
+nhất). Sau mỗi điểm mô hình học, các điểm neo được mô hình gán lại, và chuyển tiếp từ danh tính sang nhãn thô
+mới được đọc như mục 7.2. Một nhãn thô nhận danh tính của người thừa kế nó: trước hết là người thừa kế vốn đang
+mang chính nhãn thô này (không có bằng chứng nào cho thấy tên của mô hình đã thôi gọi cụm đó), nếu không có thì
+người thừa kế có nhiều điểm neo nhất ở đó, rồi đến danh tính cũ hơn. Cụm mới, và cụm con của một lần tách mà không
+phải người thừa kế, nhận danh tính mới. Danh tính bị hấp thụ mà không kế tục thì bị cho nghỉ và không bao giờ được
+trao lại. Một nhãn thô không xuất hiện trên điểm neo nào giữ danh tính cũ của nó, nếu danh tính đó chưa nghỉ và
+chưa thuộc về nhãn thô khác. Nhãn tracked của một điểm là danh tính mà nhãn thô của nó mang lúc điểm được dự đoán.
+
+Hai điểm i < j cùng một nhãn tracked nghĩa là: cụm chứa điểm i đã trao danh tính của nó, qua các lần sống sót,
+hấp thụ hay là cụm con kế tục, cho cụm chứa điểm j, như chính các dự đoán của mô hình trên điểm neo cho thấy. Nhãn
+tracked vì thế không đổi khi mô hình chỉ hoán vị tên (BIRCH, CluStream), nhận danh tính mới khi một tên cũ được
+trao cho cụm không liên quan (HPStream), và giữ danh tính của cụm lớn hơn khi hai cụm gộp. Tracker chỉ đọc dự đoán
+của mô hình trên các điểm của luồng; nó dự đoán trên mô hình đang chạy khi việc dự đoán không đổi được trạng thái,
+và trên một bản sao khôi phục khi có thể đổi, nên không bao giờ đổi điều mô hình dự đoán (test
+`test_tracking_and_probing_leave_every_protocol_model_predicting_as_it_would` trên cả mười mô hình).
+
+**Giới hạn đã biết.** (1) Một cụm dịch chuyển trọn sang vùng khác được đọc là vẫn danh tính đó, vì mô hình vẫn
+đặt các điểm neo cũ chung với điểm mới. (2) Một cụm không còn điểm neo nào (do trần `max_anchors`) giữ danh tính
+theo tên thô cho tới khi được thấy lại; với mô hình có hàng trăm nhãn (BIRCH với `threshold = 0`, RepStream) điều
+này xảy ra thường. (3) Ở mô hình có macro-cluster nhỏ sinh ra rồi mất đi liên tục (DBSTREAM ở mặc định), tracker
+tạo nhiều danh tính ngắn hạn: đó là đúng phân hoạch tạm thời của mô hình, nhưng nó hạ recall so với nhãn thô, vốn
+ghép các cụm tạm thời khác nhau dưới cùng một số. (4) `tau`, `tau_split`, `anchors_per_id`, `max_anchors` là giá
+trị chạy được, không phải khuyến nghị. Độ tin cậy của tracker được kiểm ở nơi biết đáp án chính xác: trên cùng
+một ô, HPStreamStableLabels là phân hoạch an toàn danh tính của chính mô hình HPStream, nên `validation.csv` so
+nhãn thô và nhãn tracked của HPStream với nó, và so nhãn tracked của biến thể với chính nó (một tracker hoàn hảo
+cho ARI 1 ở phép so sau).
+
+### 7.5 Đánh giá snapshot trong pipeline: `run --snapshot-eval`
+
+Với incumbent trễ của mỗi cửa sổ (member mà `lag_ari_win` đọc), cờ này ghi thêm vào dòng cửa sổ: `lag_snap_seq_*`
+(chính nhãn tuần tự đó, chấm bằng cùng một phép tính batch như hai snapshot), `lag_snap_pre_*` (mọi điểm gán bởi
+mô hình khi cửa sổ bắt đầu, ngoài mẫu) và `lag_snap_post_*` (sau khi đã học cửa sổ, trong mẫu). Với mỗi snapshot
+có ARI, NMI, purity, silhouette cổ điển, số nhãn và ARI so với nhãn tuần tự; dòng tóm tắt có trung bình và trung
+bình phần đuôi, cùng `snapshot_runtime_s`. Cửa sổ có ít hơn hai lớp thật không có số đo ngoài, như `lag_ari_win`.
+Cờ chỉ đọc bản sao của member, không đổi quyết định nào (test so từng cửa sổ với lần chạy không cờ), và không
+thuộc protocol trong manifest. `python -m conf_pipeline.identity_audit --read-run DIR` tóm tắt các trường này theo
+thuật toán, nhóm luồng và chế độ tune vào `DIR/report/snapshot_eval/`.
+
+Cách đọc đề xuất: `lag_snap_pre_ari_win` là chất lượng phân hoạch của mô hình mà người dùng nhận được ở đầu cửa sổ,
+không phụ thuộc cách mô hình đặt tên trong cửa sổ; `lag_ari_win` là chất lượng gán tuần tự theo định nghĩa ở mục
+7.4. Hai số lệch nhau nhiều ở một thuật toán đặt tên không bền là dấu hiệu con số tuần tự đang đo cách đặt tên.
+
+### 7.6 Lệnh và chi phí đo được (08/11/2026)
+
+Smoke trên Mac (Apple M3 Pro, 8 worker), 6 kịch bản × seed 1 × `default,scaled_default`, h = 500, 9 cửa sổ chấm:
+96 ô, không ô nào lỗi, 1 506 s wall, khoảng 8 150 s CPU cộng trên các ô. Riêng DenStream của River chiếm phần lớn:
+461 s ở `default` và 6 045 s ở `scaled_default` (ô dài nhất 1 328 s), vì snapshot phải khôi phục trạng thái
+trước mỗi điểm. Sau smoke, lần refresh của tracker trên mô hình loại này đổi sang một bản sao mỗi lần refresh,
+nên con số đó là cận trên. Chi phí trên luồng thật chưa đo xong (smoke dừng giữa chừng): BIRCH ở `threshold = 0`
+có hàng trăm nhãn mỗi cửa sổ và là ô đắt nhất. `run --snapshot-eval` tốn dưới 1 s mỗi job trên smoke
+`static_overlap` 8 000 điểm (DBSTREAM, DenStream, CluStream × default, confstream), và không đổi quyết định nào.
+
+```bash
+# kịch bản có sự kiện biết trước
+PYTHONHASHSEED=0 OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 \
+  .venv/bin/python -m conf_pipeline.identity_audit --out result/identity_audit_scenarios \
+  --seeds 1,2,3 --configs default,scaled_default --workers 16
+# luồng của protocol: chạy bản ngắn trước để đo, rồi bản đủ
+PYTHONHASHSEED=0 OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 \
+  .venv/bin/python -m conf_pipeline.identity_audit --out result/identity_audit_folds_w3 --scenarios "" \
+  --folds <các fold> --fold-windows 3 --configs default,scaled_default --workers 16
+```

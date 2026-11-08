@@ -22,13 +22,14 @@ from pathlib import Path
 import numpy as np
 
 from benchmark.algorithms.registry import accepts_seed, get_algorithm
+from benchmark.tuning.cluster_identity import snapshot_labels
 from benchmark.tuning.confstream import (
     LIFECYCLE_SCHEMA, TIE_BREAKS, TIE_LEVELS, ConfStreamEnsemble, EnsembleConfig, WindowOutcome,
 )
 from benchmark.tuning.recluster import common_recluster, micro_centers
 from benchmark.tuning.signals import NOISE_POLICIES, SIGNALS, check_signals
 from benchmark.tuning.space import ParamSpace, SpaceContext
-from benchmark.tuning.window import WindowBuffer
+from benchmark.tuning.window import WindowBuffer, silhouette_status
 
 from . import _common as C
 from . import manifest as M
@@ -171,6 +172,58 @@ def _table_a_fields(lag_member, lag: WindowOutcome | None, buffer: WindowBuffer,
     return {**{f"lag_{k}": v for k, v in table_a.items()}, "lag_table_a_error": error}
 
 
+#: The partitions ``--snapshot-eval`` reads for the lagged incumbent on each window: its sequential
+#: labels (the ones ``lag_ari_win`` reads, scored here the same way as the snapshots), and the snapshots
+#: of the model at the start of the window and once it has learned it.
+SNAPSHOT_PARTS: tuple[str, ...] = ("seq", "pre", "post")
+
+
+def _ari_between(a: list, b: list) -> float | None:
+    from sklearn.metrics import adjusted_rand_score
+
+    both = [(x, y) for x, y in zip(a, b) if x is not None and y is not None]
+    if len(both) < 2:
+        return None
+    ia, ib = {}, {}
+    return float(adjusted_rand_score([ia.setdefault(x, len(ia)) for x, _ in both],
+                                     [ib.setdefault(y, len(ib)) for _, y in both]))
+
+
+def snapshot_fields(parts: dict, buffer: WindowBuffer, metrics: tuple[str, ...]) -> dict:
+    """``--snapshot-eval``'s readings of one window, keyed ``lag_snap_<part>_*``.
+
+    ``parts`` maps ``SNAPSHOT_PARTS`` to the lagged incumbent's labels of the window's points (None where
+    there was no lagged incumbent). ``seq`` is the sequential partition ``lag_ari_win`` reads; ``pre`` the
+    partition of the model as it stood when the window began, every point labelled by that one state
+    (out of sample, ``cluster_identity.snapshot_labels``); ``post`` the same once it has learned the window
+    (in sample). All three are scored by one batch computation over the points with a true class and a
+    label, None on a window with fewer than ``MIN_TRUE_CLASSES`` classes; the snapshots also get their
+    classic silhouette, their number of labels and their ARI against the sequential labels."""
+    ok = len({y for y in buffer.ys if y is not None}) >= C.MIN_TRUE_CLASSES
+    seq = parts.get("seq")
+    out: dict = {}
+    for name in SNAPSHOT_PARTS:
+        labels = parts.get(name)
+        pre = f"lag_snap_{name}_"
+        if labels is None or not ok:
+            out.update({f"{pre}{m}_win": None for m in metrics})
+        else:
+            pairs = [(y, p) for y, p in zip(buffer.ys, labels) if y is not None and p is not None]
+            ext = batch_external([y for y, _ in pairs], [p for _, p in pairs], metrics)
+            out.update({f"{pre}{m}_win": v for m, v in ext.items()})
+        if name == "seq":
+            continue
+        if labels is None:
+            out.update({f"{pre}silhouette": None, f"{pre}silhouette_reason": None, f"{pre}n_labels": None,
+                        f"{pre}vs_seq_ari": None})
+            continue
+        st = silhouette_status(buffer.xs, labels)
+        out.update({f"{pre}silhouette": st.score if st.defined else None, f"{pre}silhouette_reason": st.reason,
+                    f"{pre}n_labels": len({p for p in labels if p is not None}),
+                    f"{pre}vs_seq_ari": _ari_between(labels, seq) if seq is not None else None})
+    return out
+
+
 def switch_cost(window_rows: list[dict]) -> float | None:
     """Spec 4.5: mean ``lag_ari_win`` on the windows whose ``incumbent_id``
     differs from the previous window's, minus the mean on the other windows.
@@ -265,8 +318,13 @@ def run_ensemble(
     prediction_log: Path | None = None,
     prefix_scaling: str | None = None,
     pins: dict | None = None,
+    snapshot_eval: bool = False,
 ) -> list[dict]:
     """Run one ensemble over ``dataset`` and return its window rows + summary row.
+
+    ``snapshot_eval`` adds, for the lagged incumbent of every window, the evaluation of the coherent
+    partitions one model state makes (``snapshot_fields``: ``lag_snap_*`` on the window rows, their
+    means on the summary). It reads copies of the member and changes nothing the ensemble does.
 
     ``shadow_log`` receives the shadow members' rows (``EnsembleConfig.shadow_size``), apart from the
     member log, whose readers take every row for a member of the ensemble. ``prediction_log`` receives
@@ -460,6 +518,13 @@ def run_ensemble(
         # right after being scored and trained on this window, whether or
         # not it survives into the next one.
         lag_member = ensemble.find(last_incumbent_id) if last_incumbent_id is not None else None
+        snap_parts, snap_s = None, 0.0
+        if snapshot_eval:
+            t_snap = time.perf_counter()
+            snap_parts = {"seq": None, "pre": None, "post": None}
+            if lag_member is not None and lag_member.error is None:
+                snap_parts["pre"] = snapshot_labels(lag_member.adapter, buffer.xs)
+            snap_s += time.perf_counter() - t_snap
         report = ensemble.process_window(buffer, window_index)
         wall = time.perf_counter() - win_t0
         log_s = log_members(report)
@@ -495,6 +560,20 @@ def run_ensemble(
         t_a = time.perf_counter()
         table_a_fields = _table_a_fields(lag_member, lag, buffer, C.TABLE_A_EPS_FACTOR * s_online)
         table_a_s = time.perf_counter() - t_a
+        snap_fields: dict = {}
+        if snap_parts is not None:
+            t_snap = time.perf_counter()
+            same = lag is not None and lag_member is not None and lag.member_id == lag_member.id
+            if not same:
+                snap_parts["pre"] = None
+            else:
+                snap_parts["seq"] = lag.predictions
+                if lag_member.error is None:
+                    snap_parts["post"] = snapshot_labels(lag_member.adapter, buffer.xs)
+            snap_fields = snapshot_fields(
+                snap_parts, buffer, tuple(m for m in cfg.external_metrics if m not in C.CMM_METRICS))
+            snap_s += time.perf_counter() - t_snap
+            snap_fields["snapshot_runtime_s"] = snap_s
 
         row = {
             "kind": "window", **base, "window": window_index,
@@ -504,6 +583,7 @@ def run_ensemble(
             **(_incumbent_fields(lag, "lag_") if lag is not None else
                {"lag_member_id": None, "lag_score": None, "lag_defined": None, "lag_pred_sha": None}),
             **table_a_fields,
+            **snap_fields,
             "n_true_classes": inc.n_true_classes,
             "majority_class_share": inc.majority_class_share,
             "external_defined": external_defined(inc),
@@ -695,6 +775,17 @@ def run_ensemble(
         summary["prediction_log"] = True
     if pins:
         summary["pins"] = dict(pins)
+    if snapshot_eval:
+        summary["snapshot_eval"] = True
+        summary["snapshot_runtime_s"] = float(sum(r.get("snapshot_runtime_s", 0.0) for r in window_rows))
+        for name in SNAPSHOT_PARTS:
+            for m in ("ari", "nmi"):
+                key = f"lag_snap_{name}_{m}_win"
+                summary[f"{key}_mean"] = _mean(key)
+                summary[f"{key}_tail_mean"] = _mean(key, tail)
+            if name != "seq":
+                summary[f"lag_snap_{name}_silhouette_mean"] = _mean(f"lag_snap_{name}_silhouette")
+                summary[f"lag_snap_{name}_vs_seq_ari_mean"] = _mean(f"lag_snap_{name}_vs_seq_ari")
     return [*window_rows, summary]
 
 
@@ -936,6 +1027,7 @@ def _run_one_child() -> None:
         params_override=job.get("params_override"), model_seed=model, calibration_seed=calibration,
         seed_fields=fields, lifecycle_log=lifecycle_log, shadow_log=shadow_log, prediction_log=prediction_log,
         prefix_scaling=job.get("prefix_scaling"), pins=job.get("pins"),
+        snapshot_eval=bool(job.get("snapshot_eval", False)),
     )
     rows[-1].update(stream_sha256=stream.digest.hexdigest(), stream_n_samples=stream.digest.n, code_sha256=code_sha,
                     data_seed=data_seed if C.is_synthetic(fold) else None)
@@ -1057,6 +1149,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--log-predictions", action="store_true",
                         help=f"E1: write every member's per-point predictions on every window to <out-dir>/{PREDICTIONS_DIR}/, "
                              "one file per job (large: about members x samples integers per job)")
+    parser.add_argument("--snapshot-eval", action="store_true",
+                        help="also score, for the lagged incumbent of every window, the coherent partitions of one "
+                             "model state: the model at the start of the window (out of sample) and once it has "
+                             "learned it (lag_snap_pre_*, lag_snap_post_*, beside lag_snap_seq_*); log-only, the "
+                             "tuner's decisions do not change")
     parser.add_argument("--pin", action="append", default=[], metavar="ALGO.PARAM=VALUE",
                         help="E9: set a constructor parameter of one algorithm on every member (repeatable), e.g. "
                              "HPStream.n_samples_init=2000 or BIRCH.n_macro_clusters=8; VALUE is read as JSON when it "
@@ -1167,6 +1264,8 @@ def plan_jobs(args: argparse.Namespace) -> tuple[list[dict], list[tuple[dict, di
             job["shadow_size"] = shadow_size
         if prefix_scaling != "none":
             job["prefix_scaling"] = prefix_scaling
+        if getattr(args, "snapshot_eval", False):
+            job["snapshot_eval"] = True
         if pins.get(algo):
             job["pins"] = dict(pins[algo])
         if arm == "scaled_default" and not distance_params(algo):
