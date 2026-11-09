@@ -40,7 +40,9 @@ def test_the_pilot_config_runs_hpstream_as_its_label_variant_by_the_users_decisi
 def test_the_pilot_config_holds_the_locked_protocol_streams_arms_and_seeds(cfg):
     p = cfg["protocol"]
     assert cfg["folds"] == PILOT_FOLDS
-    assert cfg["arms"] == ["default", "scaled_default", "confstream", "frozen_prefix", "frozen_reinit", "random_online"]
+    assert cfg["arms"] == ["default", "scaled_default", "confstream", "frozen_prefix", "frozen_reinit", "random_online",
+                           "frozen_ensemble", "portfolio_renewal", "random_after_prefix"]
+    assert p["score_partition"] == "snapshot"
     assert (p["h"], p["e_size"], p["e_test"], p["freeze_after_window"], p["n_samples"]) == (1000, 20, 10, 20, 100000)
     assert (p["seed_policy"], p["model_seed"], p["fixed_model_seeds"], p["data_seed"]) == ("split", 201, [201], 42)
     assert p["runtime_gate"] is False and p["tie_break"] == "micro_clusters" and p["signals"] == ["stability"]
@@ -53,11 +55,13 @@ def test_the_pilot_config_holds_the_locked_protocol_streams_arms_and_seeds(cfg):
     assert not set(cfg["arms"]) & set(C.DIAGNOSTIC_ARMS) and set(cfg["excluded_arms"]) == set(C.DIAGNOSTIC_ARMS)
 
 
-def test_the_inventory_is_996_plus_132_runnable_jobs_and_24_identical_skips(inv):
-    assert inv["n_runnable"] == 1128 and inv["n_skipped"] == 24
-    assert inv["by_group"] == {"clustream_repstream_one_tuner_seed": 132, "six_algorithms_three_tuner_seeds": 996}
+def test_the_inventory_is_1644_plus_204_runnable_jobs_and_24_identical_skips(inv):
+    # the six arms of 2026-11-04 (1 128 jobs) and the three E3 branches, 240 jobs each
+    assert inv["n_runnable"] == 1848 and inv["n_skipped"] == 24
+    assert inv["by_group"] == {"clustream_repstream_one_tuner_seed": 204, "six_algorithms_three_tuner_seeds": 1644}
     assert inv["by_arm"] == {"confstream": 240, "default": 96, "frozen_prefix": 240, "frozen_reinit": 240,
-                             "random_online": 240, "scaled_default": 72}
+                             "random_online": 240, "scaled_default": 72, "frozen_ensemble": 240,
+                             "portfolio_renewal": 240, "random_after_prefix": 240}
     assert {(s["algo"], s["arm"]) for s in inv["skipped"]} == {("HPStreamStableLabels", "scaled_default"),
                                                                ("RepStream", "scaled_default")}
 
@@ -141,10 +145,11 @@ def test_more_tuner_seeds_extend_the_campaign_and_are_recorded(cfg, inv, tmp_pat
     more = copy.deepcopy(cfg)
     more["groups"][1]["tuner_seeds"] = [101, 102, 103]
     inv2 = K.inventory(more, tmp_path / "out")
-    assert inv2["n_runnable"] == 1128 + 2 * 12 * 4 * 2
+    # two more tuner seeds for two algorithms on 12 streams and the seven online arms
+    assert inv2["n_runnable"] == 1848 + 2 * 12 * 7 * 2
     new = _manifest(more, inv2, tmp_path)
     merged, kind, added = K.check_resume(old, new, workers=8, argv=[])
-    assert kind == "extended" and len(added) == 2 * 12 * 4 * 2 and merged["history"][-1]["n_jobs_added"] == len(added)
+    assert kind == "extended" and len(added) == 2 * 12 * 7 * 2 and merged["history"][-1]["n_jobs_added"] == len(added)
 
 
 def test_the_full_run_and_a_dir_no_campaign_made_are_never_written(tmp_path):
@@ -177,11 +182,13 @@ def test_the_dry_run_and_help_work_and_write_nothing_into_the_out_dir(tmp_path):
     proc = subprocess.run([sys.executable, "-m", "conf_pipeline.campaign", "--config", str(CONFIG), "--out-dir", str(out),
                            "--write-inventory", str(inv_path)], cwd=REPO, capture_output=True, text=True, env=env)
     assert proc.returncode == 0, proc.stderr
-    assert "1128 runnable jobs, 24 written down as skipped" in proc.stdout and "dry run" in proc.stdout
-    assert "paper confirmation NOT ELIGIBLE" in proc.stdout and "DenStream: open, GAP-6" in proc.stdout
+    assert "1848 runnable jobs, 24 written down as skipped" in proc.stdout and "dry run" in proc.stdout
+    # under the snapshot rule DenStream's within-window labelling no longer limits the readings; the campaign's
+    # own open conditions still keep it from confirming the paper
+    assert "paper confirmation NOT ELIGIBLE" in proc.stdout and "DenStream: resolved, resolved by the protocol" in proc.stdout
     assert "HPStreamStableLabels: resolved" in proc.stdout
     assert not out.exists()
-    assert json.loads(inv_path.read_text())["inventory"]["n_runnable"] == 1128
+    assert json.loads(inv_path.read_text())["inventory"]["n_runnable"] == 1848
     help_ = subprocess.run([sys.executable, "-m", "conf_pipeline.campaign", "--help"], cwd=REPO, capture_output=True,
                            text=True, env=env)
     assert help_.returncode == 0 and "--execute" in help_.stdout
@@ -198,9 +205,19 @@ def test_execute_refuses_a_parent_without_the_pinned_hash_seed(tmp_path, monkeyp
 
 
 def test_the_measurement_status_keeps_every_algorithm_and_never_calls_the_campaign_ready_for_the_paper(cfg, inv, tmp_path):
-    ms = K.measurement_status(cfg)
+    snap = K.measurement_status(cfg)
     algos = [a for g in cfg["groups"] for a in g["algos"]]
-    assert set(ms["algorithms"]) == set(algos) == set(inv["by_algo"])       # nobody left out of the design
+    assert set(snap["algorithms"]) == set(algos) == set(inv["by_algo"])       # nobody left out of the design
+    # the snapshot rule: no algorithm open, only the campaign's own conditions keep it not eligible
+    assert not [a for a, v in snap["algorithms"].items() if v["status"] == "open"]
+    assert {a for a, v in snap["algorithms"].items() if v["status"] == "resolved"} == {
+        "BIRCH", "CluStream", "DBSTREAM", "DenStream", "HPStreamStableLabels"}
+    assert snap["paper_confirmation"] == "not eligible" and snap["reasons"] == list(K.OPEN_CONDITIONS)
+    m = K.build_manifest(cfg, CONFIG, tmp_path / "out", inv)
+    assert m["measurement_status"] == snap
+    # the sequential rule, the one before 2026-11-08: the four labelling issues are open again
+    cfg = {**cfg, "protocol": {**cfg["protocol"], "score_partition": "sequential"}}
+    ms = K.measurement_status(cfg)
     open_ = sorted(a for a, v in ms["algorithms"].items() if v["status"] == "open")
     assert open_ == ["BIRCH", "CluStream", "DBSTREAM", "DenStream"]
     assert ms["algorithms"]["HPStreamStableLabels"]["status"] == "resolved"
@@ -214,13 +231,15 @@ def test_the_measurement_status_keeps_every_algorithm_and_never_calls_the_campai
     # an inventory of algorithms without an issue is still not eligible while a campaign condition is open
     only = {**cfg, "groups": [{"name": "g", "algos": ["SOStream"], "tuner_seeds": [101]}]}
     assert K.measurement_status(only)["paper_confirmation"] == "not eligible"
-    m = K.build_manifest(cfg, CONFIG, tmp_path / "out", inv)
-    assert m["measurement_status"] == ms
 
 
 def test_a_subclass_inherits_its_river_class_issue_and_an_algorithm_never_audited_blocks(cfg):
     groups = [{"name": "g", "algos": ["DenStreamPatched", "DenStreamPatchedFast", "HPStreamStableLabels",
                                       "CluStreamPyramidal", "KMeans", "SOStream"], "tuner_seeds": [101]}]
+    snap = K.measurement_status({**cfg, "groups": groups})["algorithms"]
+    assert snap["DenStreamPatchedFast"]["status"] == "resolved" and snap["DenStreamPatchedFast"]["inherited_from"] == "DenStream"
+    assert snap["KMeans"]["status"] == "not audited"                         # the protocol resolves only GAP-6
+    cfg = {**cfg, "protocol": {**cfg["protocol"], "score_partition": "sequential"}}
     ms = K.measurement_status({**cfg, "groups": groups})["algorithms"]
     for a, base in (("DenStreamPatched", "DenStream"), ("DenStreamPatchedFast", "DenStream"),
                     ("CluStreamPyramidal", "CluStream")):
@@ -237,3 +256,37 @@ def test_a_subclass_inherits_its_river_class_issue_and_an_algorithm_never_audite
         assert K.measurement_status(clean)["paper_confirmation"] == "eligible on the known measurement issues"
     finally:
         K.OPEN_CONDITIONS = saved
+
+
+E3_CONFIG = REPO / "conf_pipeline" / "campaigns" / "e3_mechanism.json"
+E3_ARMS = ["frozen_prefix", "frozen_ensemble", "portfolio_renewal", "random_after_prefix", "confstream"]
+MATCHED = "frozen_prefix_matched"
+
+
+def test_the_e3_config_is_the_pilot_restricted_to_the_five_e3_procedures(cfg):
+    e3 = K.load_config(E3_CONFIG)
+    assert e3["arms"] == [*E3_ARMS, MATCHED] and e3["folds"] == cfg["folds"] and e3["groups"] == cfg["groups"]
+    # the same protocol but the stability diagnostic, which never enters selection and no E3 contrast reads
+    assert {k: v for k, v in e3["protocol"].items() if k != "signals"} == \
+        {k: v for k, v in cfg["protocol"].items() if k != "signals"}
+    assert e3["protocol"]["signals"] == [] and e3["out_dir"] != cfg["out_dir"]
+    assert e3["operational"]["timeout_s"] == 86400
+
+
+def test_the_e3_inventory_is_the_pilots_jobs_of_its_five_arms(cfg, inv, tmp_path):
+    e3 = K.inventory(K.load_config(E3_CONFIG), tmp_path / "out")
+    assert e3["n_runnable"] == 1440 and e3["n_skipped"] == 0
+    assert e3["by_arm"] == {a: 240 for a in [*E3_ARMS, MATCHED]}
+    key = lambda j: (j["algo"], j["fold"], j["arm"], j["seed"], j["tuner_seed"], j["model_seed"])
+    assert {key(j) for j in e3["jobs"] if j["arm"] != MATCHED} == {key(j) for j in inv["jobs"] if j["arm"] in E3_ARMS}
+
+
+def test_the_contrast_report_holds_every_e3_contrast_the_e3_config_can_read():
+    from conf_pipeline import report as RP
+
+    pairs = {(a, b) for a, b, _ in RP.CONTRASTS}
+    want = {("portfolio_renewal", "frozen_ensemble"), ("confstream", "random_after_prefix"),
+            ("confstream", "portfolio_renewal")} | {(a, "frozen_prefix") for a in E3_ARMS if a != "frozen_prefix"}
+    want |= {(a, MATCHED) for a in E3_ARMS if a != "frozen_prefix"} | {(MATCHED, "frozen_prefix")}
+    assert want <= pairs
+    assert all(a in [*E3_ARMS, MATCHED] and b in [*E3_ARMS, MATCHED] for a, b in want)

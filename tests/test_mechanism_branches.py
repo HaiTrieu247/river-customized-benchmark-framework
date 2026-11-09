@@ -208,7 +208,7 @@ def test_the_driver_plans_the_new_logs_and_refuses_shadow_without_member_logs(tm
     args = R.build_parser().parse_args([
         "--algos", "DenStream", "--folds", "static_easy", "--arms", "confstream,frozen_ensemble",
         "--tuner-seeds", "1", "--out-dir", str(tmp_path), "--log-members", "--shadow-size", "4",
-        "--log-predictions", "--prefix-scaling", "standard"])
+        "--log-predictions", "--prefix-scaling", "standard", "--stream-scaling", "none"])
     jobs, skipped, _, _ = R.plan_jobs(args)
     assert len(jobs) == 2 and not skipped
     for j in jobs:

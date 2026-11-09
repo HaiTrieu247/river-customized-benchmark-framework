@@ -98,10 +98,11 @@ def test_the_cli_projects_a_campaign_inventory(tmp_path):
                            "--arm-factor", "confstream=1.2", "--out", str(out)],
                           cwd=REPO, capture_output=True, text=True, env={**os.environ, "PYTHONHASHSEED": "0"})
     assert proc.returncode == 0, proc.stderr
-    assert "1128 runnable jobs" in proc.stdout and "1128 jobs (" in proc.stdout and "unmeasured cells" in proc.stdout
+    # the campaign's inventory with the three E3 branches (2026-11-09): 1 848 jobs
+    assert "1848 runnable jobs" in proc.stdout and "1848 jobs (" in proc.stdout and "unmeasured cells" in proc.stdout
     assert "jobs projected past the timeout 43200 s: 3" in proc.stdout       # the three tuner seeds
     assert "DenStream covtype confstream seed=101: 16.67 h" in proc.stdout
-    assert len(out.read_text().splitlines()) == 1129
+    assert len(out.read_text().splitlines()) == 1849
 
 
 def test_an_algorithm_the_measured_dir_never_ran_is_read_through_a_stated_proxy(tmp_path):

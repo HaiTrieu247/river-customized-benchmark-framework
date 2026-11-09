@@ -141,17 +141,25 @@ def cause_of(row: dict) -> str:
 
 # --- streams ----------------------------------------------------------------------------------------
 
-def _scenario_stream(name: str, seed: int, shape: F.StreamShape):
+def _scenario_stream(name: str, seed: int, shape: F.StreamShape, stream_scaling: str = "none",
+                     scaling_window: int | None = None):
     scen = F.make_scenario(name, seed, shape)
     xs, ys = scen.points(), scen.y.tolist()
     h = shape.h
+    xs = F.scaled_scenario(xs, ys, [], h, C.stream_scaling_of(name, stream_scaling), scaling_window)[0]
     windows = [(xs[w * h:(w + 1) * h], ys[w * h:(w + 1) * h]) for w in range(shape.n_windows)]
     events = [dict(e) for e in scen.events]
     return windows, events, scen.phases
 
 
-def _fold_stream(fold: str, h: int, n_windows: int, data_seed: int):
+def _fold_stream(fold: str, h: int, n_windows: int, data_seed: int, stream_scaling: str = "none",
+                 scaling_window: int | None = None):
+    from benchmark.datasets.scaling import scale_stream
+
     data = C.load_fold(fold, n_samples=h * (n_windows + 1), data_seed=data_seed)
+    scaling = C.stream_scaling_of(fold, stream_scaling or "none")
+    if scaling != "none":
+        data = scale_stream(data, scaling, C.scaling_window(scaling_window, h))
     xs, ys, out = [], [], []
     for x, y in data:
         xs.append(dict(x))
@@ -178,11 +186,13 @@ def audit_cell(task: dict) -> dict:
     try:
         if source == "scenario":
             shape = F.StreamShape(**task["shape"])
-            windows, events, phases = _scenario_stream(stream, seed, shape)
+            windows, events, phases = _scenario_stream(stream, seed, shape, task["stream_scaling"],
+                                                       task["scaling_window"])
             h = shape.h
         else:
             h = task["fold_h"]
-            windows, events, phases = _fold_stream(stream, h, task["fold_windows"], task["data_seed"])
+            windows, events, phases = _fold_stream(stream, h, task["fold_windows"], task["data_seed"],
+                                                   task["stream_scaling"], task["scaling_window"])
         if len(windows) < 2:
             raise ValueError(f"stream shorter than two windows of {h}")
         d = len(windows[0][0][0])
@@ -298,7 +308,8 @@ def _tasks(args) -> tuple[list[dict], list[dict]]:
               "anchors_per_id": args.anchors_per_id, "max_anchors": args.max_anchors, "tau": args.tau,
               "tau_split": args.tau_split, "lag_edges": tuple(args.lag_edges), "pair_readings": PAIR_READINGS,
               "shape": dataclasses.asdict(shape), "fold_h": args.fold_h, "fold_windows": args.fold_windows,
-              "data_seed": args.data_seed}
+              "data_seed": args.data_seed, "stream_scaling": args.stream_scaling,
+              "scaling_window": args.scaling_window}
     tasks, skipped = [], []
     streams = [("scenario", sc, seed) for sc in args.scenarios for seed in args.seeds]
     streams += [("fold", fold, args.data_seed) for fold in args.folds]
@@ -306,9 +317,9 @@ def _tasks(args) -> tuple[list[dict], list[dict]]:
         w0, d, h = None, None, args.h if source == "scenario" else args.fold_h
         if "scaled_default" in args.configs and "default" in args.configs:
             if source == "scenario":
-                w0 = F.make_scenario(stream, seed, shape).points()[:h]
+                w0 = _scenario_stream(stream, seed, shape, args.stream_scaling, args.scaling_window)[0][0][0]
             else:
-                w0 = _fold_stream(stream, h, 0, args.data_seed)[0][0][0]
+                w0 = _fold_stream(stream, h, 0, args.data_seed, args.stream_scaling, args.scaling_window)[0][0][0]
             d = len(w0[0])
         for algo in args.algos:
             for cfg in args.configs:
@@ -518,6 +529,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--fold-windows", type=int, default=DEFAULTS["fold_windows"], help="fold windows after the warm start")
     p.add_argument("--data-seed", type=int, default=C.DATA_SEED)
     p.add_argument("--model-seed", type=int, default=C.MODEL_SEED)
+    p.add_argument("--stream-scaling", default=C.STREAM_SCALING, choices=C.STREAM_SCALING_RULES,
+                   help="the benchmark's stream scaling rule (default protocol since 2026-11-09)")
+    p.add_argument("--scaling-window", type=int, default=C.SCALING_WINDOW, help="default: one window h")
     p.add_argument("--probe-every", type=int, default=DEFAULTS["probe_every"], help="0: no transitions")
     p.add_argument("--refresh-every", type=int, default=DEFAULTS["refresh_every"], help="0: no tracker")
     p.add_argument("--anchors-per-id", type=int, default=DEFAULTS["anchors_per_id"])

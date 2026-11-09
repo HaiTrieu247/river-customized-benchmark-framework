@@ -115,6 +115,8 @@ def run_table(out_dir: Path, arms=None, diagnostic: bool = False) -> pd.DataFram
             continue
         if r.get("algo") in C.IMPL_VARIANTS:
             continue
+        if r.get("fold") in C.SCALED_TWIN_FOLDS:
+            continue  # the scaling-sensitivity twins are read apart (report --scaling-sensitivity)
         rows.append({**r, **dict(zip(IDENTITY, key))})
     if not rows:
         return pd.DataFrame(columns=[*IDENTITY, "status"])

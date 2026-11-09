@@ -129,7 +129,7 @@ def show(title: str, df: pd.DataFrame, cols: list[str] | None = None) -> None:
 PANEL_MD = r"""
 ## 1. Bảng điều khiển
 
-Cell dưới chọn preset theo `OTB_PRESET` (mặc định `pilot`), thư mục kết quả theo `OTB_OUT_DIR` (mặc định `conf_pipeline/out/<preset>`) và số worker theo `OTB_WORKERS` (mặc định của preset), dựng sẵn danh sách cờ cho ba lệnh CLI rồi in toàn bộ thiết lập đã chốt để đối chiếu trước khi chạy. Muốn đổi một giá trị cho riêng lần chạy này thì gán lại ở chỗ đánh dấu ngay dưới các cờ, ví dụ `WORKERS = 4`; khi đổi `N_SAMPLES`, `H`, `E_SIZE`, `E_TEST` hay `FREEZE_AFTER_WINDOW` thì nên đổi cả `OTB_OUT_DIR` để hai lần chạy không trộn vào cùng một file. `FREEZE_AFTER_WINDOW` là cửa sổ mà `frozen_prefix` thôi tune và cũng là nơi phần đuôi của mọi arm bắt đầu; `tiny` đặt nó bằng 1 vì luồng chỉ có 3 cửa sổ. Preset `full` thêm `DenStreamPatchedFast` vào `ALGOS`: đây là DenStream đã sửa BUG-7 và BUG-8 với pha offline nhanh (GAP-3), được chạy như mọi thuật toán khác nhưng không bao giờ được xếp hạng chung, chỉ so với DenStream ở bảng T7. `RUN_SWEEP` và `RUN_ORACLE` bật hoặc tắt hai bước quét và chạy lại oracle, `LOG_MEMBERS` ghi kết quả của từng thành viên ensemble (cần cho `R_proxy`, `R_search` và mốc hồi phục sau drift), còn `RETRY_FAILED = True` chạy lại các job đã lỗi.
+Cell dưới chọn preset theo `OTB_PRESET` (mặc định `pilot`), thư mục kết quả theo `OTB_OUT_DIR` (mặc định `conf_pipeline/out/<preset>`) và số worker theo `OTB_WORKERS` (mặc định của preset), dựng sẵn danh sách cờ cho ba lệnh CLI rồi in toàn bộ thiết lập đã chốt để đối chiếu trước khi chạy. Muốn đổi một giá trị cho riêng lần chạy này thì gán lại ở chỗ đánh dấu ngay dưới các cờ, ví dụ `WORKERS = 4`; khi đổi `N_SAMPLES`, `H`, `E_SIZE`, `E_TEST` hay `FREEZE_AFTER_WINDOW` thì nên đổi cả `OTB_OUT_DIR` để hai lần chạy không trộn vào cùng một file. `FREEZE_AFTER_WINDOW` là cửa sổ mà `frozen_prefix` thôi tune; phần đuôi của mọi arm bắt đầu sau nó hai cửa sổ (`POST_FREEZE_LAG`), cửa sổ đầu tiên mà một quyết định sau khi đóng băng có thể chạm tới; `tiny` đặt nó bằng 1 vì luồng chỉ có 5 cửa sổ (đuôi là cửa sổ 3 và 4). Preset `full` thêm `DenStreamPatchedFast` vào `ALGOS`: đây là DenStream đã sửa BUG-7 và BUG-8 với pha offline nhanh (GAP-3), được chạy như mọi thuật toán khác nhưng không bao giờ được xếp hạng chung, chỉ so với DenStream ở bảng T7. `RUN_SWEEP` và `RUN_ORACLE` bật hoặc tắt hai bước quét và chạy lại oracle, `LOG_MEMBERS` ghi kết quả của từng thành viên ensemble (cần cho `R_proxy`, `R_search` và mốc hồi phục sau drift), còn `RETRY_FAILED = True` chạy lại các job đã lỗi. Preset `smoke` và `full` chạy thêm bốn bản sao `*_std` của nhóm drift tham số: cùng luồng nhưng được chuẩn hoá như luồng thật, chỉ để kiểm độ nhạy (`report --scaling-sensitivity`), không vào bảng chính. `RUNTIME_GATE` mặc định tắt (từ 08/11/2026): một thành viên bị loại vì thời gian chạy đo được làm kết quả phụ thuộc tải của máy, và các nhánh của cùng một tuner không còn chung phần đầu; `OTB_RUNTIME_GATE=1` bật lại giới hạn 30 lần mà `out/full` đã chạy.
 """
 
 PANEL = r"""
@@ -138,18 +138,19 @@ OUT_DIR = Path(os.environ.get("OTB_OUT_DIR", REPO / "conf_pipeline" / "out" / PR
 
 PRESETS = {
     "tiny": dict(ALGOS=["DenStream"], FOLDS=["static_easy"], SEEDS=[1], ARMS=["default", "confstream"],
-                 N_SAMPLES=900, H=300, E_SIZE=2, E_TEST=1, FREEZE_AFTER_WINDOW=1, SWEEP_N_POINTS=2,
+                 N_SAMPLES=1500, H=300, E_SIZE=2, E_TEST=1, FREEZE_AFTER_WINDOW=1, SWEEP_N_POINTS=2,
                  WORKERS=1, TIMEOUT_S=600, ORACLE_SEEDS=[1]),
     "pilot": dict(ALGOS=["DenStream", "CluStream", "HPStream", "RepStream"],
                   FOLDS=["covtype", "insects_abrupt_balanced", "scale_drift", "k_drift"],
                   SEEDS=[1], ARMS=list(C.ARMS), N_SAMPLES=C.N_SAMPLES_CAP, H=C.H, E_SIZE=C.E_SIZE,
                   E_TEST=C.E_TEST, FREEZE_AFTER_WINDOW=C.FREEZE_AFTER_WINDOW, SWEEP_N_POINTS=8,
                   WORKERS=8, TIMEOUT_S=6 * 3600, ORACLE_SEEDS=[1]),
-    "smoke": dict(ALGOS=[*C.ALGOS, *C.IMPL_VARIANTS], FOLDS=list(C.FOLDS), SEEDS=[1],
+    "smoke": dict(ALGOS=[*C.ALGOS, *C.IMPL_VARIANTS], FOLDS=[*C.FOLDS, *C.SCALED_TWIN_FOLDS], SEEDS=[1],
                   ARMS=["default", "confstream"], N_SAMPLES=25_000, H=C.H, E_SIZE=C.E_SIZE,
                   E_TEST=C.E_TEST, FREEZE_AFTER_WINDOW=C.FREEZE_AFTER_WINDOW, SWEEP_N_POINTS=2,
                   WORKERS=8, TIMEOUT_S=2 * 3600, ORACLE_SEEDS=[1]),
-    "full": dict(ALGOS=[*C.ALGOS, *C.IMPL_VARIANTS], FOLDS=list(C.FOLDS), SEEDS=list(C.SEEDS), ARMS=list(C.ARMS),
+    "full": dict(ALGOS=[*C.ALGOS, *C.IMPL_VARIANTS], FOLDS=[*C.FOLDS, *C.SCALED_TWIN_FOLDS], SEEDS=list(C.SEEDS),
+                 ARMS=list(C.ARMS),
                  N_SAMPLES=C.N_SAMPLES_CAP, H=C.H, E_SIZE=C.E_SIZE, E_TEST=C.E_TEST,
                  FREEZE_AFTER_WINDOW=C.FREEZE_AFTER_WINDOW, SWEEP_N_POINTS=C.SWEEP_N_POINTS,
                  WORKERS=8, TIMEOUT_S=12 * 3600,
@@ -164,6 +165,10 @@ RUN_SWEEP = True
 RUN_ORACLE = True
 LOG_MEMBERS = True
 RETRY_FAILED = False
+# Gate-free by default since 2026-11-08: a member shed for its measured runtime makes a run depend on the
+# machine's load, and the branches of one tuner then stop sharing their prefix (docs/PAPER_IMPROVEMENT_PLAN.md).
+# OTB_RUNTIME_GATE=1 restores the 30x runtime cap that out/full ran under.
+RUNTIME_GATE = os.environ.get("OTB_RUNTIME_GATE", "0") == "1"
 
 # --- overrides for this run only go here, e.g. WORKERS = 4 ---
 
@@ -174,6 +179,7 @@ COMMON_ARGS = ["--algos", ",".join(ALGOS), "--folds", ",".join(FOLDS), "--n-samp
 # The protocol of out/full: one job seed drives the tuner and the models (docs/SEED_RULES.md).
 COMMON_ARGS += ["--seed-policy", "shared"]
 COMMON_ARGS += ["--retry-failed"] if RETRY_FAILED else []
+COMMON_ARGS += [] if RUNTIME_GATE else ["--no-runtime-gate"]
 DRIVER_ARGS = ["--e-size", E_SIZE, "--e-test", E_TEST, "--freeze-after-window", FREEZE_AFTER_WINDOW]
 RUN_ARGS = [*COMMON_ARGS, *DRIVER_ARGS, "--seeds", ",".join(map(str, SEEDS)), "--arms", ",".join(ARMS)]
 RUN_ARGS += ["--log-members"] if LOG_MEMBERS else []
@@ -186,7 +192,7 @@ print(f"{'PRESET':19s} = {PRESET}")
 print(f"{'OUT_DIR':19s} = {OUT_DIR}")
 for name in ("ALGOS", "FOLDS", "SEEDS", "ARMS", "N_SAMPLES", "H", "E_SIZE", "E_TEST",
              "FREEZE_AFTER_WINDOW", "SWEEP_N_POINTS", "ORACLE_SEEDS", "WORKERS", "TIMEOUT_S", "RUN_SWEEP",
-             "RUN_ORACLE", "LOG_MEMBERS", "RETRY_FAILED"):
+             "RUN_ORACLE", "LOG_MEMBERS", "RETRY_FAILED", "RUNTIME_GATE"):
     print(f"{name:19s} = {globals()[name]}")
 """
 
@@ -424,7 +430,7 @@ else:
 NOTES = r"""
 ## 10. Ghi chú: cách đọc từng bảng
 
-**Tóm tắt.** Mỗi dòng là một bộ (thuật toán, luồng, arm), lấy trung bình qua các seed đã chạy xong (`n_seeds`), và cột `_sd` là độ lệch chuẩn giữa các seed. Mọi cột chất lượng là ARI lagged, tức cấu hình đương nhiệm sau cửa sổ t−1 được chấm trên cửa sổ t, nên không con số nào là điểm của một cấu hình trên chính cửa sổ đã chọn ra nó. Cột có `tail` chỉ lấy các cửa sổ từ `FREEZE_AFTER_WINDOW` trở đi (20 ở `pilot` và `full`, 1 ở `tiny`), vùng mà mọi arm cùng có và `frozen_prefix` đã thôi tune, nên đây là con số chính để so các arm; cột không có `tail` lấy toàn luồng, gồm cả giai đoạn đầu khi ensemble còn đang dò. `incumbent_throughput_sps` là thông lượng (mẫu mỗi giây) của riêng cấu hình đương nhiệm, khác với chi phí của cả ensemble ở `ensemble_runtime_s`. Cửa sổ nào chỉ chứa một lớp thật thì không có ARI, NMI hay purity: ở đó ARI bằng 1 nếu thuật toán trả về đúng một nhóm và bằng 0 trong mọi trường hợp khác, còn purity luôn bằng 1, nên con số chỉ cho biết thuật toán có trả về một nhóm hay không. Các cửa sổ này bị bỏ khỏi mọi phép trung bình; `n_single_class_windows` đếm chúng, còn `lag_ari_n_windows` và `lag_ari_n_windows_tail` là số cửa sổ mà ARI lagged trên toàn luồng và trên đuôi thực sự dựa vào (kdd99 chỉ còn khoảng 23 trên 80 cửa sổ đuôi).
+**Tóm tắt.** Mỗi dòng là một bộ (thuật toán, luồng, arm), lấy trung bình qua các seed đã chạy xong (`n_seeds`), và cột `_sd` là độ lệch chuẩn giữa các seed. Mọi cột chất lượng là ARI lagged, tức cấu hình đương nhiệm sau cửa sổ t−1 được chấm trên cửa sổ t, nên không con số nào là điểm của một cấu hình trên chính cửa sổ đã chọn ra nó. Cột có `tail` chỉ lấy các cửa sổ từ `FREEZE_AFTER_WINDOW + 2` trở đi (22 ở `pilot` và `full`, 3 ở `tiny`; các run trước 08/11/2026 tính từ chính `FREEZE_AFTER_WINDOW`), vùng mà mọi arm cùng có và đầu ra của `frozen_prefix` đã có thể khác `confstream`, nên đây là con số chính để so các arm; cột không có `tail` lấy toàn luồng, gồm cả giai đoạn đầu khi ensemble còn đang dò. `incumbent_throughput_sps` là thông lượng (mẫu mỗi giây) của riêng cấu hình đương nhiệm, khác với chi phí của cả ensemble ở `ensemble_runtime_s`. Cửa sổ nào chỉ chứa một lớp thật thì không có ARI, NMI hay purity: ở đó ARI bằng 1 nếu thuật toán trả về đúng một nhóm và bằng 0 trong mọi trường hợp khác, còn purity luôn bằng 1, nên con số chỉ cho biết thuật toán có trả về một nhóm hay không. Các cửa sổ này bị bỏ khỏi mọi phép trung bình; `n_single_class_windows` đếm chúng, còn `lag_ari_n_windows` và `lag_ari_n_windows_tail` là số cửa sổ mà ARI lagged trên toàn luồng và trên đuôi thực sự dựa vào (kdd99 chỉ còn 23 trên 78 cửa sổ đuôi).
 
 **Arm so với default.** `gain_tail` và `gain_all` là ARI lagged của arm trừ đi của `default`, trên phần đuôi và trên toàn luồng. Gain dương trên đuôi nhưng âm trên toàn luồng nghĩa là arm trả giá ở giai đoạn dò rồi mới vượt default. `throughput_ratio` là thông lượng của cấu hình đương nhiệm của arm chia cho của `default`, nên nhỏ hơn 1 nghĩa là cấu hình được tune chạy chậm hơn default.
 

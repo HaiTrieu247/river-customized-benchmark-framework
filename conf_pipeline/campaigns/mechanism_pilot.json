@@ -1,26 +1,67 @@
 {
   "schema": 1,
   "name": "mechanism_pilot",
-  "description": "Six-arm mechanism pilot (E1 scaled_default, E2 frozen_reinit, E5 random_online beside default, confstream, frozen_prefix) on the 12 streams locked in docs/MECHANISM_PILOT.md, gate-free, sequential silhouette as the selection signal, stability and the end-of-window snapshot logged as diagnostics only. The two E4 oracle arms of MECHANISM_PILOT.md are not in this inventory; they can be added later as an extension under the same protocol.",
+  "description": "Mechanism campaign on the 12 streams locked in docs/MECHANISM_PILOT.md, gate-free: E1 scaled_default, E2 frozen_reinit, E5 random_online beside default, confstream and frozen_prefix, and the E3 branches frozen_ensemble, portfolio_renewal and random_after_prefix, which share the online arm's prefix through the freeze. Streams are scaled by the protocol's rule (stream_scaling protocol, 2026-11-09): River's StandardScaler(window_size = h) before any model, except the parameter-drift streams, which keep their coordinates. Selection and every *_win reading use model snapshots (score_partition snapshot, 2026-11-08); the sequential scores are kept as lag_seq_*, stability is logged as a diagnostic. The two E4 oracle arms of MECHANISM_PILOT.md are not in this inventory; they can be added later under the same protocol.",
   "out_dir": "conf_pipeline/out/mech_campaign",
   "folds": [
-    "covtype", "kdd99", "electricity", "shuttle", "insects_abrupt_imbalanced",
-    "scale_drift", "density_drift", "k_drift", "mixed_drift",
-    "static_overlap", "incremental_drift", "evolving"
+    "covtype",
+    "kdd99",
+    "electricity",
+    "shuttle",
+    "insects_abrupt_imbalanced",
+    "scale_drift",
+    "density_drift",
+    "k_drift",
+    "mixed_drift",
+    "static_overlap",
+    "incremental_drift",
+    "evolving"
   ],
-  "arms": ["default", "scaled_default", "confstream", "frozen_prefix", "frozen_reinit", "random_online"],
+  "arms": [
+    "default",
+    "scaled_default",
+    "confstream",
+    "frozen_prefix",
+    "frozen_reinit",
+    "random_online",
+    "frozen_ensemble",
+    "portfolio_renewal",
+    "random_after_prefix"
+  ],
   "groups": [
-    {"name": "six_algorithms_three_tuner_seeds",
-     "algos": ["DenStream", "HPStreamStableLabels", "DBSTREAM", "STREAMKMeans", "SOStream", "BIRCH"],
-     "tuner_seeds": [101, 102, 103]},
-    {"name": "clustream_repstream_one_tuner_seed",
-     "algos": ["CluStream", "RepStream"],
-     "tuner_seeds": [101]}
+    {
+      "name": "six_algorithms_three_tuner_seeds",
+      "algos": [
+        "DenStream",
+        "HPStreamStableLabels",
+        "DBSTREAM",
+        "STREAMKMeans",
+        "SOStream",
+        "BIRCH"
+      ],
+      "tuner_seeds": [
+        101,
+        102,
+        103
+      ]
+    },
+    {
+      "name": "clustream_repstream_one_tuner_seed",
+      "algos": [
+        "CluStream",
+        "RepStream"
+      ],
+      "tuner_seeds": [
+        101
+      ]
+    }
   ],
   "protocol": {
     "seed_policy": "split",
     "model_seed": 201,
-    "fixed_model_seeds": [201],
+    "fixed_model_seeds": [
+      201
+    ],
     "data_seed": 42,
     "h": 1000,
     "e_size": 20,
@@ -35,12 +76,28 @@
     "max_micro_clusters": 10000,
     "tie_break": "micro_clusters",
     "log_members": true,
-    "signals": ["stability"],
+    "signals": [
+      "stability"
+    ],
     "signal_noise": "label",
-    "cmm": true
+    "cmm": true,
+    "score_partition": "snapshot",
+    "stream_scaling": "protocol",
+    "scaling_window": null
   },
-  "locked_to_repo_constants": ["h", "e_size", "e_test", "freeze_after_window", "n_samples", "p_reset",
-                               "half_life_frac", "max_memory_mb", "max_micro_clusters", "data_seed", "model_seed"],
+  "locked_to_repo_constants": [
+    "h",
+    "e_size",
+    "e_test",
+    "freeze_after_window",
+    "n_samples",
+    "p_reset",
+    "half_life_frac",
+    "max_memory_mb",
+    "max_micro_clusters",
+    "data_seed",
+    "model_seed"
+  ],
   "operational": {
     "timeout_s": 43200,
     "timeout_source": "conf_pipeline/make_notebook.py, preset full (TIMEOUT_S = 12 * 3600), the timeout out/full ran under",

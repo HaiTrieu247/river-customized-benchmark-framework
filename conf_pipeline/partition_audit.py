@@ -34,8 +34,14 @@ ROW_COLS = ["algo", "fold", "arm", "window", "n_points", "n_probes", "n_rename_e
             "n_labels", "error"]
 
 
-def _windows(fold: str, h: int, n_windows: int, data_seed: int):
+def _windows(fold: str, h: int, n_windows: int, data_seed: int, stream_scaling: str = C.STREAM_SCALING,
+             scaling_window: int | None = C.SCALING_WINDOW):
+    from benchmark.datasets.scaling import scale_stream
+
     data = C.load_fold(fold, n_samples=h * (n_windows + 1), data_seed=data_seed)
+    scaling = C.stream_scaling_of(fold, stream_scaling or "none")
+    if scaling != "none":
+        data = scale_stream(data, scaling, C.scaling_window(scaling_window, h))
     buf, out = [], []
     for x, _ in data:
         buf.append(dict(x))
@@ -48,10 +54,11 @@ def _windows(fold: str, h: int, n_windows: int, data_seed: int):
 
 
 def audit_cell(algo: str, fold: str, arm: str, h: int, n_windows: int, every: int = 1,
-               data_seed: int = C.DATA_SEED, model_seed: int = C.MODEL_SEED) -> list[dict]:
+               data_seed: int = C.DATA_SEED, model_seed: int = C.MODEL_SEED,
+               stream_scaling: str = C.STREAM_SCALING, scaling_window: int | None = C.SCALING_WINDOW) -> list[dict]:
     from .run import _make_adapter_factory
 
-    wins = _windows(fold, h, n_windows, data_seed)
+    wins = _windows(fold, h, n_windows, data_seed, stream_scaling, scaling_window)
     if len(wins) < 2:
         return [{"algo": algo, "fold": fold, "arm": arm, "error": "stream shorter than two windows"}]
     s = C.estimate_scale(wins[0], np.random.default_rng(C.CALIBRATION_SEED))
@@ -86,6 +93,8 @@ def main(argv=None) -> None:
     parser.add_argument("--windows", type=int, default=3, help="audited windows after the warm-start window")
     parser.add_argument("--every", type=int, default=1, help="probe the window's labels every this many points")
     parser.add_argument("--data-seed", type=int, default=C.DATA_SEED)
+    parser.add_argument("--stream-scaling", default=C.STREAM_SCALING, choices=C.STREAM_SCALING_RULES)
+    parser.add_argument("--scaling-window", type=int, default=C.SCALING_WINDOW, help="default: one window h")
     parser.add_argument("--out", required=True, help="a new directory for audit.csv and audit.json")
     args = parser.parse_args(argv)
     out = Path(args.out)
@@ -97,12 +106,15 @@ def main(argv=None) -> None:
     for algo in csv(args.algos):
         for fold in csv(args.folds):
             for arm in csv(args.arms):
-                rows += audit_cell(algo, fold, arm, args.h, args.windows, args.every, args.data_seed)
+                rows += audit_cell(algo, fold, arm, args.h, args.windows, args.every, args.data_seed,
+                                   stream_scaling=args.stream_scaling, scaling_window=args.scaling_window)
                 print(json.dumps(rows[-1], default=str), flush=True)
     df = pd.DataFrame(rows).reindex(columns=ROW_COLS)
     df.to_csv(out / "audit.csv", index=False)
     (out / "audit.json").write_text(json.dumps({"argv": argv, "h": args.h, "windows": args.windows,
                                                 "every": args.every, "data_seed": args.data_seed,
+                                                "stream_scaling": args.stream_scaling,
+                                                "scaling_window": args.scaling_window,
                                                 "model_seed": C.MODEL_SEED}, indent=2), encoding="utf-8")
     print(out / "audit.csv")
 

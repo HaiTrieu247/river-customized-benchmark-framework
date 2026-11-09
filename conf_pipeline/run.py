@@ -22,6 +22,7 @@ from pathlib import Path
 import numpy as np
 
 from benchmark.algorithms.registry import accepts_seed, get_algorithm
+from benchmark.datasets.scaling import STREAM_SCALINGS, scale_stream
 from benchmark.tuning.cluster_identity import snapshot_labels
 from benchmark.tuning.confstream import (
     LIFECYCLE_SCHEMA, SCORE_PARTITIONS, TIE_BREAKS, TIE_LEVELS, ConfStreamEnsemble, EnsembleConfig, WindowOutcome,
@@ -287,7 +288,8 @@ def arm_config(arm: str, cfg: EnsembleConfig, freeze_after_window: int | None) -
         over = dict(freeze_after_window=freeze_after_window, freeze_mode=C.BRANCH_ARMS[arm])
     elif arm in C.SIGNAL_ARMS or arm in C.DIAGNOSTIC_ARMS:
         over = dict(selection_signal=arm.removeprefix("confstream_"))
-    elif arm == "frozen_prefix":
+    elif arm == "frozen_prefix" or arm in C.MATCHED_ARMS:
+        # the matched arm's sizes depend on the stream's length: run_ensemble scales them (C.matched_sizes)
         over = dict(freeze_after_window=freeze_after_window)
     else:
         raise ValueError(f"unknown arm {arm!r}; arms: {C.ARMS + C.OPTIONAL_ARMS + C.DIAGNOSTIC_ARMS + C.EXTRA_ARMS}")
@@ -324,8 +326,14 @@ def run_ensemble(
     prefix_scaling: str | None = None,
     pins: dict | None = None,
     snapshot_eval: bool = False,
+    stream_scaling: str | None = None,
+    scaling_window: int | None = None,
 ) -> list[dict]:
     """Run one ensemble over ``dataset`` and return its window rows + summary row.
+
+    ``stream_scaling`` (``benchmark.datasets.scaling``; None reads as ``none``, the rule of every run before
+    2026-11-09) scales the stream itself before the distance unit, any model or any reading sees it, with a
+    rolling window of ``scaling_window`` points (one window ``h`` when None); it excludes ``prefix_scaling``.
 
     ``snapshot_eval`` adds, for the lagged incumbent of every window, the evaluation of the coherent
     partitions one model state makes (``snapshot_fields``: ``lag_snap_*`` on the window rows, their
@@ -359,7 +367,8 @@ def run_ensemble(
     on, see ``sweep.incumbent_candidates``); the two are exclusive.
     ``freeze_after_window`` (default
     ``FREEZE_AFTER_WINDOW``) is where ``frozen_prefix`` stops tuning, and where
-    every arm's tail metrics start unless ``tail_from`` says otherwise.
+    every arm's tail metrics start ``_common.POST_FREEZE_LAG`` windows later (``_common.tail_start``),
+    unless ``tail_from`` says otherwise.
 
     Every member -- start, ``unit_override`` point or child -- has its
     initialisation buffer (``n_samples_init``, ``chunk_size``) capped at ``h``
@@ -371,7 +380,7 @@ def run_ensemble(
     if freeze_after_window is None:
         freeze_after_window = C.FREEZE_AFTER_WINDOW
     if tail_from is None:
-        tail_from = freeze_after_window
+        tail_from = C.tail_start(freeze_after_window)
     cfg = arm_config(arm, cfg, freeze_after_window)
     if unit_override and params_override:
         raise ValueError("give unit_override or params_override, not both")
@@ -386,8 +395,14 @@ def run_ensemble(
     if prefix_scaling not in (None, "none", *PREFIX_SCALINGS):
         raise ValueError(f"prefix_scaling must be one of {('none',) + PREFIX_SCALINGS}, got {prefix_scaling!r}")
     scaled_stream = None
+    if prefix_scaling not in (None, "none") and stream_scaling not in (None, "none"):
+        raise ValueError("give prefix_scaling or stream_scaling, not both: each is a scaling of the whole stream")
     if prefix_scaling not in (None, "none"):
         dataset = scaled_stream = PrefixStandardised(dataset, h)
+    rolled = None
+    if stream_scaling not in (None, "none"):
+        scaling_window = C.scaling_window(scaling_window, h)
+        dataset = rolled = scale_stream(dataset, stream_scaling, scaling_window)
 
     try:
         length = len(dataset)
@@ -400,6 +415,9 @@ def run_ensemble(
             raise ValueError("lam must be given when the stream length is unknown")
         lam = C.lambda_for(n_windows_total, half_life_frac)
     cfg = EnsembleConfig(**{**cfg.__dict__, "lam": lam})
+    matched = None
+    if arm in C.MATCHED_ARMS and n_windows_total is None:
+        raise ValueError(f"{arm} needs the stream's length to match confstream's budget")
 
     base = {"algo": algo, "fold": fold, "seed": seed, "arm": arm, "config_id": config_id, **(seed_fields or {}),
             #: The partition every ``*_win`` external reading reads (``WindowOutcome.ari_basis``).
@@ -497,6 +515,18 @@ def run_ensemble(
                     start = [scaled]
                 pinned = dict(pins or {})
                 start = [{**clamp_init_buffers(algo, p, h), **pinned} for p in start]
+                if arm in C.MATCHED_ARMS:
+                    # scored windows are numbered from len(calibration); the freeze window is the last prefix one
+                    n_scored = n_windows_total - len(calibration)
+                    n_prefix = freeze_after_window - len(calibration) + 1
+                    e_m, c_m, k = C.matched_sizes(n_scored, n_prefix, cfg.e_size, cfg.e_test)
+                    matched = {"budget_factor": k, "budget_e_size": e_m, "budget_e_test": c_m,
+                               "budget_reference_e_size": cfg.e_size, "budget_reference_e_test": cfg.e_test,
+                               "budget_target_evaluations": C.evaluations(n_scored, n_scored, cfg.e_size,
+                                                                          cfg.e_test, frozen=False),
+                               "budget_planned_evaluations": C.evaluations(n_scored, n_prefix, e_m, c_m,
+                                                                           frozen=True)}
+                    cfg = EnsembleConfig(**{**cfg.__dict__, "e_size": e_m, "e_test": c_m})
                 ensemble = ConfStreamEnsemble(
                     space=space, ctx=ctx, make_adapter=_make_adapter_factory(algo, h),
                     start_params=start, config=cfg, rng=rng, seed=model_seed,
@@ -651,7 +681,12 @@ def run_ensemble(
         "n_calibration_windows": len(calibration), "d": d, "s_online": s_online,
         "drift_points": list(C.drift_points(fold, n_samples)),
         "lam": lam, "half_life_frac": half_life_frac,
-        "e_size": cfg.e_size, "e_test": cfg.e_test, "p_reset": cfg.p_reset,
+        # the protocol's sizes; the matched arm's own sizes before the freeze are its budget_* fields
+        "e_size": matched["budget_reference_e_size"] if matched else cfg.e_size,
+        "e_test": matched["budget_reference_e_test"] if matched else cfg.e_test, "p_reset": cfg.p_reset,
+        **(matched or {}),
+        #: Models evaluated over the run (the budget ``frozen_prefix_matched`` is matched on).
+        "n_evaluated_total": int(sum(r.get("n_evaluated") or 0 for r in window_rows)),
         "runtime_factor": cfg.runtime_factor, "max_memory_mb": cfg.max_memory_mb,
         "max_micro_clusters": cfg.max_micro_clusters,
         "start_params": start[0], "final_params": window_rows[-1]["params"] if window_rows else None,
@@ -680,6 +715,8 @@ def run_ensemble(
         ),
         "lag_cmm_first_error": next((r["lag_cmm_error"] for r in lag_rows if r.get("lag_cmm_error")), None),
         "tail_from": tail_from,
+        #: The freeze window the tail is counted from (``_common.tail_start``), whatever the arm.
+        "tail_freeze_window": freeze_after_window,
         "lag_ari_win_tail_mean": _mean("lag_ari_win", tail),
         "lag_score_tail_mean": _mean("lag_score", tail),
         "lag_ari_A_kmeans_mean": _mean("lag_ari_A_kmeans"),
@@ -781,6 +818,9 @@ def run_ensemble(
                        shadow_runtime_s=float(sum(r.get("shadow_runtime_s", 0.0) for r in window_rows)))
     if scaled_stream is not None:
         summary.update(prefix_scaling=prefix_scaling, prefix_scaling_stats=scaled_stream.summary())
+    summary["stream_scaling"] = stream_scaling or "none"
+    if rolled is not None:
+        summary.update(scaling_window=scaling_window, stream_scaling_stats=rolled.summary())
     if prediction_log is not None:
         summary["prediction_log"] = True
     if pins:
@@ -1038,7 +1078,10 @@ def _run_one_child() -> None:
         seed_fields=fields, lifecycle_log=lifecycle_log, shadow_log=shadow_log, prediction_log=prediction_log,
         prefix_scaling=job.get("prefix_scaling"), pins=job.get("pins"),
         snapshot_eval=bool(job.get("snapshot_eval", False)),
+        # absent: a job planned before 2026-11-09, which read the supplied coordinates
+        stream_scaling=job.get("stream_scaling") or "none", scaling_window=job.get("scaling_window"),
     )
+    rows[-1].update(scaling_rule=job.get("scaling_rule") or "none")
     rows[-1].update(stream_sha256=stream.digest.hexdigest(), stream_n_samples=stream.digest.n, code_sha256=code_sha,
                     data_seed=data_seed if C.is_synthetic(fold) else None)
     try:
@@ -1174,6 +1217,15 @@ def build_parser() -> argparse.ArgumentParser:
                              "HPStream.n_samples_init=2000 or BIRCH.n_macro_clusters=8; VALUE is read as JSON when it "
                              "parses, else as a string. The value is the user's choice, not a recommendation; the "
                              "manifest records it per algorithm")
+    parser.add_argument("--stream-scaling", default=C.STREAM_SCALING, choices=C.STREAM_SCALING_RULES,
+                        help="the scaling rule of the streams, each shared by every model and reading of its run: "
+                             "protocol (the default since 2026-11-09: River's StandardScaler(window_size), each point "
+                             "learned then transformed, on every stream but the parameter-drift group, which keeps its "
+                             "coordinates; _common.stream_scaling_of), rolling_standard or none on every stream (none: "
+                             "the supplied coordinates, as out/full)")
+    parser.add_argument("--scaling-window", type=int, default=C.SCALING_WINDOW,
+                        help="the rolling window of --stream-scaling rolling_standard (default: one window h; a "
+                             "placeholder)")
     parser.add_argument("--prefix-scaling", default="none", choices=("none",) + PREFIX_SCALINGS,
                         help="E4: standardise every feature with the first window's mean and standard deviation, "
                              "then hold them fixed (a protocol of its own: write into a new --out-dir)")
@@ -1256,6 +1308,10 @@ def plan_jobs(args: argparse.Namespace) -> tuple[list[dict], list[tuple[dict, di
         raise SystemExit("--shadow-size needs --log-members: the shadow readings are written only beside the member logs")
     log_predictions = bool(getattr(args, "log_predictions", False))
     prefix_scaling = getattr(args, "prefix_scaling", "none") or "none"
+    scaling_rule = getattr(args, "stream_scaling", None) or C.STREAM_SCALING
+    if prefix_scaling != "none" and scaling_rule != "none":
+        raise SystemExit("--prefix-scaling scales the whole stream too: give it with --stream-scaling none")
+    window = C.scaling_window(getattr(args, "scaling_window", None), args.h) if scaling_rule != "none" else None
     pins = parse_pins(getattr(args, "pin", None) or [], algos)
     jobs, skipped = [], []
     picked = []
@@ -1279,6 +1335,8 @@ def plan_jobs(args: argparse.Namespace) -> tuple[list[dict], list[tuple[dict, di
             job["shadow_size"] = shadow_size
         if prefix_scaling != "none":
             job["prefix_scaling"] = prefix_scaling
+        job["scaling_rule"], job["scaling_window"] = scaling_rule, window
+        job["stream_scaling"] = C.stream_scaling_of(fold, scaling_rule)
         if getattr(args, "snapshot_eval", False):
             job["snapshot_eval"] = True
         job["score_partition"] = getattr(args, "score_partition", None) or C.SCORE_PARTITION

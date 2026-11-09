@@ -98,6 +98,17 @@ DRIFT_VARIANT_FOLDS: tuple[str, ...] = (
     "scale_drift_x1_5", "scale_drift_x8", "random_drift", "scale_drift_gradual",
 )
 X7_FOLDS: tuple[str, ...] = NATURAL_DRIFT_FOLDS + DRIFT_VARIANT_FOLDS
+#: The scaling-sensitivity twins of the parameter-drift folds: the same streams, standardised as the real
+#: ones are (``stream_scaling_of``). Their group is ``SENSITIVITY_GROUP``; the reports read them apart
+#: (``report --scaling-sensitivity``), never in a main table, ranking or pool.
+SCALED_TWIN_SUFFIX = "_std"
+SCALED_TWIN_FOLDS: tuple[str, ...] = tuple(f"{f}{SCALED_TWIN_SUFFIX}" for f in PARAM_DRIFT_FOLDS)
+SENSITIVITY_GROUP = "param_drift_scaled"
+
+
+def twin_base(fold: str) -> str:
+    """The parameter-drift fold a scaled twin copies; any other fold itself."""
+    return fold[: -len(SCALED_TWIN_SUFFIX)] if fold in SCALED_TWIN_FOLDS else fold
 
 
 def _e8_folds() -> tuple[tuple[str, ...], tuple[str, ...]]:
@@ -116,6 +127,8 @@ def stream_group(fold: str) -> str:
     streams are real ones; the drift variants change their best parameters as the
     parameter-drift folds do. E8's drift streams join ``param_drift`` and its stationary controls
     ``other_synth`` (a grouping for the reports, the researchers' to change)."""
+    if fold in SCALED_TWIN_FOLDS:
+        return SENSITIVITY_GROUP
     if fold in REAL_FOLDS or fold in NATURAL_DRIFT_FOLDS:
         return "real"
     if fold in PARAM_DRIFT_FOLDS or fold in DRIFT_VARIANT_FOLDS:
@@ -144,6 +157,7 @@ def source_block(fold: str) -> str:
     variant that changes one parameter of a design is that design, any other fold is its
     own. A fold without a stream group raises, as in ``stream_group``."""
     stream_group(fold)
+    fold = twin_base(fold)
     if fold.startswith("insects_"):
         return "insects"
     return _VARIANT_OF.get(fold, fold)
@@ -188,7 +202,14 @@ SIGNAL_ARMS: tuple[str, ...] = tuple(f"confstream_{s}" for s in SELECTABLE if s 
 #: ``frozen_reinit`` share the same ensemble up to the boundary (``followup prefix-identity`` checks it).
 BRANCH_ARMS: dict[str, str] = {"frozen_ensemble": "ensemble", "portfolio_renewal": "portfolio",
                                "random_after_prefix": "random"}
-OPTIONAL_ARMS: tuple[str, ...] = ("random_online", "frozen_reinit", "scaled_default") + tuple(BRANCH_ARMS) + SIGNAL_ARMS
+#: ``frozen_prefix_matched`` (E3, equal budget): one configuration frozen at ``FREEZE_AFTER_WINDOW`` like
+#: ``frozen_prefix``, but tuned before the freeze with ``e_size`` and ``e_test`` scaled by ``budget_factor`` so
+#: that its models evaluated over the whole stream equal ``confstream``'s: the same budget spent before the
+#: freeze instead of spread over the stream. It parts from the other branches on window 0, so it shares no
+#: prefix with them and ``followup prefix-identity`` leaves it out.
+MATCHED_ARMS: tuple[str, ...] = ("frozen_prefix_matched",)
+OPTIONAL_ARMS: tuple[str, ...] = (("random_online", "frozen_reinit", "scaled_default") + tuple(BRANCH_ARMS)
+                                  + MATCHED_ARMS + SIGNAL_ARMS)
 #: Single-configuration arms driven by a file: the sweep's points and its winner.
 EXTRA_ARMS: tuple[str, ...] = ("oracle_static", "sweep")
 #: Diagnostic arms (E4), never deployable and in no report's default list: the tuner with its
@@ -199,9 +220,19 @@ DIAGNOSTIC_ARMS: tuple[str, ...] = ("confstream_ari_oracle", "confstream_ari_ora
 FIXED_ARMS: tuple[str, ...] = ("default", "scaled_default") + EXTRA_ARMS
 #: Every fold is cut at this many samples (the driver caps; loaders never see it).
 N_SAMPLES_CAP = 100_000
-#: ``frozen_prefix`` stops tuning after this window; every arm's tail metrics
-#: start here, so all arms are compared on the same evaluation region.
+#: ``frozen_prefix`` stops tuning after this window.
 FREEZE_AFTER_WINDOW = 20
+#: Every arm's tail metrics start this many windows after the freeze window, so all arms are compared on
+#: the same region and every online--frozen contrast is strictly post-freeze: under the lagged reading,
+#: window ``t0`` is read from the incumbent named after ``t0 - 1`` and window ``t0 + 1`` from the one named
+#: after ``t0``, the same model under both regimes; ``t0 + 2`` is the first window a decision taken after
+#: the freeze can reach. Runs before 2026-11-08 started their tail at the freeze window itself.
+POST_FREEZE_LAG = 2
+
+
+def tail_start(freeze_after_window: int) -> int:
+    """The first window of the evaluation region of a run frozen after ``freeze_after_window``."""
+    return int(freeze_after_window) + POST_FREEZE_LAG
 SWEEP_N_POINTS = 32
 #: The readings the static oracle is picked on, in order of preference: the tail, the
 #: region every arm is compared on, then the whole stream for a stream too short to
@@ -216,9 +247,42 @@ SYNTH_N_SAMPLES = 120_000
 #: so the reports, which key runs by (algo, fold, seed, arm), never mix two draws of a stream.
 DATA_SEED = 42
 
-#: No preprocessing: the algorithms see the data's raw units, and ``s`` is the
-#: only unit in play (HPStream normalises internally; that is the algorithm's).
+#: No scaler inside a model's adapter: a stream is scaled once, before every model and every reading
+#: (``STREAM_SCALING``), so all models of a run share their coordinates.
 SCALER = "none"
+#: The scaling rule of the streams (``benchmark.datasets.scaling``), chosen on 2026-11-09 before any run
+#: under it: ``protocol`` standardises every stream with River's ``StandardScaler(window_size=W)`` (as
+#: ``standard_safe``, RIVER_BUGS.md BUG-1), each point learned then transformed, except the
+#: parameter-drift group, which keeps its supplied coordinates: those streams are built to change the best
+#: parameters (the coordinate scale, the radius, the cluster count), and a rolling standardisation would
+#: undo the change they are built to produce. Their scaled twins (``SCALED_TWIN_FOLDS``) are the
+#: sensitivity check. ``rolling_standard`` and ``none`` apply one scaling to every stream (``none`` as every
+#: run before 2026-11-09). ``SCALING_WINDOW`` None means one window ``h``: a placeholder.
+STREAM_SCALING = "protocol"
+STREAM_SCALING_RULES: tuple[str, ...] = ("protocol", "rolling_standard", "none")
+SCALING_WINDOW: int | None = None
+
+
+def stream_scaling_of(fold: str, rule: str = STREAM_SCALING) -> str:
+    """The scaling ``rule`` gives ``fold`` (``none`` or ``rolling_standard``): under ``protocol``, the
+    parameter-drift group reads its supplied coordinates, its scaled twins and every other stream,
+    a stream outside the protocol's lists included, are standardised."""
+    if rule not in STREAM_SCALING_RULES:
+        raise ValueError(f"scaling rule must be one of {STREAM_SCALING_RULES}, got {rule!r}")
+    if rule != "protocol":
+        return rule
+    if fold in SCALED_TWIN_FOLDS:
+        return "rolling_standard"
+    try:
+        group = stream_group(fold)
+    except ValueError:
+        return "rolling_standard"
+    return "none" if group == "param_drift" else "rolling_standard"
+
+
+def scaling_window(window: int | None, h: int) -> int:
+    """The rolling window a stream is standardised over: ``window``, else one window ``h``."""
+    return int(window) if window is not None else int(h)
 #: ``cmm`` is MOA's CMM (``benchmark.evaluation.cmm``) and ``cmm_strict`` the same without
 #: MOA's class merging and sphere excuse (``confstream.CMM_VARIANTS``); both read the points of
 #: a window, not its labels alone, so they have no cumulative form. ``--no-cmm`` leaves them out.
@@ -243,6 +307,31 @@ PYTHONHASHSEED = "0"
 THREAD_PINS = {"OMP_NUM_THREADS": "1", "OPENBLAS_NUM_THREADS": "1", "MKL_NUM_THREADS": "1"}
 MEMORY_LIMIT_BYTES = 4 * 1024**3
 TIMEOUT_S = 6 * 3600
+
+
+def evaluations(n_scored: int, n_prefix: int, e_size: int, e_test: int, frozen: bool) -> int:
+    """Models evaluated over a run of ``n_scored`` scored windows: ``e_size`` on the first (the ensemble has
+    no test set yet), ``e_size + e_test`` on each later one up to and including the freeze window (the
+    ``n_prefix``-th scored window), then ``e_size + e_test`` again for an arm that goes on tuning, one for a
+    frozen single model. ``frozen=False`` reads every window as tuning (``confstream``)."""
+    if n_scored <= 0:
+        return 0
+    if not frozen:
+        n_prefix = n_scored
+    p = max(1, min(n_scored, n_prefix))
+    return e_size + (p - 1) * (e_size + e_test) + (n_scored - p)
+
+
+def matched_sizes(n_scored: int, n_prefix: int, e_size: int, e_test: int) -> tuple[int, int, float]:
+    """``(e_size, e_test, factor)`` before the freeze for ``frozen_prefix_matched``: both sizes scaled by the
+    factor ``k`` at which a frozen single model evaluates, over the run, as many models as ``confstream``
+    (``evaluations``), ``k (E + (P - 1)(E + C)) + (n - P) = E + (n - 1)(E + C)``, each size rounded. At
+    least the protocol's sizes."""
+    target = evaluations(n_scored, n_scored, e_size, e_test, frozen=False)
+    p = max(1, min(n_scored, n_prefix))
+    prefix = e_size + (p - 1) * (e_size + e_test)
+    k = max(1.0, (target - (n_scored - p)) / prefix) if prefix > 0 else 1.0
+    return max(1, int(round(k * e_size))), int(round(k * e_test)), k
 
 
 def lambda_for(n_windows: int, half_life_frac: float = HALF_LIFE_FRAC) -> float:
@@ -320,6 +409,9 @@ def load_fold(name: str, n_samples: int | None = None, data_seed: int = DATA_SEE
         load_kddcup99, load_shuttle, make_param_drift, make_scenario,
     )
 
+    if name in SCALED_TWIN_FOLDS:
+        # the same points as the fold it copies; the driver scales it (``stream_scaling_of``)
+        return load_fold(twin_base(name), n_samples=n_samples, data_seed=data_seed)
     if name == "covtype":
         return load_covtype(quantitative_only=True)
     if name == "kdd99":
@@ -352,6 +444,7 @@ def is_synthetic(name: str) -> bool:
     """Whether ``name`` is drawn by a generator, so that a data seed reaches it."""
     from benchmark.datasets import PARAM_DRIFT_SCENARIOS, SCENARIOS
 
+    name = twin_base(name)
     return name in PARAM_DRIFT_SCENARIOS or name in SCENARIOS
 
 
@@ -362,6 +455,8 @@ def fold_source(name: str) -> dict:
     content each run consumed, which catches what a description cannot (a data file
     replaced under the same loader).
     """
+    if name in SCALED_TWIN_FOLDS:
+        return {**fold_source(twin_base(name)), "scaled_twin_of": twin_base(name)}
     real = {
         "covtype": ("load_covtype", {"quantitative_only": True}),
         "kdd99": ("load_kddcup99", {"n_samples": None}),
@@ -396,6 +491,7 @@ def drift_points(fold: str, n_samples: int | None) -> tuple[int, ...]:
     """Sample indices where a parameter-drift fold changes regime; ``()`` otherwise."""
     from benchmark.datasets import PARAM_DRIFT_SCENARIOS, make_param_drift
 
+    fold = twin_base(fold)
     if fold in PARAM_DRIFT_SCENARIOS:
         return make_param_drift(fold, n_samples=n_samples or SYNTH_N_SAMPLES).drift_points
     return ()

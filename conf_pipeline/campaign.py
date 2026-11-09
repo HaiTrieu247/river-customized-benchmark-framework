@@ -61,7 +61,8 @@ REPO_CONSTANTS: dict[str, str] = {
 }
 PROTOCOL_KEYS = ("seed_policy", "model_seed", "fixed_model_seeds", "data_seed", "h", "e_size", "e_test",
                  "freeze_after_window", "n_samples", "p_reset", "half_life_frac", "lam", "runtime_gate",
-                 "max_memory_mb", "max_micro_clusters", "tie_break", "log_members", "signals", "signal_noise", "cmm")
+                 "max_memory_mb", "max_micro_clusters", "tie_break", "log_members", "signals", "signal_noise", "cmm",
+                 "score_partition", "stream_scaling", "scaling_window")
 
 
 # --- the config -----------------------------------------------------------------------------------
@@ -143,16 +144,30 @@ INHERITS_LABELLING: dict[str, str] = {**C.RIVER_CLASS, "CluStreamPyramidal": "Cl
 OPEN_CONDITIONS: tuple[str, ...] = (
     "repeatability across two machines not checked (one-machine smoke only)",
     "no smoke on a real stream at the campaign's h, E, C",
-    "the 12 h timeout is a projection for CluStream on kdd99 without the gate and with stability (margin x1.25)",
+    "the timeout is a projection for CluStream on kdd99 without the gate (operational.timeout_source), not a "
+    "measurement at the campaign's protocol",
 )
 
 
-def _algo_status(algo: str) -> dict:
+#: Why a GAP-6 issue no longer limits a campaign run under the snapshot rule (``score_partition``).
+SNAPSHOT_RESOLUTION = ("resolved by the protocol: under score_partition=snapshot the selection signal and every "
+                       "*_win reading read partitions of one model state (docs/SEQUENTIAL_PARTITION_AUDIT.md "
+                       "section 7.7); the issue bears only on the sequential assignment score, reported apart as "
+                       "lag_seq_*")
+
+
+def _algo_status(algo: str, score_partition: str = "sequential") -> dict:
     """``open`` (an issue of its own or of the River class it inherits its labels from), ``resolved``,
-    ``no known issue`` (audited), or ``not audited`` (never read: it blocks like an open issue)."""
+    ``no known issue`` (audited), or ``not audited`` (never read: it blocks like an open issue). Under the
+    snapshot rule an open within-window labelling issue is ``resolved`` for the campaign's readings."""
     if algo in RESOLVED:
         return {"status": "resolved", "evidence": RESOLVED[algo]}
     base = algo if algo in MEASUREMENT_ISSUES else INHERITS_LABELLING.get(algo)
+    if base in MEASUREMENT_ISSUES and score_partition == "snapshot":
+        out = {"status": "resolved", "evidence": SNAPSHOT_RESOLUTION, "issue": MEASUREMENT_ISSUES[base]["issue"]}
+        if base != algo:
+            out["inherited_from"] = base
+        return out
     if base in MEASUREMENT_ISSUES:
         out = {"status": "open", **MEASUREMENT_ISSUES[base]}
         if base != algo:
@@ -169,7 +184,8 @@ def measurement_status(cfg: dict) -> dict:
     results may stand as confirmation for the paper: never while an algorithm in the inventory has an
     open issue or a condition of ``OPEN_CONDITIONS`` is open. Runs, dry runs and diagnostics go ahead."""
     algos = [a for g in cfg["groups"] for a in g["algos"]]
-    per = {a: _algo_status(a) for a in algos}
+    rule = cfg["protocol"].get("score_partition", "sequential")
+    per = {a: _algo_status(a, rule) for a in algos}
     blocked = sorted(a for a, v in per.items() if v["status"] not in ("no known issue", "resolved"))
     reasons = [f"{a}: {per[a].get('issue', per[a]['status'])}" for a in blocked] + list(OPEN_CONDITIONS)
     return {"paper_confirmation": "not eligible" if reasons else "eligible on the known measurement issues",
@@ -240,9 +256,12 @@ def run_argv(cfg: dict, group: dict, out_dir: Path, workers: int, dry_run: bool 
             "--half-life-frac", repr(float(p["half_life_frac"])),
             "--max-memory-mb", repr(float(p["max_memory_mb"])), "--max-micro-clusters", str(p["max_micro_clusters"]),
             "--tie-break", p["tie_break"], "--signal-noise", p["signal_noise"],
+            "--score-partition", p["score_partition"], "--stream-scaling", p["stream_scaling"],
             "--out-dir", str(out_dir), "--workers", str(int(workers)), "--timeout", str(cfg["operational"]["timeout_s"])]
     if p.get("lam") is not None:
         argv += ["--lam", repr(float(p["lam"]))]
+    if p.get("scaling_window") is not None:
+        argv += ["--scaling-window", str(int(p["scaling_window"]))]
     if not p["runtime_gate"]:
         argv.append("--no-runtime-gate")
     if p["log_members"]:

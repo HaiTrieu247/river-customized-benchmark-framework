@@ -1,4 +1,82 @@
-# Chiến dịch cơ chế sáu arm (E1, E2, E5): protocol thực tế và lệnh chạy
+# Chiến dịch cơ chế (E1, E2, E3, E5): protocol thực tế và lệnh chạy
+
+**Cập nhật 09/11/2026.** Chiến dịch có thêm ba nhánh E3 của paper: `frozen_ensemble` (giữ cả portfolio
+lúc đóng băng, tiếp tục chọn giữa các model sẵn có, không tạo model mới), `portfolio_renewal` (giữ cấu hình
+của portfolio, mỗi cửa sổ làm mới model của `e_test` cấu hình) và `random_after_prefix` (tiếp tục tune bằng
+cấu hình rút đều trên không gian từ cùng trạng thái). Cùng với `frozen_prefix` và `confstream`, đó là năm thủ
+tục mà phản biện yêu cầu; cả năm dùng chung phần đầu luồng tới cửa sổ đóng băng (chạy lại tất định, chứng
+nhận bằng `followup prefix-identity`). Danh sách job thành 1 848 job chạy được (240 job cho mỗi nhánh mới) và
+24 job ghi là bỏ qua. `report --contrasts` có thêm `portfolio_renewal − frozen_prefix` và
+`random_after_prefix − frozen_prefix`, và với mỗi phép so ghi chi phí của hai bên sau đóng băng (`costs.csv`:
+giây CPU mỗi run, tỉ lệ trung vị, số model được chấm mỗi cửa sổ), vì các thủ tục liên tục chấm E + C model mỗi
+cửa sổ còn `frozen_prefix` chỉ một: hiệu chất lượng đi kèm hiệu chi phí đó, không phải ở ngân sách bằng nhau.
+Cấu hình ghi `score_partition: snapshot` (silhouette chọn và mọi số `*_win` đọc snapshot,
+`docs/SEQUENTIAL_PARTITION_AUDIT.md` mục 7.7), vùng đánh giá bắt đầu ở t ≥ 22 (mục 7.8), nên bốn vấn đề nhãn
+GAP-6 không còn giới hạn các số đọc của chiến dịch (`measurement_status` ghi `resolved by the protocol`); ba
+điều kiện chung của mục 8 vẫn mở. Dự toán (`cost --campaign`, chi phí đo của `out/full`, các nhánh mới đọc
+qua `confstream`, hệ số 1,15 cho hai lần dự đoán snapshot): khoảng 471 giờ tiến trình, khoảng 59 giờ trên 8
+worker. Các đoạn dưới đây mô tả phiên bản sáu arm ngày 04/11 và giữ nguyên làm lịch sử.
+
+**Chỉ chạy E3 (09/11/2026).** `conf_pipeline/campaigns/e3_mechanism.json` là chiến dịch trên, giới hạn ở
+năm thủ tục E3: `frozen_prefix`, `frozen_ensemble`, `portfolio_renewal`, `random_after_prefix`, `confstream`.
+Luồng, nhóm thuật toán, tuner seed, model seed và protocol giữ nguyên, trừ một điểm: chẩn đoán `stability`
+không được ghi (`signals: []`). Nó không bao giờ vào phép chọn và không phép so E3 nào đọc nó, nhưng chiếm
+khoảng 5–20% thời gian mỗi job ở các smoke ngày 04/11. Vì vậy các run E3 không gộp được vào thư mục của
+`mechanism_pilot.json`. Thư mục ra là `conf_pipeline/out/e3_mechanism`, gồm 1 200 job (240 mỗi arm), không
+job nào bị bỏ qua. Danh sách job đúng bằng các job năm arm đó trong chiến dịch đầy đủ
+(`tests/test_conf_campaign.py`).
+
+Timeout là 86 400 giây. Job dài nhất dự kiến là CluStream trên kdd99 ở bốn arm liên tục: 10,5 giờ trên một lõi
+vật lý (`cost --stat max`, hệ số 1,15 cho snapshot, 1,2 cho bỏ gate). Với 16 worker trên máy 8 lõi 16 luồng,
+mỗi job chậm khoảng 1,5 lần, tức khoảng 15,7 giờ, quá 12 giờ của chiến dịch đầy đủ.
+
+Dự toán bên dưới đọc từ chi phí đo của `out/full`. Ba nhánh mới được đọc qua `confstream`, và
+HPStreamStableLabels qua HPStream.
+
+| Máy, số worker | Giờ tiến trình (trung bình / chậm nhất) | Wall (trung bình / chậm nhất) |
+|---|---:|---:|
+| 8C/16T, 8 worker | 383 / 422 | 48 h / 53 h |
+| 8C/16T, 16 worker (giả định chậm 1,5 lần mỗi job) | 575 / 633 | 36 h / 40 h |
+| 32C/64T, 32 worker | 383 / 422 | 12 h / 13 h |
+
+`report --contrasts` đọc bảy phép so E3:
+
+- `frozen_ensemble`, `portfolio_renewal`, `random_after_prefix` và `confstream`, mỗi thủ tục so với `frozen_prefix`;
+- `portfolio_renewal − frozen_ensemble`;
+- `confstream − random_after_prefix`;
+- `confstream − portfolio_renewal`.
+
+Mỗi phép so có chi phí sau đóng băng của hai bên trong `costs.csv`. `followup prefix-identity` chứng nhận
+phần đầu luồng chung; `followup post-freeze` kiểm thứ tự challenger trên log.
+
+```bash
+PYTHONHASHSEED=0 .venv/bin/python -m conf_pipeline.campaign --config conf_pipeline/campaigns/e3_mechanism.json
+PYTHONHASHSEED=0 nohup .venv/bin/python -m conf_pipeline.campaign --config conf_pipeline/campaigns/e3_mechanism.json \
+    --execute --workers 16 > conf_pipeline/out/e3_mechanism.log 2>&1 &
+PYTHONHASHSEED=0 .venv/bin/python -m conf_pipeline.campaign --config conf_pipeline/campaigns/e3_mechanism.json --status
+```
+
+**Đối chứng cùng ngân sách (09/11/2026).** Phản biện đòi so mỗi thủ tục liên tục với mô hình đóng băng
+"dưới ngân sách tương đương". `frozen_prefix` chỉ chấm một model mỗi cửa sổ sau đóng băng, còn các thủ tục
+liên tục chấm E + C model. Arm `frozen_prefix_matched` (`_common.MATCHED_ARMS`) đóng băng một cấu hình ở
+cùng cửa sổ, nhưng trước đóng băng tune với E và C nhân cùng một hệ số (`_common.matched_sizes`). Hệ số được
+chọn sao cho tổng số model được chấm trên cả luồng bằng của `confstream`: E ở cửa sổ chấm đầu tiên, E + C ở
+mỗi cửa sổ sau, và một model mỗi cửa sổ sau đóng băng (`_common.evaluations`).
+
+Hệ số tính trong run, sau pha hiệu chỉnh, vì số cửa sổ được chấm phụ thuộc độ dài luồng và số cửa sổ hiệu
+chỉnh. Trên luồng 100 cửa sổ, hệ số khoảng 4,9 (E' = 98, C' = 49). Run ghi `budget_factor`, `budget_e_size`,
+`budget_e_test`, `budget_target_evaluations`, `budget_planned_evaluations` và `n_evaluated_total`; trên
+smoke hai số cuối khớp đúng với `confstream` (68 = 68, `tests/test_budget_matched.py`).
+
+Ngân sách đo bằng số model được chấm, không bằng giây CPU, vì giây CPU phụ thuộc máy, số worker và cấu
+hình được chọn. Arm này khác các nhánh từ cửa sổ 0, nên không chung phần đầu luồng; `followup
+prefix-identity` bỏ nó ra. `report --contrasts` đọc thêm năm phép so cùng ngân sách: bốn thủ tục liên tục,
+mỗi thủ tục so với `frozen_prefix_matched`, và `frozen_prefix_matched − frozen_prefix`.
+
+Đã thêm vào `e3_mechanism.json`: 1 440 job. Dự toán (`--stat max`, arm mới đọc qua `confstream`, là giả định):
+520 giờ tiến trình; khoảng 65 h trên 8 worker, 49 h trên 16 worker (8C/16T), 16 h trên 32 worker.
+Rủi ro chưa đo: 147 model trong một tiến trình. Với RepStream trên k_drift (51 MB mỗi model ở `out/full`),
+tổng có thể vượt giới hạn 4 GiB mỗi tiến trình; job như vậy sẽ được ghi `oom` và đếm trong coverage.
 
 Ngày 04/11/2026 (cập nhật cùng ngày sau vòng review thứ hai). Tài liệu này mô tả protocol mà code hiện tại
 chạy, các kiểm tra đã làm và các lệnh để chạy tiếp. Chiến dịch chưa chạy; ở đây không có kết quả thực nghiệm

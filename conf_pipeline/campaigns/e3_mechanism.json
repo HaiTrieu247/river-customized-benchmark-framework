@@ -1,0 +1,104 @@
+{
+  "schema": 1,
+  "name": "e3_mechanism",
+  "description": "E3 only: the five procedures that separate parameter adaptation from model renewal and continued selection, on the 12 streams of mechanism_pilot.json under the same protocol. frozen_prefix (one selected configuration, no fresh state), frozen_ensemble (the portfolio kept at the freeze, selection among its existing models, no fresh state), portfolio_renewal (the same fixed portfolio, fresh models of its configurations), random_after_prefix (new configurations drawn uniformly from the same state) and confstream (new configurations drawn around parents). All five run the same tuner up to and including the freeze window, with the same tuner and model seeds, gate-free and with the deterministic tie-break, so they share their prefix (followup prefix-identity certifies it); every model reads the same stream scaling (stream_scaling protocol), the same adapters, eligibility caps and initialisation. The stability diagnostic is not logged (signals []): it never enters selection and no E3 contrast reads it, so these runs do not pool with mechanism_pilot.json. frozen_prefix_matched is the equal-budget control: one configuration frozen at the same window, tuned before the freeze with e_size and e_test scaled (C.matched_sizes, about 4.9x on a 100-window stream) so that it evaluates as many models over the run as confstream; it shares no prefix with the others. report --contrasts reads portfolio_renewal-frozen_ensemble, confstream-random_after_prefix, confstream-portfolio_renewal and every continuous procedure against frozen_prefix, each with its post-freeze cost (costs.csv).",
+  "out_dir": "conf_pipeline/out/e3_mechanism",
+  "folds": [
+    "covtype",
+    "kdd99",
+    "electricity",
+    "shuttle",
+    "insects_abrupt_imbalanced",
+    "scale_drift",
+    "density_drift",
+    "k_drift",
+    "mixed_drift",
+    "static_overlap",
+    "incremental_drift",
+    "evolving"
+  ],
+  "arms": [
+    "frozen_prefix",
+    "frozen_ensemble",
+    "portfolio_renewal",
+    "random_after_prefix",
+    "confstream",
+    "frozen_prefix_matched"
+  ],
+  "groups": [
+    {
+      "name": "six_algorithms_three_tuner_seeds",
+      "algos": [
+        "DenStream",
+        "HPStreamStableLabels",
+        "DBSTREAM",
+        "STREAMKMeans",
+        "SOStream",
+        "BIRCH"
+      ],
+      "tuner_seeds": [
+        101,
+        102,
+        103
+      ]
+    },
+    {
+      "name": "clustream_repstream_one_tuner_seed",
+      "algos": [
+        "CluStream",
+        "RepStream"
+      ],
+      "tuner_seeds": [
+        101
+      ]
+    }
+  ],
+  "protocol": {
+    "seed_policy": "split",
+    "model_seed": 201,
+    "fixed_model_seeds": [
+      201
+    ],
+    "data_seed": 42,
+    "h": 1000,
+    "e_size": 20,
+    "e_test": 10,
+    "freeze_after_window": 20,
+    "n_samples": 100000,
+    "p_reset": 0.01,
+    "half_life_frac": 0.1,
+    "lam": null,
+    "runtime_gate": false,
+    "max_memory_mb": 2048.0,
+    "max_micro_clusters": 10000,
+    "tie_break": "micro_clusters",
+    "log_members": true,
+    "signals": [],
+    "signal_noise": "label",
+    "cmm": true,
+    "score_partition": "snapshot",
+    "stream_scaling": "protocol",
+    "scaling_window": null
+  },
+  "locked_to_repo_constants": [
+    "h",
+    "e_size",
+    "e_test",
+    "freeze_after_window",
+    "n_samples",
+    "p_reset",
+    "half_life_frac",
+    "max_memory_mb",
+    "max_micro_clusters",
+    "data_seed",
+    "model_seed"
+  ],
+  "operational": {
+    "timeout_s": 86400,
+    "timeout_source": "24 h: the longest projected job (CluStream on kdd99, 10.5 h on a physical core by conf_pipeline.cost --stat max from out/full, x1.15 snapshot rule, x1.2 no gate) runs about 1.5x slower with 16 workers on 8 cores and 16 threads, about 15.7 h, past the 12 h of mechanism_pilot.json",
+    "workers": 16
+  },
+  "decisions": {
+    "HPStream": "read through HPStreamStableLabels, run in its place: River's HPStream with labels never reused (RIVER_BUGS.md GAP-6), the same clusters and predictions at every point; decided by the user on 2026-11-04. River's HPStream stays registered and runnable; the campaign does not run both, as one model would count twice"
+  }
+}

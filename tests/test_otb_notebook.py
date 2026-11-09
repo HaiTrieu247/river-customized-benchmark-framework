@@ -78,7 +78,7 @@ def test_full_runs_three_seeds_and_reruns_the_oracle_on_three_others(tmp_path, m
 
     ns = _panel("full", tmp_path, monkeypatch)
     assert ns["SEEDS"] == [1, 2, 3] and ns["ORACLE_SEEDS"] == [2, 3, 4]
-    assert ns["ALGOS"] == [*C.ALGOS, *C.IMPL_VARIANTS] and ns["FOLDS"] == list(C.FOLDS)
+    assert ns["ALGOS"] == [*C.ALGOS, *C.IMPL_VARIANTS] and ns["FOLDS"] == [*C.FOLDS, *C.SCALED_TWIN_FOLDS]
 
 
 def test_smoke_covers_every_cell_of_full_on_a_short_stream(tmp_path, monkeypatch):

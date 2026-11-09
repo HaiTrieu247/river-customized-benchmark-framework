@@ -890,7 +890,7 @@ def test_contrasts_end_to_end_on_a_split_dir_with_failures_and_coverage(tmp_path
     t = report.contrast_tables(out)
     g = t["groups"].query("level == 'group' and metric == 'ari' and subset == 'all' and unit == 'real'")
     assert set(g["contrast"]) == {"scaled_default-default", "confstream-scaled_default", "frozen_reinit-frozen_prefix",
-                                  "confstream-frozen_reinit", "confstream-random_online"}
+                                  "confstream-frozen_reinit", "confstream-random_online", "confstream-frozen_prefix"}
     e1 = g.set_index("contrast").loc["scaled_default-default"]
     assert e1["n_algorithms"] == 2                         # HPStream/RepStream never read 0 by construction
     full = g.set_index("contrast").loc["confstream-scaled_default"]
@@ -912,4 +912,5 @@ def test_contrasts_end_to_end_on_a_split_dir_with_failures_and_coverage(tmp_path
     nmi = t["groups"].query("metric == 'nmi'")
     assert len(nmi)
     paths = report.write_contrasts(out)
-    assert (out / "report" / "contrasts" / "contrasts.md").exists() and len(paths) == 9
+    assert (out / "report" / "contrasts" / "contrasts.md").exists() and len(paths) == 10
+    assert (out / "report" / "contrasts" / "costs.csv").exists()

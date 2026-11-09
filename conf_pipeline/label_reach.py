@@ -29,13 +29,19 @@ OUT_NAME = "label_reach.jsonl"
 
 
 def fold_rows(fold: str, h: int = C.H, n_samples: int | None = C.N_SAMPLES_CAP,
-              eps_grid=LR.EPS_GRID, min_samples: int = LR.MIN_SAMPLES) -> list[dict]:
-    """Every reading of one fold, then its ``fold`` row."""
+              eps_grid=LR.EPS_GRID, min_samples: int = LR.MIN_SAMPLES, stream_scaling: str = C.STREAM_SCALING,
+              scaling_window: int | None = C.SCALING_WINDOW) -> list[dict]:
+    """Every reading of one fold, then its ``fold`` row; the stream scaled as the benchmark's runs scale it."""
+    from benchmark.datasets.scaling import scale_stream
+
     t0 = time.perf_counter()
-    base = {"fold": fold, "h": h, "n_samples_cap": n_samples, "min_samples": min_samples}
+    stream_scaling = C.stream_scaling_of(fold, stream_scaling or "none")
+    window_size = C.scaling_window(scaling_window, h) if stream_scaling != "none" else None
+    base = {"fold": fold, "h": h, "n_samples_cap": n_samples, "min_samples": min_samples,
+            "stream_scaling": stream_scaling, "scaling_window": window_size}
     rows, xs, ys = [], [], []
     n_seen = window = n_single = 0
-    for x, y in C.load_fold(fold, n_samples):
+    for x, y in scale_stream(C.load_fold(fold, n_samples), stream_scaling, window_size):
         if n_samples is not None and n_seen >= n_samples:
             break
         xs.append(dict(x))
@@ -74,6 +80,9 @@ def main() -> None:
     parser.add_argument("--eps-grid", default=",".join(f"{v:.6g}" for v in LR.EPS_GRID),
                         help="DBSCAN radii as multiples of the window's median pairwise distance")
     parser.add_argument("--out-dir", default=str(C.OUT))
+    parser.add_argument("--stream-scaling", default=C.STREAM_SCALING, choices=C.STREAM_SCALING_RULES,
+                        help="match the runs' --stream-scaling")
+    parser.add_argument("--scaling-window", type=int, default=C.SCALING_WINDOW, help="default: one window h")
     parser.add_argument("--workers", type=int, default=1)
     parser.add_argument("--force", action="store_true", help="override a lock left by a dead process")
     args = parser.parse_args()
@@ -84,7 +93,8 @@ def main() -> None:
     with C.JsonlLock(path, force=args.force):
         todo = [f for f in _csv(args.folds) if f not in done_folds(path)]
         print(f"{len(todo)} folds to read ({path})")
-        kwargs = dict(h=args.h, n_samples=n_samples, eps_grid=eps_grid, min_samples=args.min_samples)
+        kwargs = dict(h=args.h, n_samples=n_samples, eps_grid=eps_grid, min_samples=args.min_samples,
+                      stream_scaling=args.stream_scaling, scaling_window=args.scaling_window)
         if args.workers <= 1:
             results = ((f, fold_rows(f, **kwargs)) for f in todo)
         else:

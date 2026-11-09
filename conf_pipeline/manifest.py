@@ -92,7 +92,7 @@ def constants() -> dict:
         "TABLE_A_EPS_FACTOR": C.TABLE_A_EPS_FACTOR, "ORACLE_METRICS": C.ORACLE_METRICS,
         "SYNTH_N_SAMPLES": C.SYNTH_N_SAMPLES, "PYTHONHASHSEED": C.PYTHONHASHSEED,
         "THREAD_PINS": C.THREAD_PINS, "UNDEFINED_SCORE": UNDEFINED_SCORE, "INITIAL_SIGMA": INITIAL_SIGMA,
-        "INIT_BUFFER_PARAMS": INIT_BUFFER_PARAMS, "lag_windows": 1, "tail_from": "freeze_after_window",
+        "INIT_BUFFER_PARAMS": INIT_BUFFER_PARAMS, "lag_windows": 1, "tail_from": f"freeze_after_window + {C.POST_FREEZE_LAG}",
     })
 
 
@@ -199,7 +199,7 @@ def _seeds(jobs: list[dict]) -> dict:
 #: still matches, and a run that sets it is a different arm.
 _LATER_ARM_FIELDS = {"freeze_mode": "single", "shadow_size": 0, "score_partition": "sequential"}
 #: Protocol fields added later, recorded only when a job sets them (absent means the earlier protocol).
-OPTIONAL_PROTOCOL_KEYS = ("prefix_scaling",)
+OPTIONAL_PROTOCOL_KEYS = ("prefix_scaling", "scaling_rule", "scaling_window")
 
 
 def arm_spec(job: dict) -> dict:
@@ -241,6 +241,9 @@ def build(jobs: list[dict], provenance: dict | None = None, sweep: dict | None =
         key = stream_key(j["fold"], protocol["data_seed"])
         if key not in m["streams"]:
             m["streams"][key] = stream_spec(j["fold"], protocol["n_samples"], protocol["data_seed"])
+            if j.get("stream_scaling") not in (None, "none"):
+                # the scaling this stream is read under (``_common.stream_scaling_of``), part of what it is
+                m["streams"][key]["stream_scaling"] = j["stream_scaling"]
     if sweep is not None:
         m["sweep"] = _plain(sweep)
     m["code"] = _plain(code_provenance() if provenance is None else provenance)

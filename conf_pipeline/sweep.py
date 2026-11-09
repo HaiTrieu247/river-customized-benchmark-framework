@@ -164,7 +164,7 @@ def _protocol(protocol: dict) -> dict:
         p_reset=C.P_RESET, half_life_frac=C.HALF_LIFE_FRAC, runtime_factor=C.RUNTIME_FACTOR,
         max_memory_mb=C.MAX_MEMORY_MB, max_micro_clusters=C.MAX_MICRO_CLUSTERS,
         freeze_after_window=C.FREEZE_AFTER_WINDOW, data_seed=C.DATA_SEED,
-        score_partition=C.SCORE_PARTITION,
+        score_partition=C.SCORE_PARTITION, stream_scaling=C.STREAM_SCALING, scaling_window=C.SCALING_WINDOW,
     )
     unknown = sorted(set(protocol) - set(defaults))
     if unknown:
@@ -189,6 +189,8 @@ def _sweep_job(algo, fold, seeds_of, n_samples, h, proto, config_id,
         "freeze_after_window": proto["freeze_after_window"], "member_log": None,
         "config_id": config_id, "unit_override": unit_override, "params_override": params_override,
         "data_seed": proto["data_seed"], "score_partition": proto["score_partition"],
+        "scaling_rule": proto["stream_scaling"], "stream_scaling": C.stream_scaling_of(fold, proto["stream_scaling"]),
+        "scaling_window": (C.scaling_window(proto["scaling_window"], h) if proto["stream_scaling"] != "none" else None),
     }
 
 
@@ -438,8 +440,8 @@ def main() -> None:
     parser.add_argument("--n-samples", type=int, default=C.N_SAMPLES_CAP, help="0 = whole stream")
     parser.add_argument("--h", type=int, default=C.H)
     parser.add_argument("--freeze-after-window", type=int, default=C.FREEZE_AFTER_WINDOW,
-                        help="where every point's tail starts, the region the oracle is picked on "
-                             "(match the arms' --freeze-after-window)")
+                        help="the freeze window of the arms (match their --freeze-after-window); every point's "
+                             "tail, the region the oracle is picked on, starts POST_FREEZE_LAG windows later")
     parser.add_argument("--out-dir", default=str(C.OUT))
     parser.add_argument("--workers", type=int, default=1)
     parser.add_argument("--timeout", type=int, default=C.TIMEOUT_S)
@@ -447,6 +449,10 @@ def main() -> None:
                         help="leave CMM (cmm, cmm_strict) out of the per-window external readings")
     parser.add_argument("--data-seed", type=int, default=C.DATA_SEED,
                         help="seed of the synthetic streams' generators (match the arms' --data-seed)")
+    parser.add_argument("--stream-scaling", default=C.STREAM_SCALING, choices=C.STREAM_SCALING_RULES,
+                        help="match the arms' --stream-scaling (default protocol)")
+    parser.add_argument("--scaling-window", type=int, default=C.SCALING_WINDOW,
+                        help="match the arms' --scaling-window (default: one window h)")
     parser.add_argument("--score-partition", default=C.SCORE_PARTITION, choices=("snapshot", "sequential"),
                         help="match the arms' --score-partition: under snapshot every point's ARI reads its "
                              "snapshot at the start of each window, the reading the oracle is picked on")
@@ -481,6 +487,7 @@ def main() -> None:
         folds = _csv(args.folds)
         gate = {"runtime_factor": None} if args.no_runtime_gate else {}
         gate["score_partition"] = args.score_partition
+        gate["stream_scaling"], gate["scaling_window"] = args.stream_scaling, args.scaling_window
         if args.seed_policy == "split":
             if args.seed is not None or args.seeds is not None:
                 raise SystemExit("--seed and --seeds are the shared policy's; under the split policy give "

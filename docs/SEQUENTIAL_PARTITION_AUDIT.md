@@ -397,3 +397,21 @@ cửa sổ của incumbent trễ, trùng với `lag_snap_pre_ari_win`, và mọi
 trường này được đọc là `sequential`), và `report.current_runs` từ chối một out dir trộn hai cơ sở. Số gộp cả
 luồng `lag_<metric>_cumulative` đã bị bỏ khỏi dòng tóm tắt và khỏi báo cáo: nó ghép nhãn của mọi cửa sổ và mọi
 incumbent, vốn không gọi tên chung cụm nào.
+
+### 7.8 Vùng đánh giá bắt đầu sau cửa sổ đóng băng hai cửa sổ; thứ tự của challenger (08/11/2026)
+
+Theo cách đọc trễ, cửa sổ `t0` (cửa sổ đóng băng, 20) được đọc từ incumbent chọn sau `t0 − 1`, và cửa sổ
+`t0 + 1` từ incumbent chọn sau `t0`: dưới `confstream` và `frozen_prefix` đó là cùng một mô hình. Cửa sổ đầu
+tiên mà một quyết định sau khi đóng băng có thể chạm tới là `t0 + 2`. Từ ngày này phần đuôi của mọi arm bắt
+đầu ở đó (`_common.POST_FREEZE_LAG = 2`, `_common.tail_start`): `tail_from` của dòng tóm tắt là 22 ở protocol,
+dòng tóm tắt ghi thêm `tail_freeze_window`, lượt quét chọn oracle trên cùng vùng đó, và mọi so sánh
+`confstream`–`frozen_prefix` là strictly post-freeze. Run trước ngày này tính đuôi từ chính cửa sổ đóng băng;
+báo cáo đọc `tail_from` của từng run nên vẫn đọc đúng chúng, còn `followup post-freeze` lấy `t0` từ
+`tail_freeze_window` khi có. KDD99 còn 23 trên 78 cửa sổ có hơn một lớp, INSECTS gradual balanced còn 2.
+
+Thứ tự vào tuner của một challenger, đúng như mã chạy: tạo sau cửa sổ `t − 1` và warm-start trên cửa sổ đó chỉ
+bằng lời gọi learn; chấm lần đầu ở cửa sổ `t`, mỗi điểm được dự đoán trước khi học; nhận vào hay thay thế sau
+cửa sổ `t`; làm incumbent sớm nhất từ cửa sổ `t + 1`; không mô hình nào học một điểm hai lần, và snapshot chỉ dự
+đoán trên bản sao. `tests/test_challenger_timing.py` kiểm từng điều này trên mô hình ghi lại mọi lời gọi. Theo
+quy tắc snapshot, silhouette dùng để chọn được đọc sau khi mọi mô hình đã học cửa sổ `t` (trong mẫu, như
+confStream), không phải điểm prequential; điểm ngoài của cửa sổ đọc trạng thái trước cửa sổ, nên ngoài mẫu.

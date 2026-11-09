@@ -134,7 +134,8 @@ class _Streams:
         self.cache: dict = {}
 
     def get(self, run: dict):
-        key = (run["fold"], run.get("n_samples_cap"), run.get("data_seed"), run.get("prefix_scaling"), run.get("h"))
+        key = (run["fold"], run.get("n_samples_cap"), run.get("data_seed"), run.get("prefix_scaling"), run.get("h"),
+               run.get("stream_scaling"), run.get("scaling_window"))
         if key not in self.cache:
             from .run import PrefixStandardised
 
@@ -142,6 +143,10 @@ class _Streams:
                                data_seed=run.get("data_seed") if run.get("data_seed") is not None else C.DATA_SEED)
             if run.get("prefix_scaling") not in (None, "none"):
                 data = PrefixStandardised(data, run["h"])
+            from benchmark.datasets.scaling import scale_stream
+
+            # the coordinates the run's models saw: a run records its stream scaling (none before 2026-11-09)
+            data = scale_stream(data, run.get("stream_scaling"), run.get("scaling_window"))
             xs, ys = [], []
             for x, y in data:
                 if run.get("n_samples_cap") and len(xs) >= run["n_samples_cap"]:

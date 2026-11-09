@@ -347,12 +347,27 @@ def contrast(seeds: pd.DataFrame, other: str, unit: str, n_boot: int = N_BOOT, s
 
 # --- E2: post-freeze ---------------------------------------------------------------------------------
 
+def _freeze_windows(runs: pd.DataFrame) -> dict:
+    """(algo, fold, seed, arm) -> the run's freeze window t0: ``tail_freeze_window`` where the run records
+    it, else its ``tail_from`` (runs before 2026-11-08 started their tail at the freeze window)."""
+    if runs.empty:
+        return {}
+    if "tail_freeze_window" not in runs:
+        return R._tail_from(runs)
+    out = R._tail_from(runs)
+    vals = pd.to_numeric(runs["tail_freeze_window"], errors="coerce")
+    for a, f, s, arm, t in zip(runs["algo"], runs["fold"], runs["seed"], runs["arm"], vals):
+        if not pd.isna(t):
+            out[(a, f, s, arm)] = int(t)
+    return out
+
+
 def start_specs(runs: pd.DataFrame, starts=None, offsets=(0, 1, 2)) -> list[tuple[str, object]]:
-    """``[(label, tail_from)]``: absolute ``starts`` as given, else each run's freeze window t0 (its
-    ``tail_from``, which is ``FREEZE_AFTER_WINDOW`` in every protocol run) plus each of ``offsets``."""
+    """``[(label, tail_from)]``: absolute ``starts`` as given, else each run's freeze window t0
+    (``_freeze_windows``; ``FREEZE_AFTER_WINDOW`` in every protocol run) plus each of ``offsets``."""
     if starts:
         return [(f"t>={int(s)}", int(s)) for s in starts]
-    tail = R._tail_from(runs)
+    tail = _freeze_windows(runs)
     values = sorted(set(tail.values()))
     out = []
     for k in offsets:
@@ -700,7 +715,8 @@ def prefix_table(members: pd.DataFrame, wrows: pd.DataFrame, runs: pd.DataFrame)
         branches.setdefault(bkey, {})[arm] = job
     rows = []
     for bkey, arms in sorted(branches.items(), key=lambda kv: str(kv[0])):
-        frozen = sorted(a for a in arms if arms[a] in freeze)
+        # the budget-matched arm tunes with other sizes from window 0: it shares no prefix with the others
+        frozen = sorted(a for a in arms if arms[a] in freeze and a not in C.MATCHED_ARMS)
         pairs = [(ONLINE, a) for a in frozen if ONLINE in arms]
         pairs += [(a, b) for i, a in enumerate(frozen) for b in frozen[i + 1:]]
         for a, b in pairs:

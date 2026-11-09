@@ -499,6 +499,23 @@ def _predict_copy(probe, x: dict):
     return probe.predict_one(probe.scaler.transform_one(x) if probe.scaler is not None else x)
 
 
+def scaled_scenario(xs: list[dict], ys: list, probe: list[dict], h: int, scaling: str | None,
+                    window: int | None) -> tuple[list[dict], dict | None]:
+    """A scenario's points under the benchmark's stream scaling (``benchmark.datasets.scaling``), and the
+    probe set as the scaler stands at the end of each window ``w`` (``{w: points}``; None unscaled)."""
+    from benchmark.datasets.scaling import scale_stream, transform_side
+
+    if scaling in (None, "none"):
+        return xs, None
+    stream = scale_stream(list(zip(xs, ys)), scaling, C.scaling_window(window, h))
+    out, probes = [], {}
+    for i, (x, _) in enumerate(stream):
+        out.append(x)
+        if probe and (i + 1) % h == 0:
+            probes[(i + 1) // h - 1] = [transform_side(stream, p) for p in probe]
+    return out, probes
+
+
 def run_cell(task: dict) -> dict:
     """Run one (scenario, seed, config, algo) cell; see the module docstring. Never raises: an error is
     recorded on the cell and on the windows it stopped."""
@@ -513,6 +530,9 @@ def run_cell(task: dict) -> dict:
     h, W = shape.h, shape.n_windows
     xs, ys = scen.points(), scen.y.tolist()
     probe_xs = scen.probe_points()
+    xs, probe_by_window = scaled_scenario(xs, ys, probe_xs, h,
+                                          C.stream_scaling_of(scen.name, task.get("stream_scaling", "none")),
+                                          task.get("scaling_window"))
     base = {"scenario": scen.name, "seed": scen.seed, "config": config, "algo": algo}
     out = {"key": (scen.name, scen.seed, config, algo), "windows": [], "checks": [], "seq": {}, "error": None,
            "cell": dict(base)}
@@ -536,7 +556,8 @@ def run_cell(task: dict) -> dict:
                 snap_adapter = copy.deepcopy(adapter)
                 ss0, sf0 = snap_adapter.n_sentinel_predictions, snap_adapter.n_fallback_predictions
                 snap = [_predict_copy(snap_adapter, x) for x in xs[lo:hi]]
-                probe = ([_predict_copy(snap_adapter, p) for p in probe_xs]
+                side = probe_by_window.get(w, probe_xs) if probe_by_window is not None else probe_xs
+                probe = ([_predict_copy(snap_adapter, p) for p in side]
                          if probe_xs and w >= scen.meta.get("window", W) - 1 else None)
                 try:
                     n_model = snap_adapter.n_macro_clusters()
@@ -1546,6 +1567,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--separation", type=float, default=StreamShape.separation, help="in sigma, per coordinate")
     p.add_argument("--stress-period", type=int, default=None, help="points between births in identity_stress (h/2)")
     p.add_argument("--model-seed", type=int, default=C.MODEL_SEED)
+    p.add_argument("--stream-scaling", default=C.STREAM_SCALING, choices=C.STREAM_SCALING_RULES,
+                   help="the benchmark's stream scaling (BIRCH's cross-library check reads the raw scenario)")
+    p.add_argument("--scaling-window", type=int, default=C.SCALING_WINDOW, help="default: one window h")
     p.add_argument("--threshold", action="append", default=[], metavar="KEY=VALUE",
                    help=f"override a check threshold; keys: {', '.join(THRESHOLDS)}")
     p.add_argument("--proxy", action="append", default=[], metavar="KEY=VALUE",
@@ -1614,7 +1638,8 @@ def main(argv=None) -> Path:
     for sc in scenarios:
         for seed in seeds:
             scen = make_scenario(sc, seed, shape)
-            w0 = scen.points()[:shape.h]
+            w0 = scaled_scenario(scen.points(), scen.y.tolist(), [], shape.h,
+                                 C.stream_scaling_of(sc, args.stream_scaling), args.scaling_window)[0][:shape.h]
             for algo in algos:
                 base_params = cell_params(algo, "default", shape.h, shape.d, w0)[0]
                 for cfg in configs:
@@ -1624,7 +1649,8 @@ def main(argv=None) -> Path:
                                         "reason": "scaled_default leaves every parameter as in default"})
                         continue
                     tasks.append({"scenario": sc, "seed": seed, "config": cfg, "algo": algo, "shape": shape_d,
-                                  "model_seed": args.model_seed, "thresholds": th, "proxy": px})
+                                  "model_seed": args.model_seed, "thresholds": th, "proxy": px,
+                                  "stream_scaling": args.stream_scaling, "scaling_window": args.scaling_window})
     print(f"fidelity: {len(tasks)} cells ({len(skipped)} scaled_default cells identical to default, not run)", flush=True)
     cells: dict = {}
     windows, checks, cell_rows = [], [], []
@@ -1688,6 +1714,7 @@ def main(argv=None) -> Path:
             "argv": list(sys.argv[1:] if argv is None else argv), "algos": algos, "seeds": seeds,
             "configs": configs, "scenarios": scenarios, "shape": shape_d, "thresholds": th, "proxy": px,
             "model_seed": args.model_seed, "workers": args.workers, "birch_branching_factor": args.birch_branching_factor,
+            "stream_scaling": args.stream_scaling, "scaling_window": args.scaling_window,
             "birch_factors": _csv(args.birch_factors), "river_commit": _river_commit(), "sklearn": sklearn.__version__,
             "pythonhashseed": os.environ.get("PYTHONHASHSEED", "<unset>"), "n_cells": len(tasks),
             "n_skipped_identical": len(skipped), "wall_s": time.perf_counter() - t_start,

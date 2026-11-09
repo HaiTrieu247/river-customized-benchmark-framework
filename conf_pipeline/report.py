@@ -22,7 +22,12 @@ Tables (each a function, each written as a CSV and a section of ``report.md``):
 
 ``--contrasts`` writes the mechanism campaign's paired contrasts instead (``CONTRASTS``: E1
 ``scaled_default-default`` and ``confstream-scaled_default``, E2 ``frozen_reinit-frozen_prefix`` and
-``confstream-frozen_reinit``, E5 ``confstream-random_online``), on common tail windows, source block as
+``confstream-frozen_reinit``, E5 ``confstream-random_online``; the E3 branches, where a dir holds them:
+``frozen_ensemble``, ``portfolio_renewal``, ``random_after_prefix`` and ``confstream`` each against
+``frozen_prefix``, ``portfolio_renewal-frozen_ensemble``, ``confstream-portfolio_renewal`` and
+``confstream-random_after_prefix``, and at equal budget each continuous procedure against
+``frozen_prefix_matched`` and ``frozen_prefix_matched-frozen_prefix``, each with its post-freeze cost in
+``costs.csv``), on common tail windows, source block as
 the unit (``analysis_support``), with coverage, failures, and per arm the undefined-partition, cap-rejection
 and member-error rates kept apart.
 
@@ -123,8 +128,12 @@ def _headroom_cols(arms=HEADROOM_ARMS) -> list[str]:
 
 # --- loading -------------------------------------------------------------------------------
 
-def current_runs(out_dir: Path, diagnostic: bool = False) -> pd.DataFrame:
+def current_runs(out_dir: Path, diagnostic: bool = False, twins: bool = False) -> pd.DataFrame:
     """``runs.jsonl`` without the rows a later result made obsolete.
+
+    The scaled twins of the parameter-drift folds (``_common.SCALED_TWIN_FOLDS``) are left out unless
+    ``twins``: they are a sensitivity check, read by ``scaling_sensitivity``, never a stream of a main
+    table, ranking or pool.
 
     Rows of the diagnostic arms (``_common.DIAGNOSTIC_ARMS``, a tuner selecting by labels) are
     left out unless ``diagnostic``: every default table, ranking and normalisation reads the
@@ -138,7 +147,8 @@ def current_runs(out_dir: Path, diagnostic: bool = False) -> pd.DataFrame:
     - ``skipped`` rows of a job that also has an ``ok`` row.
     """
     rows = [r for r in C.read_jsonl(Path(out_dir) / "runs.jsonl")
-            if diagnostic or r.get("arm") not in C.DIAGNOSTIC_ARMS]
+            if (diagnostic or r.get("arm") not in C.DIAGNOSTIC_ARMS)
+            and (twins or r.get("fold") not in C.SCALED_TWIN_FOLDS)]
     oracle = _read_oracle(out_dir)
     rows = [r for r in rows if _is_current(r, oracle)]
     ok = {_job(r) for r in rows if r.get("status") == "ok"}
@@ -147,6 +157,36 @@ def current_runs(out_dir: Path, diagnostic: bool = False) -> pd.DataFrame:
         return pd.DataFrame(columns=["algo", "fold", "seed", "arm", "status"])
     check_one_basis(rows, Path(out_dir))
     return pd.DataFrame(rows)
+
+
+def scaling_by_group(runs) -> dict[str, list[str]]:
+    """Per stream group, the stream scalings its ``ok`` runs were read under (``none`` for runs that predate
+    the field)."""
+    rows = runs.to_dict("records") if hasattr(runs, "to_dict") else list(runs)
+    out: dict[str, set] = {}
+    for r in rows:
+        if r.get("status") != "ok" or r.get("fold") is None:
+            continue
+        try:
+            g = C.stream_group(r["fold"])
+        except ValueError:
+            g = "other"
+        out.setdefault(g, set()).add(r.get("stream_scaling") or "none")
+    return {g: sorted(v) for g, v in sorted(out.items())}
+
+
+def scaling_text(runs) -> str:
+    """What the report says about the stream scalings it reads, and about any figure pooled over groups."""
+    by = scaling_by_group(runs)
+    if not by:
+        return ""
+    parts = ", ".join(f"`{g}`: {' and '.join(v)}" for g, v in by.items())
+    mixed = len({s for v in by.values() for s in v}) > 1
+    return (f"Stream scaling per group: {parts}." + (
+        " The groups were read under different scalings (the protocol's rule: the parameter-drift streams keep "
+        "their coordinates), so a figure pooled over groups (`all`) mixes two preprocessings and is not a "
+        "result of either; read the groups apart, and the parameter-drift group beside its scaled twins "
+        "(`report --scaling-sensitivity`)." if mixed else ""))
 
 
 #: ``ari_basis`` of a row written before 2026-11-08, which has none: its ARIs read the sequential labels.
@@ -217,10 +257,12 @@ def replicate_view(values: pd.DataFrame, value_cols=("value",), split: bool = Tr
     return pd.concat([online, broadcast], ignore_index=True)[list(out.columns)]
 
 
-def load_windows(out_dir: Path, diagnostic: bool = False) -> pd.DataFrame:
-    """``windows.jsonl``; the diagnostic arms' rows only with ``diagnostic`` (see ``current_runs``)."""
+def load_windows(out_dir: Path, diagnostic: bool = False, twins: bool = False) -> pd.DataFrame:
+    """``windows.jsonl``; the diagnostic arms' rows only with ``diagnostic``, the scaled twins only with
+    ``twins`` (see ``current_runs``)."""
     rows = [r for r in C.read_jsonl(Path(out_dir) / "windows.jsonl")
-            if diagnostic or r.get("arm") not in C.DIAGNOSTIC_ARMS]
+            if (diagnostic or r.get("arm") not in C.DIAGNOSTIC_ARMS)
+            and (twins or r.get("fold") not in C.SCALED_TWIN_FOLDS)]
     if not rows:
         return pd.DataFrame(columns=["algo", "fold", "seed", "arm", "window"])
     return pd.DataFrame(rows)
@@ -1190,7 +1232,9 @@ def write_report(out_dir: Path) -> list[Path]:
         "(-1 when undefined); `ari_win` is the ARI inside the window. The partition these ARIs read is "
         f"named by `ari_basis`, here {_basis_text(runs)}. No whole-stream ARI is reported: it would join the "
         "labels of every window and of every incumbent, which name no common clusters. "
-        "`*_tail_*` columns cover the windows from `tail_from` (the freeze window) on, "
+        f"{scaling_text(runs)} "
+        "`*_tail_*` columns cover the windows from `tail_from` on (two windows after the freeze window in runs "
+        "since 2026-11-08, the first a decision taken after the freeze can reach; the freeze window itself before), "
         "the region every arm shares; they are the headline numbers. A window with a single "
         "true class has no external reading (ARI would only say whether the prediction had one "
         "label) and is left out of every mean: `n_single_class_windows` counts them and "
@@ -1410,7 +1454,84 @@ CONTRASTS: tuple[tuple[str, str, str], ...] = (
     ("confstream", "portfolio_renewal", "branch: changing configurations beyond renewing the portfolio"),
     ("confstream", "random_after_prefix", "branch: evolutionary against uniform children from the same state "
                                           "(same schedule; not a matched-compute comparison)"),
+    ("portfolio_renewal", "frozen_prefix", "branch: renewing the kept portfolio against the frozen single model"),
+    ("random_after_prefix", "frozen_prefix", "branch: uniform search from the same state against the frozen single "
+                                             "model"),
+    ("confstream", "frozen_prefix", "branch: evolutionary search after the freeze against the frozen single model"),
+    # Equal budget (C.MATCHED_ARMS): the frozen single model tuned before the freeze with the models confstream
+    # evaluates over the whole stream, so both sides evaluate as many models in all.
+    ("confstream", "frozen_prefix_matched", "equal budget: evolutionary search spread over the stream against the "
+                                            "same budget spent before the freeze"),
+    ("random_after_prefix", "frozen_prefix_matched", "equal budget: uniform search spread over the stream against "
+                                                     "the same budget spent before the freeze"),
+    ("portfolio_renewal", "frozen_prefix_matched", "equal budget: renewing the kept portfolio against the same "
+                                                   "budget spent before the freeze"),
+    ("frozen_ensemble", "frozen_prefix_matched", "equal budget: selection among the kept portfolio against the same "
+                                                 "budget spent before the freeze"),
+    ("frozen_prefix_matched", "frozen_prefix", "the frozen single model with confstream's budget spent before the "
+                                               "freeze against the protocol's prefix budget"),
 )
+
+
+COST_COLS = ["contrast", "group", "n_cells", "post_freeze_s_a", "post_freeze_s_b", "cost_ratio_median",
+             "evaluations_per_window_a", "evaluations_per_window_b"]
+#: Run identity columns of a window row, as many as the rows carry.
+_RUN_ID = ("algo", "fold", "arm", "seed", "tuner_seed", "model_seed")
+
+
+def contrast_costs(out_dir: Path) -> pd.DataFrame:
+    """What each side of every ``CONTRASTS`` pair spends after the freeze, beside its quality: per run, the
+    ensemble's CPU seconds over the windows after its freeze window (``tail_freeze_window``, the protocol's
+    ``FREEZE_AFTER_WINDOW`` for runs that predate it) and the mean number of models evaluated per window;
+    then per (algorithm, stream) the mean over runs, and per stream group, over the cells both arms ran,
+    the mean seconds of each side and the median ratio a / b. A contrast between arms of unequal cost is
+    not a matched-budget comparison; this table says how unequal."""
+    win, runs = load_windows(out_dir), current_runs(out_dir)
+    if win.empty or runs.empty or "ensemble_runtime_s" not in win:
+        return pd.DataFrame(columns=COST_COLS)
+    ok = runs[runs["status"] == "ok"]
+    ids = [c for c in _RUN_ID if c in win and c in ok]
+    t0 = {}
+    for r in ok.to_dict("records"):
+        v = r.get("tail_freeze_window")
+        t0[tuple(str(r.get(c)) for c in ids)] = int(v) if v is not None and v == v else C.FREEZE_AFTER_WINDOW
+    w = win.copy()
+    w["_key"] = [tuple(str(x) for x in row) for row in w[ids].itertuples(index=False)]
+    w = w[w["_key"].isin(t0)]
+    if w.empty:
+        return pd.DataFrame(columns=COST_COLS)
+    w = w[pd.to_numeric(w["window"], errors="coerce") > w["_key"].map(t0)]
+    evals = pd.to_numeric(w["n_evaluated"], errors="coerce") if "n_evaluated" in w else pd.Series(np.nan, index=w.index)
+    w = w.assign(_s=pd.to_numeric(w["ensemble_runtime_s"], errors="coerce"), _e=evals)
+    per_run = w.groupby("_key").agg(algo=("algo", "first"), fold=("fold", "first"), arm=("arm", "first"),
+                                    s=("_s", "sum"), e=("_e", "mean")).reset_index(drop=True)
+    cell = per_run.groupby(["algo", "fold", "arm"])[["s", "e"]].mean()
+    rows = []
+    for a, b, _ in CONTRASTS:
+        if a not in cell.index.get_level_values("arm") or b not in cell.index.get_level_values("arm"):
+            continue
+        ca = cell.xs(a, level="arm")
+        cb = cell.xs(b, level="arm")
+        both = ca.join(cb, lsuffix="_a", rsuffix="_b", how="inner").reset_index()
+        if both.empty:
+            continue
+        both["group"] = [_group_of(f) for f in both["fold"]]
+        for group in [*sorted(set(both["group"])), "all"]:
+            sub = both if group == "all" else both[both["group"] == group]
+            ratio = sub["s_a"] / sub["s_b"].where(sub["s_b"] > 0)
+            rows.append({"contrast": f"{a}-{b}", "group": group, "n_cells": int(len(sub)),
+                         "post_freeze_s_a": float(sub["s_a"].mean()), "post_freeze_s_b": float(sub["s_b"].mean()),
+                         "cost_ratio_median": float(ratio.median()) if ratio.notna().any() else np.nan,
+                         "evaluations_per_window_a": float(sub["e_a"].mean()),
+                         "evaluations_per_window_b": float(sub["e_b"].mean())})
+    return pd.DataFrame(rows, columns=COST_COLS)
+
+
+def _group_of(fold: str) -> str:
+    try:
+        return C.stream_group(fold)
+    except ValueError:
+        return "other"
 
 
 def _scaled_changed(runs: pd.DataFrame) -> dict[tuple, bool | None]:
@@ -1472,6 +1593,7 @@ def contrast_tables(out_dir: Path, threshold: float = C.MIN_CEILING_GAIN, n_boot
             expected[j["arm"]] = expected.get(j["arm"], 0) + 1
     return {"pairs": cat(pairs), "cells": cat(cells), "algo_blocks": cat(algo_blocks), "blocks": cat(blocks),
             "groups": cat(groups), "point_support": pd.DataFrame(support, columns=POINT_SUPPORT_COLS),
+            "costs": contrast_costs(out_dir),
             "coverage": AS.coverage(runs, tw, expected),
             "filled": pd.DataFrame({"algo": filled, "scaled_default_read_from": "default"})}
 
@@ -1566,6 +1688,18 @@ def write_contrasts(out_dir: Path, rep_dir: Path | None = None, threshold: float
             lines += [f"**{v} and {ref} are both here.** {v} is {ref} under other labels: every mean over "
                       "algorithms counts that model twice. Read the `per_algorithm` rows, or one of the two.", ""]
     ps = t["point_support"]
+    costs = t["costs"]
+    from . import analysis_support as AS
+
+    scal = scaling_text(AS.run_table(out_dir))
+    if scal:
+        lines += [f"**Stream scaling.** {scal}", ""]
+    lines += ["**Cost.** Beside every contrast, what each side spent after the freeze (`costs.csv`): the ensemble's "
+              "CPU seconds per run over the windows after the freeze window, the median ratio a / b over the "
+              "(algorithm, stream) cells both arms ran, and the models evaluated per window. The online arm and "
+              "the branches that keep renewing evaluate E + C models per window, the frozen single model one: a "
+              "contrast between them is a difference in quality at that difference in cost, not at a matched "
+              "budget.", ""]
     for a, b, what in CONTRASTS:
         sub = g[(g["contrast"] == f"{a}-{b}") & (g["level"] == "group")] if len(g) else g
         lines += [f"## `{a}-{b}`", "", what, ""]
@@ -1577,6 +1711,9 @@ def write_contrasts(out_dir: Path, rep_dir: Path | None = None, threshold: float
             lines += [_md_table(main, cols, 4), ""]
         else:
             lines += ["No common reading: one of the arms did not run here.", ""]
+        csub = costs[costs["contrast"] == f"{a}-{b}"] if len(costs) else costs
+        if len(csub):
+            lines += ["Cost after the freeze:", "", _md_table(csub, [c for c in COST_COLS if c != "contrast"], 3), ""]
         psub = ps[ps["contrast"] == f"{a}-{b}"] if len(ps) else ps
         if len(psub):
             lines += ["Point support of the common windows (replicate-pair windows):", "",
@@ -1598,15 +1735,107 @@ def write_contrasts(out_dir: Path, rep_dir: Path | None = None, threshold: float
     return paths
 
 
+#: The arm contrasts the scaling sensitivity reads under both scalings of the parameter-drift streams.
+SENSITIVITY_CONTRASTS: tuple[tuple[str, str], ...] = (
+    ("confstream", "default"), ("confstream", "frozen_prefix"), ("frozen_prefix", "default"),
+    ("confstream", "oracle_static"),
+)
+
+
+def scaling_sensitivity(out_dir: Path, metric: str = TAIL) -> dict[str, pd.DataFrame]:
+    """The parameter-drift streams read in their coordinates (the protocol) beside their scaled twins
+    (``_common.SCALED_TWIN_FOLDS``, standardised as the real streams are), on ``metric``:
+
+    - ``cells``: per (algorithm, stream, arm), the mean over seeds under each scaling and the difference;
+    - ``arms``: per arm, the mean over the (algorithm, stream) cells read under both scalings;
+    - ``contrasts``: per ``SENSITIVITY_CONTRASTS`` pair, the mean difference over the cells of the real
+      streams, of the parameter-drift streams in their coordinates and of their scaled twins, on the
+      (algorithm, stream) cells both arms read: how much of the gap between the drift streams and the real
+      ones is left once both are preprocessed alike.
+    Implementation variants are left out, as in every main table."""
+    runs = current_runs(out_dir, twins=True)
+    if runs.empty or metric not in runs:
+        return {"cells": pd.DataFrame(), "arms": pd.DataFrame(), "contrasts": pd.DataFrame()}
+    ok = runs[(runs["status"] == "ok") & ~runs["algo"].isin(list(C.IMPL_VARIANTS))].copy()
+    ok[metric] = pd.to_numeric(ok[metric], errors="coerce")
+    ok["base"] = [C.twin_base(f) for f in ok["fold"]]
+    ok["version"] = ["scaled" if f in C.SCALED_TWIN_FOLDS else ("raw" if f in C.PARAM_DRIFT_FOLDS else None)
+                     for f in ok["fold"]]
+    ok["group"] = [_group_of(f) for f in ok["fold"]]
+    drift = ok[ok["version"].notna()]
+    cell = drift.groupby(["algo", "base", "arm", "version"])[metric].mean().unstack("version")
+    for v in ("raw", "scaled"):
+        if v not in cell:
+            cell[v] = np.nan
+    cell = cell.reset_index()
+    cell["scaled_minus_raw"] = cell["scaled"] - cell["raw"]
+    both = cell.dropna(subset=["raw", "scaled"])
+    arms = both.groupby("arm").agg(n_cells=("raw", "size"), raw=("raw", "mean"), scaled=("scaled", "mean"),
+                                   scaled_minus_raw=("scaled_minus_raw", "mean")).reset_index()
+    real = ok[ok["group"] == "real"].groupby(["algo", "fold", "arm"])[metric].mean().unstack("arm")
+    raw_c = cell.pivot_table(index=["algo", "base"], columns="arm", values="raw")
+    sc_c = cell.pivot_table(index=["algo", "base"], columns="arm", values="scaled")
+    rows = []
+    for a, b in SENSITIVITY_CONTRASTS:
+        row = {"contrast": f"{a}-{b}"}
+        for name, tab in (("real", real), ("param_drift_raw", raw_c), ("param_drift_scaled", sc_c)):
+            if a in tab and b in tab:
+                d = (tab[a] - tab[b]).dropna()
+                row[f"{name}_mean"], row[f"{name}_n_cells"] = (float(d.mean()) if len(d) else np.nan), int(len(d))
+            else:
+                row[f"{name}_mean"], row[f"{name}_n_cells"] = np.nan, 0
+        row["drift_minus_real_raw"] = row["param_drift_raw_mean"] - row["real_mean"]
+        row["drift_minus_real_scaled"] = row["param_drift_scaled_mean"] - row["real_mean"]
+        rows.append(row)
+    return {"cells": cell, "arms": arms, "contrasts": pd.DataFrame(rows)}
+
+
+def write_scaling_sensitivity(out_dir: Path) -> list[Path]:
+    """``scaling_sensitivity`` into ``<out-dir>/report/scaling_sensitivity/``: CSVs and a ``.md``."""
+    out_dir = Path(out_dir)
+    rep = out_dir / C.REPORT_DIR.name / "scaling_sensitivity"
+    rep.mkdir(parents=True, exist_ok=True)
+    t = scaling_sensitivity(out_dir)
+    paths = []
+    for name, df in t.items():
+        path = rep / f"{name}.csv"
+        df.to_csv(path, index=False)
+        paths.append(path)
+    lines = ["# Scaling sensitivity of the parameter-drift streams", "",
+             "The protocol reads the parameter-drift streams in their supplied coordinates: they are built to change "
+             "the best parameters (the coordinate scale, the cluster radius, the cluster count), and a rolling "
+             "standardisation would undo the change. Their scaled twins (`" + "`, `".join(C.SCALED_TWIN_FOLDS) + "`) "
+             "are the same streams standardised as the real ones are (River's `StandardScaler(window_size)`, learned "
+             f"then transformed). The metric is `{TAIL}`, the mean over seeds per (algorithm, stream, arm). The twins "
+             "never enter a main table, ranking or pool.", "",
+             "## Per arm, over the cells read under both scalings", "", _md_table(t["arms"], list(t["arms"].columns), 4), "",
+             "## The gap between the drift streams and the real ones, under each scaling", "",
+             "Each contrast is the mean difference over (algorithm, stream) cells. `drift_minus_real_raw` compares the "
+             "drift streams in their coordinates with the real streams, as the main tables do; "
+             "`drift_minus_real_scaled` compares them once both are standardised alike, the part of the gap a "
+             "difference of preprocessing cannot explain.", "", _md_table(t["contrasts"], list(t["contrasts"].columns), 4), "",
+             "## Per algorithm, stream and arm", "", _md_table(t["cells"], list(t["cells"].columns), 4), ""]
+    md = rep / "scaling_sensitivity.md"
+    md.write_text("\n".join(lines), encoding="utf-8")
+    return paths + [md]
+
+
 def main(argv=None) -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--out-dir", default=str(C.OUT))
     parser.add_argument("--contrasts", action="store_true",
                         help="write the mechanism campaign's paired contrasts (E1, E2, E5) into <out-dir>/report/contrasts/ "
                              "instead of the report")
+    parser.add_argument("--scaling-sensitivity", action="store_true",
+                        help="write the parameter-drift streams beside their scaled twins into "
+                             "<out-dir>/report/scaling_sensitivity/ instead of the report")
     parser.add_argument("--threshold", type=float, default=C.MIN_CEILING_GAIN,
                         help="with --contrasts: the practical-effect threshold (default the pre-declared 0.05)")
     args = parser.parse_args(argv)
+    if args.scaling_sensitivity:
+        for p in write_scaling_sensitivity(Path(args.out_dir)):
+            print(p)
+        return
     if args.contrasts:
         for p in write_contrasts(Path(args.out_dir), threshold=args.threshold):
             print(p)
